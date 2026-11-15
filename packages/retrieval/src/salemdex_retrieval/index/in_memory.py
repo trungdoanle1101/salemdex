@@ -1,17 +1,25 @@
-"""An index kept in memory: the reference behaviour for filters and writes.
+"""An index kept in memory: the reference behaviour for filters, writes and searches.
 
 Use it in tests and single-process local runs. Other backends (Qdrant) must match how it
-selects and writes chunks.
+selects, writes and ranks chunks.
 """
 
+import heapq
+import math
 import uuid
 from collections.abc import Callable, Iterable
 from typing import Final, assert_never
 
-from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
-from salemdex_retrieval.index.protocol import check_batch, check_filter
+from salemdex_retrieval.index.protocol import (
+    check_batch,
+    check_filter,
+    check_limit,
+    check_query,
+)
 from salemdex_retrieval.schema import Schema
+from salemdex_retrieval.vectors import DenseDistance, DenseValue, VectorQuery
 
 
 class InMemoryIndex:
@@ -61,6 +69,23 @@ class InMemoryIndex:
         for embedded in batch:
             self._embedded_chunks[embedded.chunk.id] = embedded
 
+    def search(self, query: VectorQuery, *, where: Filter, limit: int) -> list[Hit]:
+        """Return the chunks `where` matches nearest to `query` (`Index.search`).
+
+        Scores every matching chunk, then keeps the best `limit`. Equal scores keep the
+        order the chunks were stored in, but other backends don't promise that.
+        """
+        check_limit(limit)
+        check_query(query, schema=self.schema)
+        check_filter(where, schema=self.schema)
+        matches = self._build_matcher(where)
+        hits = [
+            Hit(chunk=embedded.chunk, score=_score(embedded, query=query))
+            for embedded in self._embedded_chunks.values()
+            if matches(embedded.chunk)
+        ]
+        return heapq.nlargest(limit, hits, key=lambda hit: hit.score)
+
     def _build_matcher(self, where: Filter) -> Callable[[Chunk], bool]:
         """Return a function telling whether a chunk matches `where`.
 
@@ -90,3 +115,28 @@ class InMemoryIndex:
             for chunk_id, embedded in self._embedded_chunks.items()
             if not matches(embedded.chunk)
         }
+
+
+def _score(embedded: EmbeddedChunk, *, query: VectorQuery) -> float:
+    """Return the chunk's score for `query`, by the distance of the query's vector."""
+    vector_value = embedded.vector_values[query.vector]
+    match vector_value:
+        case DenseValue(vector=v, numbers=stored):
+            return _dense_score(stored, query.numbers, distance=v.distance)
+        case _:
+            assert_never(vector_value)
+
+
+def _dense_score(
+    stored: tuple[float, ...], query: tuple[float, ...], *, distance: DenseDistance
+) -> float:
+    """Return how near `stored` is to `query` by `distance`; higher is nearer."""
+    match distance:
+        case "dot":
+            return math.sumprod(stored, query)
+        case "cosine":
+            norms = math.hypot(*stored) * math.hypot(*query)
+            # A zero vector scores 0.0, as it does in Qdrant.
+            return math.sumprod(stored, query) / norms if norms else 0.0
+        case _:
+            assert_never(distance)

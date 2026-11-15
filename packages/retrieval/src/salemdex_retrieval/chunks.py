@@ -165,6 +165,24 @@ class EmbeddedChunk:
             )
 
 
+@dataclass(frozen=True, kw_only=True)
+class Hit:
+    """A chunk a search found, with its score for the query.
+
+    Holds the `Chunk` alone, as `find` returns it: nothing that reads a hit needs its
+    vectors.
+
+    Attributes:
+        chunk: The chunk found.
+        score: How near the chunk is to the query, by the vector's distance: higher
+            is nearer, for both cosine and dot. Comparable only with the other hits of
+            the same search, never across vectors or questions.
+    """
+
+    chunk: Chunk
+    score: float
+
+
 def _field_problems(chunk: Chunk, schema: type[Schema]) -> list[str]:
     """Return what's wrong with the chunk's fields for `schema`; none when they fit."""
     return _problems(

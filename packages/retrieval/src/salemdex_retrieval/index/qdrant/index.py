@@ -2,7 +2,8 @@
 
 Each chunk is one point: the chunk id is the point id, each vector value is one of the
 point's named vectors, and the payload is laid out as `payload.py` describes. Filters
-run inside Qdrant (`filters.py`).
+run inside Qdrant (`filters.py`), for searches too: a search ranks only the points its
+filter matches.
 
 Open an index with `QdrantIndex.open`, which checks the collection first: it creates the
 collection and its payload indexes when they're missing, and refuses to open when what
@@ -13,15 +14,20 @@ points.
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Final, Self
+from typing import Final, Self, assert_never
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter
-from salemdex_retrieval.index.protocol import check_batch, check_filter
+from salemdex_retrieval.index.protocol import (
+    check_batch,
+    check_filter,
+    check_limit,
+    check_query,
+)
 from salemdex_retrieval.index.qdrant.filters import build_qdrant_filter
 from salemdex_retrieval.index.qdrant.payload import (
     WRITTEN_FIELDS,
@@ -32,7 +38,14 @@ from salemdex_retrieval.index.qdrant.payload import (
     written_fields_of,
 )
 from salemdex_retrieval.schema import Schema
-from salemdex_retrieval.vectors import Dense, DenseDistance
+from salemdex_retrieval.vectors import (
+    Dense,
+    DenseDistance,
+    DenseQuery,
+    DenseValue,
+    VectorQuery,
+    VectorValue,
+)
 
 # Room for every expected `written_fields` entry and this many others; more means the
 # collection holds something else entirely, and listing them wouldn't help.
@@ -44,11 +57,19 @@ _QDRANT_DISTANCES: dict[DenseDistance, models.Distance] = {
 }
 
 
+# What Qdrant stores under a vector's name, and takes as a query for it. Widens with
+# each kind of vector: list[list[float]] for multi-dense, models.SparseVector for
+# sparse.
+type _QdrantVectorData = list[float]
+
+
 class QdrantIndex:
     """An `Index` storing its chunks as the points of one Qdrant collection.
 
     Behaves as `InMemoryIndex` does; the shared contract tests hold it to that. Every
-    write waits until Qdrant has applied it, so a `find` right after sees it.
+    write waits until Qdrant has applied it, so a `find` or `search` right after sees
+    it. One difference: once a collection is large, `search` is approximate (see
+    `search`).
 
     Attributes:
         schema: The schema every chunk and every filter field must belong to.
@@ -91,7 +112,7 @@ class QdrantIndex:
             collection: The collection's name.
 
         Returns:
-            The index, ready for `put`, `find`, `delete` and `replace`.
+            The index, ready for `put`, `find`, `delete`, `replace` and `search`.
 
         Raises:
             SchemaMismatchError: The collection's vectors differ from the schema's:
@@ -143,6 +164,47 @@ class QdrantIndex:
         self._store(batch)
         self._delete(_left_over(where, kept=[embedded.chunk.id for embedded in batch]))
 
+    def search(self, query: VectorQuery, *, where: Filter, limit: int) -> list[Hit]:
+        """Return the chunks `where` matches nearest to `query` (`Index.search`).
+
+        One request: Qdrant applies `where` while it searches, never after. Scores are
+        computed on the float32 numbers Qdrant stores, so they may differ from the
+        in-memory index's in the last digits.
+
+        Exact only while the collection is small: Qdrant compares every vector until
+        the collection outgrows its indexing threshold, then searches an HNSW graph,
+        which is approximate. A restrictive `where` (a reader's few groups) can then
+        return fewer than `limit` hits or miss the nearest. A payload index on each
+        field `where` uses keeps such searches accurate, since Qdrant can then count
+        the matching points and compare them all when they're few; so declare every
+        field the engine filters every search by with `indexed=True`.
+
+        Raises:
+            SchemaMismatchError: `query` searches a vector that isn't in the schema, or
+                `where` uses a field that isn't; nothing is read. Or a matched point
+                doesn't hold a chunk of the schema; the message names it.
+            ValueError: `limit` isn't a positive `int`; nothing is read.
+        """
+        check_limit(limit)
+        check_query(query, schema=self.schema)
+        check_filter(where, schema=self.schema)
+        response = self._client.query_points(
+            collection_name=self._collection,
+            query=_to_qdrant_query(query),
+            query_filter=build_qdrant_filter(where),
+            limit=limit,
+            using=query.vector.name,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [
+            Hit(
+                chunk=self._to_chunk(point),
+                score=point.score,
+            )
+            for point in response.points
+        ]
+
     def _store(self, batch: list[EmbeddedChunk]) -> None:
         """Write embedded chunks already checked against the schema, in one request."""
         # Qdrant refuses an update with no points.
@@ -153,7 +215,7 @@ class QdrantIndex:
                 id=embedded.chunk.id,
                 payload=encode_payload(embedded.chunk),
                 vector={
-                    vector.name: value.numbers
+                    vector.name: _to_qdrant_value(value)
                     for vector, value in embedded.vector_values.items()
                 },
             )
@@ -178,7 +240,7 @@ class QdrantIndex:
             if offset is None:
                 return records
 
-    def _to_chunk(self, record: models.Record) -> Chunk:
+    def _to_chunk(self, record: models.Record | models.ScoredPoint) -> Chunk:
         """Return the chunk a point holds.
 
         Raises:
@@ -462,3 +524,21 @@ def _left_over(where: Filter, *, kept: list[uuid.UUID]) -> models.Filter:
         must=[build_qdrant_filter(where)],
         must_not=[models.HasIdCondition(has_id=kept)],
     )
+
+
+def _to_qdrant_query(query: VectorQuery) -> _QdrantVectorData:
+    """Return `query` in the form `query_points` takes for its kind of vector."""
+    match query:
+        case DenseQuery(numbers=numbers):
+            return list(numbers)
+        case _:
+            assert_never(query)
+
+
+def _to_qdrant_value(value: VectorValue) -> _QdrantVectorData:
+    """Return `value` in the form a point stores for its kind of vector."""
+    match value:
+        case DenseValue(numbers=numbers):
+            return list(numbers)
+        case _:
+            assert_never(value)

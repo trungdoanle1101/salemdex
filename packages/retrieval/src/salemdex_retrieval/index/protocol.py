@@ -8,14 +8,17 @@ import uuid
 from collections.abc import Iterable
 from typing import Protocol, assert_never
 
-from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
 from salemdex_retrieval.schema import Schema
+from salemdex_retrieval.vectors import VectorQuery
 
 
 class Index(Protocol):
-    """Chunks of one schema, stored by id with their vectors and selected by filters.
+    """Chunks of one schema: stored by id, selected by filters, ranked by queries.
+
+    Each chunk is stored with its vector values; reads return it without them.
 
     Every filter is checked against the schema before any chunk is read or changed,
     and every write is checked in full before any chunk is stored: a write either
@@ -90,6 +93,36 @@ class Index(Protocol):
         """
         ...
 
+    def search(self, query: VectorQuery, *, where: Filter, limit: int) -> list[Hit]:
+        """Return the chunks `where` matches nearest to `query`, best first.
+
+        `where` is applied before ranking, never after: a chunk it doesn't match takes
+        no place among the hits, so `limit` is filled by matching chunks whenever there
+        are enough. Hits with equal scores come in no promised order.
+
+        Like `find`, this applies no asker's access filter of its own. The engine
+        passes it in `where`; anything serving a user searches through a session.
+
+        Example:
+            index.search(KbChunks.dense.query(numbers), where=access, limit=20)
+
+        Args:
+            query: What to search for, and in which of the schema's vectors.
+            where: Which chunks may be returned. Required, so that no search can
+                forget its filter.
+            limit: The most hits to return; a positive `int`.
+
+        Returns:
+            At most `limit` hits, each holding a chunk without its vectors and its
+            score for `query`.
+
+        Raises:
+            SchemaMismatchError: `query` searches a vector that isn't in the schema,
+                or `where` uses a field that isn't. Nothing is read.
+            ValueError: `limit` isn't a positive `int`. Nothing is read.
+        """
+        ...
+
 
 def check_batch(
     embedded_chunks: Iterable[EmbeddedChunk], *, schema: type[Schema]
@@ -155,3 +188,45 @@ def check_filter(where: Filter, *, schema: type[Schema]) -> None:
             check_filter(inner, schema=schema)
         case _:
             assert_never(where)
+
+
+def check_query(query: VectorQuery, *, schema: type[Schema]) -> None:
+    """Check that `query` searches one of `schema`'s vectors.
+
+    Every backend calls it before reading anything. Vectors are compared as objects,
+    not by name, as fields are in `check_filter`. The numbers aren't checked again:
+    `Dense.query` checked them against their vector when the query was built.
+
+    Args:
+        query: The query about to be run.
+        schema: The schema of the index it runs on.
+
+    Raises:
+        SchemaMismatchError: The query's vector isn't in `schema`, or is another
+            schema's vector with the same name.
+    """
+    vector = query.vector
+    schema_vectors = schema.vectors()
+    if vector is not schema_vectors.get(vector.name):
+        in_another = (
+            " (another schema's vector)" if vector.name in schema_vectors else ""
+        )
+        raise SchemaMismatchError(
+            f"vector {vector.name!r}{in_another} not in schema {schema.__name__}"
+        )
+
+
+def check_limit(limit: int) -> None:
+    """Check that `limit` is a positive `int`.
+
+    Every backend calls it before reading anything, so none has to decide what a limit
+    of 0 means.
+
+    Args:
+        limit: The most hits a search may return.
+
+    Raises:
+        ValueError: `limit` isn't an `int` (a `bool` doesn't count), or is below 1.
+    """
+    if type(limit) is not int or limit <= 0:
+        raise ValueError(f"limit must be a positive integer, got {limit}")

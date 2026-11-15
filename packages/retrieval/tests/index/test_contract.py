@@ -4,13 +4,13 @@ Backends come from the `new_index` fixture in conftest.py.
 """
 
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Protocol
 
 import pytest
 
-from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter, and_, not_, or_
 from salemdex_retrieval.index import Index
@@ -33,6 +33,7 @@ class Entries(Schema):
 
 class Other(Schema):
     owner_id = One(uuid.UUID)
+    summary = Dense(size=2, distance="cosine")
 
 
 DOCUMENT = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -72,12 +73,12 @@ def unfit_chunk() -> Chunk:
     )
 
 
-def embedded(chunk: Chunk) -> EmbeddedChunk:
-    """Return `chunk` of Chunks with a value for its vector.
+def embedded(chunk: Chunk, *, numbers: Sequence[float] = (1.0, 0.0)) -> EmbeddedChunk:
+    """Return `chunk` of Chunks with `numbers` as its value for `Chunks.dense`.
 
-    Every chunk gets the same value: these tests store and select, they don't rank.
+    Tests that only store and select leave every chunk at the same value.
     """
-    return EmbeddedChunk(chunk=chunk, vector_values=[Chunks.dense.value([1.0, 0.0])])
+    return EmbeddedChunk(chunk=chunk, vector_values=[Chunks.dense.value(numbers)])
 
 
 def embedded_all(*chunks: Chunk) -> list[EmbeddedChunk]:
@@ -580,3 +581,198 @@ def test_replace_changes_nothing_when_its_filter_uses_a_foreign_field(
         )
 
     assert ids(index.find(where=EVERYTHING)) == {old.id}
+
+
+# Searching
+#
+# Chunks.dense compares by cosine. Every query below is (1, 0), so a chunk's score is
+# the cosine of its vector's angle to the x-axis. No two chunks of a test score alike:
+# backends promise no order for ties. Scores are compared within a tolerance, because
+# Qdrant stores float32 and normalises cosine vectors.
+
+QUERY = Chunks.dense.query([1.0, 0.0])
+
+# Vectors scoring 1.0, 0.8, 0.6 and 0.0 against QUERY.
+BEST, GOOD, FAIR, UNRELATED = (1.0, 0.0), (0.8, 0.6), (0.6, 0.8), (0.0, 1.0)
+
+
+def hit_ids(hits: Iterable[Hit]) -> list[uuid.UUID]:
+    """Return each hit's chunk id, in the order given."""
+    return [hit.chunk.id for hit in hits]
+
+
+def scores(hits: Iterable[Hit]) -> list[float]:
+    """Return each hit's score, in the order given."""
+    return [hit.score for hit in hits]
+
+
+def test_search_returns_hits_best_first_with_their_scores(
+    index_with: IndexWith,
+) -> None:
+    good, best, fair = chunk(position=0), chunk(position=1), chunk(position=2)
+    index = index_with()
+    index.put(
+        [
+            embedded(good, numbers=GOOD),
+            embedded(best, numbers=BEST),
+            embedded(fair, numbers=FAIR),
+        ]
+    )
+
+    hits = index.search(QUERY, where=EVERYTHING, limit=10)
+
+    assert hit_ids(hits) == [best.id, good.id, fair.id]
+    assert pytest.approx([1.0, 0.8, 0.6], abs=1e-6) == scores(hits)
+
+
+def test_a_hit_holds_the_chunk_as_it_was_stored(index_with: IndexWith) -> None:
+    stored = chunk(text="Article 1. Scope", groups=[HR, LEGAL])
+    index = index_with(stored)
+
+    [hit] = index.search(QUERY, where=EVERYTHING, limit=1)
+
+    assert hit.chunk == stored
+    assert hit.chunk.text == "Article 1. Scope"
+
+
+def test_search_returns_at_most_limit_hits_keeping_the_best(
+    index_with: IndexWith,
+) -> None:
+    best, good = chunk(position=0), chunk(position=1)
+    index = index_with()
+    index.put(
+        [
+            embedded(chunk(position=2), numbers=FAIR),
+            embedded(good, numbers=GOOD),
+            embedded(chunk(position=3), numbers=UNRELATED),
+            embedded(best, numbers=BEST),
+        ]
+    )
+
+    hits = index.search(QUERY, where=EVERYTHING, limit=2)
+
+    assert hit_ids(hits) == [best.id, good.id]
+
+
+def test_search_returns_every_match_when_fewer_than_limit(
+    index_with: IndexWith,
+) -> None:
+    index = index_with()
+    index.put([embedded(chunk(position=0), numbers=GOOD), embedded(chunk(position=1))])
+
+    assert len(index.search(QUERY, where=EVERYTHING, limit=10)) == 2
+
+
+def test_search_applies_where_before_ranking(index_with: IndexWith) -> None:
+    # The hidden chunk is nearest; it must neither appear nor take a place, so the
+    # limit is still filled by visible chunks.
+    hidden = chunk(position=0, groups=[FINANCE])
+    good, fair = chunk(position=1), chunk(position=2)
+    index = index_with()
+    index.put(
+        [
+            embedded(hidden, numbers=BEST),
+            embedded(good, numbers=GOOD),
+            embedded(fair, numbers=FAIR),
+            embedded(chunk(position=3), numbers=UNRELATED),
+        ]
+    )
+
+    hits = index.search(QUERY, where=Chunks.groups.any_of([HR]), limit=2)
+
+    assert hit_ids(hits) == [good.id, fair.id]
+
+
+def test_search_returns_no_hits_when_where_matches_nothing(
+    index_with: IndexWith,
+) -> None:
+    index = index_with(chunk())
+
+    assert index.search(QUERY, where=Chunks.version.eq(99), limit=10) == []
+
+
+def test_search_in_an_empty_index_returns_no_hits(index_with: IndexWith) -> None:
+    assert index_with().search(QUERY, where=EVERYTHING, limit=10) == []
+
+
+def test_cosine_ignores_how_long_a_vector_is(index_with: IndexWith) -> None:
+    long_but_off, short_and_aligned = chunk(position=0), chunk(position=1)
+    index = index_with()
+    index.put(
+        [
+            embedded(long_but_off, numbers=(8.0, 6.0)),
+            embedded(short_and_aligned, numbers=(0.1, 0.0)),
+        ]
+    )
+
+    hits = index.search(QUERY, where=EVERYTHING, limit=10)
+
+    assert hit_ids(hits) == [short_and_aligned.id, long_but_off.id]
+    assert pytest.approx([1.0, 0.8], abs=1e-6) == scores(hits)
+
+
+class Dotted(Schema):
+    position = One(int)
+    dense = Dense(size=2, distance="dot")
+
+
+def test_dot_counts_how_long_a_vector_is(
+    new_index: Callable[[type[Schema]], Index],
+) -> None:
+    def dotted(position: int, numbers: Sequence[float]) -> EmbeddedChunk:
+        return EmbeddedChunk(
+            chunk=Chunk(
+                id=uuid.UUID(int=position + 1),
+                text="Scope of application",
+                field_values=[Dotted.position.value(position)],
+            ),
+            vector_values=[Dotted.dense.value(numbers)],
+        )
+
+    index = new_index(Dotted)
+    long_but_off, short_and_aligned = dotted(0, (8.0, 6.0)), dotted(1, (0.5, 0.0))
+    index.put([long_but_off, short_and_aligned])
+
+    hits = index.search(
+        Dotted.dense.query([1.0, 0.0]),
+        where=or_(Dotted.position.eq(0), Dotted.position.eq(1)),
+        limit=10,
+    )
+
+    assert hit_ids(hits) == [long_but_off.chunk.id, short_and_aligned.chunk.id]
+    assert pytest.approx([8.0, 0.5], abs=1e-5) == scores(hits)
+
+
+def test_search_with_another_schemas_vector_raises(index_with: IndexWith) -> None:
+    index = index_with(chunk())
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match="vector 'dense' \\(another schema's vector\\) not in schema Chunks",
+    ):
+        index.search(Entries.dense.query([1.0, 0.0]), where=EVERYTHING, limit=10)
+
+
+def test_search_with_a_vector_not_in_the_schema_raises(index_with: IndexWith) -> None:
+    index = index_with(chunk())
+
+    with pytest.raises(
+        SchemaMismatchError, match="vector 'summary' not in schema Chunks"
+    ):
+        index.search(Other.summary.query([1.0, 0.0]), where=EVERYTHING, limit=10)
+
+
+@pytest.mark.parametrize("where", FOREIGN_FILTERS)
+def test_search_with_a_field_from_another_schema_raises(
+    where: Filter, index_with: IndexWith
+) -> None:
+    with pytest.raises(SchemaMismatchError):
+        index_with(chunk()).search(QUERY, where=where, limit=10)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True])
+def test_search_with_a_limit_that_is_not_a_positive_int_raises(
+    limit: int, index_with: IndexWith
+) -> None:
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        index_with(chunk()).search(QUERY, where=EVERYTHING, limit=limit)

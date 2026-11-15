@@ -1,27 +1,45 @@
 # Retrieval as a graph of stages
 
-Status: build steps 1 and 2 done; step 3 next (section 10). Branch:
-`features/retrieval-redesign`.
+Status: build steps 1 and 2 done, and `Index.search`, the first piece of step 3 (section
+10). Branch: `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
     the value checks;
   - `filters.py`: `Equals` (`eq`), `AnyOf` (`any_of`), and `and_` / `or_` / `not_`;
+  - `vectors.py`: `Dense` vectors, declared on the schema beside its fields, with checked
+    values (`Dense.value`) and queries (`Dense.query`); the closed unions `VectorValue` and
+    `VectorQuery`;
   - `chunks.py`: `Chunk`, and `Chunk.check_fits(schema)` raising `SchemaMismatchError`;
-  - `index/in_memory.py`: `InMemoryIndex` with `put`, `find`, `delete` and `replace`;
-  - `index/protocol.py`: the `Index` protocol, `check_batch` and `check_filter`, shared by
-    every backend; `tests/index/test_contract.py` runs the behaviour tests against each
-    backend: in memory, Qdrant's local mode, and a Qdrant server when `KB_TEST_QDRANT_URL` is
-    set;
+    `EmbeddedChunk`, a chunk with its vector values, which every write takes; `Hit`, a chunk
+    with its score, which search returns;
+  - `index/in_memory.py`: `InMemoryIndex` with `put`, `find`, `delete`, `replace` and
+    `search` (exact cosine and dot, in plain Python: the core has no dependencies);
+  - `index/protocol.py`: the `Index` protocol, `check_batch`, `check_filter`, `check_query`
+    and `check_limit`, shared by every backend; `tests/index/test_contract.py` runs the
+    behaviour tests, search included, against each backend: in memory, Qdrant's local mode,
+    and a Qdrant server when `KB_TEST_QDRANT_URL` is set;
   - `index/qdrant/payload.py`: encoding a chunk as a Qdrant payload and decoding it strictly;
   - `index/qdrant/filters.py`: compiling filters to Qdrant's must / should / must_not;
-  - `index/qdrant/index.py`: `QdrantIndex` with `put`, `find`, `delete` and `replace`, behind
-    the `qdrant` extra, and `QdrantIndex.open`, the startup check: it creates the collection
-    and the payload indexes it lacks (one per `indexed=True` field, plus `written_fields`),
-    and refuses to open on an index of the wrong type or on points that don't fit the schema
+  - `index/qdrant/index.py`: `QdrantIndex` with `put`, `find`, `delete`, `replace` and
+    `search` (`query_points`, filtered inside Qdrant), behind the `qdrant` extra, and `QdrantIndex.open`, the startup check: it creates the collection
+    with the schema's named vectors and the payload indexes it lacks (one per `indexed=True`
+    field, plus `written_fields`), and refuses to open on vectors that differ from the
+    schema's, on an index of the wrong type, or on points that don't fit the schema
     (section 6, "The schema"); `tests/index/test_qdrant_open.py` tests it, the payload
     indexes against a server only.
-- Next, step 3: statements and the executor.
+- **Pick up here** (as of 2026-11-16; the folder layout is in section 10):
+  1. Leftover nit: `QdrantIndex._to_chunk` takes `ScoredPoint`s too now, so rename its
+     `record` parameter to `point`.
+  2. `embedders/`: the `Embedder` protocol, `embed_chunks(chunks, *, embedder)` building
+     `EmbeddedChunk`s, and a deterministic fake embedder in `src`, with
+     `tests/embedders/test_embed_chunks.py`.
+  3. `engine/`, in dependency order: statements (`search(question)` and the type-state
+     steps), stages (retrieve, merge, rerank, take), candidates (`Candidate`, the trail,
+     `Passage`), the executor, the session (`Engine`, `Session(access=…)`,
+     `AllowEverything`) and the gates. The executor turns each source's `Hit`s into
+     candidates and merges sources by rank.
+  4. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
 - Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
   `One`, filtering by chunk ids.
 
@@ -213,8 +231,8 @@ Chunk
   never overwrite the old version's while both are in the index (see "Currency" below).
 - **`embedded_text` is where context goes**, e.g. the headings path prefixed to the text. That
   is the reason it can differ from `text`.
-- **Vectors aren't part of the chunk.** Vector names (dense, sparse) and the embedder belong to
-  the index's configuration.
+- **Vectors aren't part of the chunk.** The schema declares them, and a write pairs a chunk with
+  its vector values in an `EmbeddedChunk` ("Vectors" below).
 - **Everything else is a field:** document id, version, position, headings, reference keys,
   access groups.
 - **"Faithful" narrows.** The framework guarantees only that `text` comes back exactly as it
@@ -439,10 +457,10 @@ Chunk(
   for tests and single-process local runs. It is single-threaded and promises no more than
   Qdrant: no locks, so `replace` isn't made atomic there either (in Qdrant it is two requests).
   Why: the API and the worker are separate processes, so production needs Qdrant anyway, and a
-  stronger in-memory index would let tests pass on guarantees Qdrant doesn't give. Vectors come
-  with retrieve stages (build step 3).
-- **The Qdrant index** (`QdrantIndex`) passes the same contract tests. Its points have no
-  vectors yet; the embedder comes with search.
+  stronger in-memory index would let tests pass on guarantees Qdrant doesn't give. It stores
+  vector values already; ranking by them comes with `Index.search` (build step 3).
+- **The Qdrant index** (`QdrantIndex`) passes the same contract tests. Each vector value is one
+  of the point's named vectors.
   - **`put` sends one `upsert` request**, not `upload_points`. Why: `upload_points` splits a
     write into batches of 64, so a failure partway leaves part of a version stored. A
     document's chunks fit in one request (Qdrant's default limit is 32 MB). An empty write
@@ -464,6 +482,103 @@ Chunk(
   and have the right types.
 - A **standard schema preset** (document id, position, headings) is offered as a convenience,
   never as a requirement. Why: without one, every app would rebuild the basics.
+
+### Vectors
+
+```python
+class KbChunks(Schema):
+    document_id = One(UUID, indexed=True)
+    ...
+    dense = Dense(size=1024, distance="cosine")
+
+
+# writing: the caller embeds, then pairs each chunk with its values
+index.put([EmbeddedChunk(chunk=chunk, vector_values=[KbChunks.dense.value(numbers)])])
+
+# searching
+hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=20)
+```
+
+- **Vectors are declared on the schema, beside its fields.** `Field` and `Vector` share a
+  `Declaration` base, which takes its name from the class body (`__set_name__`). So one schema
+  can't have a field and a vector with the same name. The declaration also carries what the
+  backend needs to create the collection, such as `Dense`'s size and distance.
+- **Vectors are named from the start (`dense`), even while there is only one.** Why: Qdrant
+  keeps named and unnamed vectors in different layouts. Adding a second vector to an unnamed
+  collection would mean re-indexing.
+- **The caller embeds; the index only stores and compares.** Why:
+  - the embedder serves both writes and searches;
+  - the index stays testable without a model;
+  - a backend never has to choose a model.
+- **Values and queries are checked where they enter:** `Dense.value(numbers)` for writes and
+  `Dense.query(numbers)` for searches. Each checks:
+  - exactly `size` numbers;
+  - real numbers only, with `bool` refused;
+  - every number finite.
+
+  For `"cosine"`, the caller needn't normalise: the backend does it.
+- **`EmbeddedChunk(chunk, vector_values)` is what every write takes.**
+  - Two values for vectors with one name are refused when it's built.
+  - `check_fits(schema)` compares fields and vectors as objects, and raises one
+    `SchemaMismatchError` naming the chunk and every extra or missing field and vector.
+  - A value's size isn't checked again there: it was checked against its own vector when built.
+- **Reads return the `Chunk` alone** (`find`, and `Hit` in search). Why:
+  - vectors are large;
+  - backends don't give them back as written: Qdrant stores float32 and normalises cosine
+    vectors, so `[3, 4]` reads back as `[0.6, 0.8]`;
+  - no caller needs them.
+
+  Planned changes that need neither re-embedding nor reading vectors back:
+  - `update_fields(*, where, values)` (Qdrant's `set_payload`) for `sync_attributes` (server
+    build step 7), so a changed title or group isn't re-embedded;
+  - later perhaps `export(where)`, for copying a collection.
+- **Kinds:** only `Dense` exists. More kinds become further `Vector` subclasses when a source
+  needs them:
+  - `Sparse`: `Mapping[int, float]`, with a `modifier` (`"idf"` for BM25-style weights,
+    `"none"` for learned ones such as bge-m3's);
+  - `MultiDense`: many rows per chunk, one per token, compared by max-sim.
+
+  Each is a sibling of `Dense`, not a subclass. Why: `isinstance(vector, Dense)` would
+  otherwise match a `MultiDense` as well, and the order of the `case`s would decide
+  correctness. Each kind adds a `…Value` and a `…Query` to the closed unions `VectorValue` and
+  `VectorQuery`, so mypy points at every backend that hasn't learned it.
+- **Max-sim scores grow with the question's length,** so they aren't on any dense score's
+  scale. The executor merges sources by rank, and a score threshold can't be applied to a
+  multi-vector source as it is.
+- **Adding, dropping or changing a vector means a new collection:** Qdrant can't change a
+  collection's vectors in place.
+
+**In Qdrant:** each vector value is one of the point's named vectors. Qdrant has two slots:
+
+| Kind | Slot | Settings compared at `open` |
+|---|---|---|
+| `Dense` | `vectors_config` | size, distance, one row |
+| `MultiDense` (later) | `vectors_config`, with `multivector_config` | size, distance, many rows (max-sim) |
+| `Sparse` (later) | `sparse_vectors_config` | modifier (none read back as `none`) |
+
+- **`open` refuses a collection whose vectors differ from the schema's.** It lists every
+  difference in one `SchemaMismatchError`, whose header gives the fix: re-index into a new
+  collection. It also creates nothing, so a refused collection gets no payload indexes. It
+  catches:
+  - a vector missing, as in a collection created before vectors existed;
+  - a vector the schema doesn't declare;
+  - a vector with other settings;
+  - a collection holding one unnamed vector.
+- **An extra vector is refused, not ignored.** It's treated like an unknown `written_fields`
+  entry, not like an extra payload index. Why: Qdrant accepts a point that lacks one of the
+  collection's named vectors, and a search by that vector silently skips the point. Older code
+  writing into a newer collection would quietly lose recall. An extra payload index, by
+  contrast, only changes speed.
+- **Settings are compared by describing each side, then comparing the descriptions.** Why:
+  - the message can't disagree with the check;
+  - adding a setting is one line;
+  - defaults the server fills in (`on_disk`, `hnsw_config`, …) never enter the description,
+    so they can't cause a false mismatch.
+
+  The rule that comes with it: a setting the description leaves out isn't compared.
+- **What `open` doesn't check:** points that lack a vector. The index's own writes can't
+  produce them, since `check_fits` demands every vector, and a missing vector costs recall,
+  not access. If that's ever needed, Qdrant's `HasVectorCondition` can count them.
 
 ### Filter expressions
 
@@ -696,6 +811,117 @@ stage kinds afterwards is cheap.
   `document_processor`, moving to `packages/ingest/`) and `salemdex-server` (today's
   `kb_server`). The GitHub repo is already `salemdex`.
 
+**Folder layout.** The core modules stay at the top level. Each new kind of part gets a
+subfolder when it first arrives. The public API is re-exported from
+`salemdex_retrieval/__init__.py` before build step 4, when the server starts using it.
+
+```text
+src/salemdex_retrieval/
+  __init__.py              public API re-exports (before build step 4)
+  declarations.py  errors.py  schema.py  filters.py                       core
+  vectors.py               Dense, VectorValue, VectorQuery (closed unions)
+  chunks.py                Chunk, EmbeddedChunk, Hit (chunk, score)
+
+  index/                   storing and finding chunks
+    __init__.py            Index, InMemoryIndex
+    protocol.py            Index, check_batch, check_filter, check_query, check_limit
+    in_memory.py           search: filter first, then score every stored value
+    qdrant/
+      index.py             search: query_points(using=…, query_filter=…, limit=…)
+      filters.py  payload.py
+      vector_config.py     when Sparse arrives: _VectorConfigs and the describers
+
+  embedders/               used by both writes and searches
+    __init__.py
+    protocol.py            Embedder, and embed_chunks(chunks, *, embedder)
+    fake.py                a deterministic embedder for tests, the server's too
+    huggingface.py         bge-m3, behind the `huggingface` extra
+
+  engine/                  retrieval itself (build step 3)
+    statements.py          search(question) and the type-state steps:
+                           Question → Queries → Candidates → Passages
+    stages.py              retrieve, merge (rrf), rerank, take, as data
+    candidates.py          Candidate, TrailEntry, Passage
+    executor.py            compiles a statement and runs it: adds the access filter to every
+                           source, the currency gate before rerank and at the end
+    session.py             Engine, Session(access=…), AllowEverything
+    gates.py               the Validity protocol, the currency check
+
+  rerankers/               with the rerank stage
+    protocol.py  huggingface.py
+
+tests/                     mirrors the source folders, each with its own __init__.py
+  index/                   test_contract.py holds the search cases too
+  embedders/               test_embed_chunks.py
+  engine/                  test_statements.py  test_executor.py  test_access.py  test_gates.py
+```
+
+- **`engine/`, not `search/`.** "Search" would otherwise name three things:
+  `index.search(query, where=…)` (one source, raw hits), the package, and the `search(question)`
+  builder, so a reader couldn't tell from the call site which one runs.
+  - `Index.search` keeps the word every vector store uses for a single-source read.
+  - The package is named after the `Engine` it exports.
+  - `search(question)` reads as "a search for this question", which is what a statement is.
+- **`Hit` lives in `chunks.py`, beside `EmbeddedChunk`.** One wraps a chunk on its way into the
+  index, the other on its way out. The executor then imports it from the core, not from
+  `index/`, to start each candidate's trail.
+- **`embed_chunks` sits beside the `Embedder` protocol,** as `check_batch` sits beside `Index`:
+  it's the one helper every caller of the protocol shares.
+- **The fake embedder lives in `src`,** as `InMemoryIndex` does. Why: the server's tests need
+  one without loading torch.
+- **Backends and models sit behind extras** (`qdrant`, `huggingface`). No package
+  `__init__.py` imports them.
+- **`engine/` modules depend only on those listed above them:** statements, stages,
+  candidates, executor, session, gates.
+
+**`Index.search` (built):**
+`index.search(query, *, where, limit) -> list[Hit]`.
+
+- **`query` is a `VectorQuery`:** `DenseQuery` now, later `| SparseQuery | MultiDenseQuery`.
+  - It carries its vector, so the backend knows which named vector to search.
+  - Its numbers were checked where they entered (`Dense.query`).
+  - The union is closed, so each backend `match`es on it and ends with `assert_never`. mypy
+    then points at every backend that hasn't learned a new kind.
+- **One query per call.** Several sources are the executor's job: it calls `search` once per
+  source and merges by rank.
+- **`check_query(query, *, schema)`** in `index/protocol.py`: the query's vector must be the
+  schema's own, compared as an object, as `check_filter` compares fields. Another schema's
+  vector with the same name raises `SchemaMismatchError`.
+- **`where` is required, with no default.** Every search carries a filter, and a required
+  argument can't be forgotten. Tests that want everything pass a filter matching everything.
+- **`limit` must be a positive `int`,** checked where it enters (`check_limit`, a
+  `ValueError`; a `bool` doesn't count), so no backend has to decide what 0 means.
+- **Every backend checks before reading:** `check_limit`, `check_query`, then `check_filter`.
+- **Ties come in no promised order.** The in-memory index keeps storage order; Qdrant
+  promises nothing, so the contract tests never build a tie.
+- **`Hit.score` is comparable only within one search's results:** higher is better for cosine
+  and dot, but never compared across vectors or questions. That's why the executor merges by
+  rank. A `Hit` holds the chunk without its vectors, as `find` does.
+- **The in-memory index scores in plain Python** (`math.sumprod`, `math.hypot`), not numpy.
+  Why: the core package has no dependencies, and numpy only arrived through
+  `qdrant-client`, so the package failed to import without the `qdrant` extra. A zero vector
+  scores 0.0 under cosine, as it does in Qdrant.
+- **Qdrant converts by kind in two helpers,** `_to_qdrant_value` (writes) and
+  `_to_qdrant_query` (searches), each a `match` ending in `assert_never`, returning
+  `_QdrantVectorData`. That alias is `list[float]` for now and widens with each kind
+  (`list[list[float]]` for multi-dense, `models.SparseVector` for sparse), so mypy catches a
+  case returning the wrong shape.
+- **Qdrant's search is exact only while the collection is small.** Below its indexing
+  threshold, Qdrant compares every vector, as the in-memory index does, which is why the
+  small contract tests can demand exact ranking. Once it builds the HNSW graph, ranking is
+  approximate: a restrictive `where` (a reader's few groups) can return fewer than `limit`
+  hits or miss the nearest. A payload index on each field the filter uses keeps it accurate,
+  since Qdrant can then count the matching points and compare them all when they're few. So
+  every field the engine filters every search by, `access_group_ids` above all, must be
+  declared `indexed=True` (build step 4).
+- **Contract tests:**
+  - hits come ranked by score, with scores compared within a tolerance: Qdrant stores float32
+    and normalises cosine vectors;
+  - `where` applies before ranking: a hidden chunk that scores best never appears, and `limit`
+    is still filled by visible chunks;
+  - `limit` is respected, and an empty index gives no hits;
+  - another schema's vector is refused, and so is a `limit` below 1.
+
 **Build order.** Each layer is tested before the next one depends on it.
 
 1. **Schema, chunk, filter expressions**, plus the in-memory index that translates them. All of
@@ -705,7 +931,9 @@ stage kinds afterwards is cheap.
    against it too. Extract the `Index` protocol the two share. **(done)**
 3. **Statements and the executor** with retrieve, merge, rerank and take, plus the session, the
    access filter and the validity check.
-4. **Port the server's indexing handlers** to the new API, then build search on it.
+4. **Port the server's indexing handlers** to the new API, then build search on it. The
+   server's schema declares `access_group_ids` and every other field each search filters by
+   with `indexed=True` ("`Index.search`" above).
 
 **Migration:** build the new API alongside the old one, port the callers (server indexing
 handlers, search, evaluation, tests), then delete the old API.

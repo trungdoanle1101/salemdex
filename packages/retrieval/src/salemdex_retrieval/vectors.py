@@ -24,6 +24,7 @@ type DenseDistance = Literal["cosine", "dot"]
 _DENSE_DISTANCES = get_args(DenseDistance.__value__)
 
 type VectorValue = DenseValue
+type VectorQuery = DenseQuery
 
 
 class Vector(Declaration):
