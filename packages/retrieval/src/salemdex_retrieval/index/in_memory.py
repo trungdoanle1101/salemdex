@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from typing import Final, assert_never
 
-from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
 from salemdex_retrieval.index.protocol import check_batch, check_filter
 from salemdex_retrieval.schema import Schema
@@ -29,42 +29,37 @@ class InMemoryIndex:
 
     def __init__(self, *, schema: type[Schema]) -> None:
         self.schema: Final = schema
-        self._chunks: dict[uuid.UUID, Chunk] = {}
+        self._embedded_chunks: dict[uuid.UUID, EmbeddedChunk] = {}
 
-    def put(self, chunks: Iterable[Chunk]) -> None:
-        """Store `chunks`, overwriting any stored chunk with the same id (`Index.put`)."""
-        for chunk in check_batch(chunks, schema=self.schema):
-            self._chunks[chunk.id] = chunk
+    def put(self, embedded_chunks: Iterable[EmbeddedChunk]) -> None:
+        """Store `embedded_chunks`, overwriting any stored chunk with the same id (`Index.put`)."""
+        for embedded in check_batch(embedded_chunks, schema=self.schema):
+            self._embedded_chunks[embedded.chunk.id] = embedded
 
     def find(self, *, where: Filter) -> list[Chunk]:
         """Return the stored chunks that `where` matches (`Index.find`)."""
         check_filter(where, schema=self.schema)
         matches = self._build_matcher(where)
-        return [chunk for chunk in self._chunks.values() if matches(chunk)]
+        return [
+            embedded.chunk
+            for embedded in self._embedded_chunks.values()
+            if matches(embedded.chunk)
+        ]
 
     def delete(self, *, where: Filter) -> None:
         """Remove the stored chunks that `where` matches (`Index.delete`)."""
         check_filter(where, schema=self.schema)
         matches = self._build_matcher(where)
-        self._chunks = {
-            chunk_id: chunk
-            for chunk_id, chunk in self._chunks.items()
-            if not matches(chunk)
-        }
+        self._remove(matches)
 
-    def replace(self, *, where: Filter, with_: Iterable[Chunk]) -> None:
+    def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
         """Swap the chunks `where` matches for `with_` (`Index.replace`)."""
         check_filter(where, schema=self.schema)
         matches = self._build_matcher(where)
-        chunks = check_batch(with_, schema=self.schema)
-        self._chunks = {
-            chunk_id: chunk
-            for chunk_id, chunk in self._chunks.items()
-            if not matches(chunk)
-        }
-
-        for chunk in chunks:
-            self._chunks[chunk.id] = chunk
+        batch = check_batch(with_, schema=self.schema)
+        self._remove(matches)
+        for embedded in batch:
+            self._embedded_chunks[embedded.chunk.id] = embedded
 
     def _build_matcher(self, where: Filter) -> Callable[[Chunk], bool]:
         """Return a function telling whether a chunk matches `where`.
@@ -88,3 +83,10 @@ class InMemoryIndex:
                 return lambda chunk: not part(chunk)
             case _:
                 assert_never(where)
+
+    def _remove(self, matches: Callable[[Chunk], bool]) -> None:
+        self._embedded_chunks = {
+            chunk_id: embedded
+            for chunk_id, embedded in self._embedded_chunks.items()
+            if not matches(embedded.chunk)
+        }

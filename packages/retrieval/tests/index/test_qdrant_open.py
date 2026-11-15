@@ -1,7 +1,7 @@
 """What `QdrantIndex.open` creates and what it refuses to open.
 
-The checks on stored points run on both Qdrant backends. The payload index tests need
-a server (KB_TEST_QDRANT_URL): the local client keeps no payload indexes.
+The checks on vectors and stored points run on both Qdrant backends. The payload index
+tests need a server (KB_TEST_QDRANT_URL): the local client keeps no payload indexes.
 """
 
 import re
@@ -12,11 +12,12 @@ from typing import Any
 import pytest
 from qdrant_client import QdrantClient, models
 
-from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.index.qdrant import QdrantIndex
 from salemdex_retrieval.index.qdrant.payload import encode_payload
 from salemdex_retrieval.schema import Many, One, Schema
+from salemdex_retrieval.vectors import Dense
 
 from .conftest import QDRANT_URL
 
@@ -25,7 +26,11 @@ class Docs(Schema):
     document_id = One(uuid.UUID, indexed=True)
     version = One(int)
     groups = Many(uuid.UUID, indexed=True)
+    dense = Dense(size=2, distance="cosine")
 
+
+# The vectors a collection of Docs is created with.
+DOCS_VECTORS = {"dense": models.VectorParams(size=2, distance=models.Distance.COSINE)}
 
 DOCUMENT = uuid.UUID("00000000-0000-0000-0000-000000000001")
 HR = uuid.UUID("00000000-0000-0000-0000-00000000000a")
@@ -96,6 +101,18 @@ def chunk(*, groups: list[uuid.UUID]) -> Chunk:
     )
 
 
+def embedded(chunk: Chunk) -> EmbeddedChunk:
+    """Return `chunk` of Docs with a value for its vector."""
+    return EmbeddedChunk(chunk=chunk, vector_values=[Docs.dense.value([1.0, 0.0])])
+
+
+def dense_params(
+    *, size: int = 2, distance: models.Distance = models.Distance.COSINE
+) -> models.VectorParams:
+    """Return Qdrant settings for a dense vector, by default those of Docs.dense."""
+    return models.VectorParams(size=size, distance=distance)
+
+
 def store_raw(client: QdrantClient, collection: str, payload: dict[str, Any]) -> None:
     """Write a point straight to Qdrant, bypassing the index's checks."""
     client.upsert(
@@ -128,7 +145,9 @@ def test_opening_a_missing_collection_creates_it(
 def test_points_written_by_the_index_open_again(
     client: QdrantClient, collection: str
 ) -> None:
-    open_docs(client, collection).put([chunk(groups=[HR]), chunk(groups=[])])
+    open_docs(client, collection).put(
+        [embedded(chunk(groups=[HR])), embedded(chunk(groups=[]))]
+    )
 
     open_docs(client, collection)
 
@@ -137,9 +156,138 @@ def test_a_many_with_no_values_does_not_count_as_missing(
     client: QdrantClient, collection: str
 ) -> None:
     # Qdrant can't tell [] from a missing list; written_fields can.
-    open_docs(client, collection).put([chunk(groups=[])])
+    open_docs(client, collection).put([embedded(chunk(groups=[]))])
 
     open_docs(client, collection)
+
+
+def test_opening_a_missing_collection_creates_the_schemas_vectors(
+    client: QdrantClient, collection: str
+) -> None:
+    open_docs(client, collection)
+
+    params = client.get_collection(collection).config.params
+    assert params.vectors == DOCS_VECTORS
+    assert not params.sparse_vectors
+
+
+# Refusing vectors that don't match the schema
+
+
+def test_a_vector_of_another_size_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(collection, vectors_config={"dense": dense_params(size=3)})
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match=re.escape(
+            "dense: schema has size 2, distance Cosine, one row; "
+            "collection has size 3, distance Cosine, one row"
+        ),
+    ):
+        open_docs(client, collection)
+
+
+def test_a_vector_with_another_distance_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection, vectors_config={"dense": dense_params(distance=models.Distance.DOT)}
+    )
+
+    with pytest.raises(
+        SchemaMismatchError, match="collection has size 2, distance Dot"
+    ):
+        open_docs(client, collection)
+
+
+def test_a_multi_vector_refuses_to_open_where_the_schema_has_one_row(
+    client: QdrantClient, collection: str
+) -> None:
+    multi = dense_params().model_copy(
+        update={
+            "multivector_config": models.MultiVectorConfig(
+                comparator=models.MultiVectorComparator.MAX_SIM
+            )
+        }
+    )
+    client.create_collection(collection, vectors_config={"dense": multi})
+
+    with pytest.raises(SchemaMismatchError, match=re.escape("many rows (max_sim)")):
+        open_docs(client, collection)
+
+
+def test_a_collection_made_before_vectors_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(collection, vectors_config={})
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match="dense: the schema declares it; the collection lacks it",
+    ):
+        open_docs(client, collection)
+
+
+def test_a_vector_the_schema_does_not_declare_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection, vectors_config={**DOCS_VECTORS, "title": dense_params()}
+    )
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match="title: the collection has it; the schema doesn't declare it",
+    ):
+        open_docs(client, collection)
+
+
+def test_a_sparse_vector_the_schema_does_not_declare_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection,
+        vectors_config=DOCS_VECTORS,
+        sparse_vectors_config={"keywords": models.SparseVectorParams()},
+    )
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match="keywords: the collection has it; the schema doesn't declare it",
+    ):
+        open_docs(client, collection)
+
+
+def test_a_collection_with_one_unnamed_vector_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(collection, vectors_config=dense_params())
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match=re.escape("holds one unnamed vector, but schema Docs declares named "),
+    ):
+        open_docs(client, collection)
+
+
+def test_every_vector_problem_is_listed_in_one_error_naming_the_fix(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection,
+        vectors_config={"dense": dense_params(size=3), "title": dense_params()},
+    )
+
+    with pytest.raises(SchemaMismatchError) as raised:
+        open_docs(client, collection)
+
+    header, *problems = str(raised.value).splitlines()
+    assert collection in header
+    assert "schema Docs" in header
+    assert "re-index into a new collection" in header
+    assert [problem.split(":")[0] for problem in problems] == ["dense", "title"]
 
 
 # Refusing points that don't fit the schema
@@ -230,6 +378,17 @@ def test_opening_creates_an_index_for_each_indexed_field_and_written_fields(
     }
 
 
+def test_a_collection_refused_for_its_vectors_gets_no_payload_index(
+    server_client: QdrantClient, server_collection: str
+) -> None:
+    server_client.create_collection(server_collection, vectors_config={})
+
+    with pytest.raises(SchemaMismatchError):
+        open_docs(server_client, server_collection)
+
+    assert _index_types(server_client, server_collection) == {}
+
+
 def test_opening_again_keeps_the_indexes(
     server_client: QdrantClient, server_collection: str
 ) -> None:
@@ -244,7 +403,7 @@ def test_opening_again_keeps_the_indexes(
 def test_an_index_of_the_wrong_type_refuses_to_open_and_creates_nothing(
     server_client: QdrantClient, server_collection: str
 ) -> None:
-    server_client.create_collection(server_collection, vectors_config={})
+    server_client.create_collection(server_collection, vectors_config=DOCS_VECTORS)
     server_client.create_payload_index(
         server_collection,
         field_name="field_values.document_id",
@@ -266,7 +425,7 @@ def test_an_index_of_the_wrong_type_refuses_to_open_and_creates_nothing(
 def test_an_index_the_schema_does_not_ask_for_is_left_alone(
     server_client: QdrantClient, server_collection: str
 ) -> None:
-    server_client.create_collection(server_collection, vectors_config={})
+    server_client.create_collection(server_collection, vectors_config=DOCS_VECTORS)
     server_client.create_payload_index(
         server_collection,
         field_name="field_values.version",

@@ -8,14 +8,14 @@ import uuid
 from collections.abc import Iterable
 from typing import Protocol, assert_never
 
-from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
 from salemdex_retrieval.schema import Schema
 
 
 class Index(Protocol):
-    """Chunks of one schema, stored by id and selected by filters.
+    """Chunks of one schema, stored by id with their vectors and selected by filters.
 
     Every filter is checked against the schema before any chunk is read or changed,
     and every write is checked in full before any chunk is stored: a write either
@@ -27,13 +27,14 @@ class Index(Protocol):
         """The schema every chunk and every filter field must belong to; never changes."""
         ...
 
-    def put(self, chunks: Iterable[Chunk]) -> None:
-        """Store `chunks`, overwriting any stored chunk with the same id.
+    def put(self, embedded_chunks: Iterable[EmbeddedChunk]) -> None:
+        """Store `embedded_chunks`, overwriting any stored chunk with the same id.
 
         Writing the same chunks again changes nothing, so a retried write is safe.
+        Reads return the chunks without their vectors.
 
         Args:
-            chunks: The chunks to store.
+            embedded_chunks: The chunks to store, each with its vector values.
 
         Raises:
             SchemaMismatchError: A chunk doesn't fit the schema. Nothing is stored.
@@ -67,7 +68,7 @@ class Index(Protocol):
         """
         ...
 
-    def replace(self, *, where: Filter, with_: Iterable[Chunk]) -> None:
+    def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
         """Remove the chunks that `where` matches and store `with_` in their place.
 
         Like SQL's DELETE … WHERE then INSERT: the new chunks needn't match `where`.
@@ -80,7 +81,7 @@ class Index(Protocol):
 
         Args:
             where: Which chunks to remove.
-            with_: The chunks to store instead.
+            with_: The chunks to store instead, each with its vector values.
 
         Raises:
             SchemaMismatchError: `where` uses a field that isn't in the schema, or a
@@ -90,30 +91,33 @@ class Index(Protocol):
         ...
 
 
-def check_batch(chunks: Iterable[Chunk], *, schema: type[Schema]) -> list[Chunk]:
-    """Return `chunks` as a list, after checking every one of them against `schema`.
+def check_batch(
+    embedded_chunks: Iterable[EmbeddedChunk], *, schema: type[Schema]
+) -> list[EmbeddedChunk]:
+    """Return `embedded_chunks` as a list, after checking each against `schema`.
 
     Every backend calls it before storing anything, so a write is checked in full
     first and nothing is stored when one chunk is wrong.
 
     Args:
-        chunks: The chunks about to be written.
+        embedded_chunks: The chunks about to be written, with their vector values.
         schema: The schema of the index they're written to.
 
     Returns:
         The same chunks, in the same order.
 
     Raises:
-        SchemaMismatchError: A chunk doesn't fit the schema.
+        SchemaMismatchError: A chunk's fields or vectors don't fit the schema.
         ValueError: Two chunks share an id.
     """
-    batch = list(chunks)
+    batch = list(embedded_chunks)
     seen: set[uuid.UUID] = set()
-    for chunk in batch:
-        if chunk.id in seen:
-            raise ValueError(f"duplicate chunk {chunk.id} in batch")
-        chunk.check_fits(schema)
-        seen.add(chunk.id)
+    for embedded in batch:
+        chunk_id = embedded.chunk.id
+        if chunk_id in seen:
+            raise ValueError(f"duplicate chunk {chunk_id} in batch")
+        embedded.check_fits(schema)
+        seen.add(chunk_id)
     return batch
 
 

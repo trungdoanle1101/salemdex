@@ -10,11 +10,12 @@ from typing import Protocol
 
 import pytest
 
-from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter, and_, not_, or_
 from salemdex_retrieval.index import Index
 from salemdex_retrieval.schema import Many, One, Schema
+from salemdex_retrieval.vectors import Dense
 
 
 class Chunks(Schema):
@@ -22,10 +23,12 @@ class Chunks(Schema):
     version = One(int)
     position = One(int)
     groups = Many(uuid.UUID, indexed=True)
+    dense = Dense(size=2, distance="cosine")
 
 
 class Entries(Schema):
     version = One(int)
+    dense = Dense(size=2, distance="cosine")
 
 
 class Other(Schema):
@@ -69,6 +72,35 @@ def unfit_chunk() -> Chunk:
     )
 
 
+def embedded(chunk: Chunk) -> EmbeddedChunk:
+    """Return `chunk` of Chunks with a value for its vector.
+
+    Every chunk gets the same value: these tests store and select, they don't rank.
+    """
+    return EmbeddedChunk(chunk=chunk, vector_values=[Chunks.dense.value([1.0, 0.0])])
+
+
+def embedded_all(*chunks: Chunk) -> list[EmbeddedChunk]:
+    """Return each chunk of Chunks with a value for its vector, as `embedded` does."""
+    return [embedded(c) for c in chunks]
+
+
+# Embedded chunks that don't fit Chunks, whatever their fields.
+UNFIT = [
+    pytest.param(lambda: embedded(unfit_chunk()), id="a field missing"),
+    pytest.param(
+        lambda: EmbeddedChunk(chunk=chunk(position=9), vector_values=[]),
+        id="a vector missing",
+    ),
+    pytest.param(
+        lambda: EmbeddedChunk(
+            chunk=chunk(position=9), vector_values=[Entries.dense.value([1.0, 0.0])]
+        ),
+        id="another schema's vector",
+    ),
+]
+
+
 class IndexWith(Protocol):
     def __call__(self, *chunks: Chunk) -> Index: ...
 
@@ -79,7 +111,7 @@ def index_with(new_index: Callable[[type[Schema]], Index]) -> IndexWith:
 
     def open_with(*chunks: Chunk) -> Index:
         index = new_index(Chunks)
-        index.put(chunks)
+        index.put(embedded_all(*chunks))
         return index
 
     return open_with
@@ -128,7 +160,7 @@ def test_find_returns_nothing_when_no_chunk_matches(index_with: IndexWith) -> No
 def test_put_accepts_any_iterable_such_as_a_generator(index_with: IndexWith) -> None:
     index = index_with()
 
-    index.put(chunk(position=p) for p in range(3))
+    index.put(embedded(chunk(position=p)) for p in range(3))
 
     assert len(index.find(where=EVERYTHING)) == 3
 
@@ -137,7 +169,7 @@ def test_putting_the_same_chunks_again_changes_nothing(index_with: IndexWith) ->
     chunks = [chunk(position=0), chunk(position=1)]
     index = index_with(*chunks)
 
-    index.put(chunks)
+    index.put(embedded_all(*chunks))
 
     assert ids(index.find(where=EVERYTHING)) == ids(chunks)
 
@@ -145,19 +177,20 @@ def test_putting_the_same_chunks_again_changes_nothing(index_with: IndexWith) ->
 def test_put_overwrites_a_stored_chunk_with_the_same_id(index_with: IndexWith) -> None:
     index = index_with(chunk(text="old"))
 
-    index.put([chunk(text="new")])
+    index.put([embedded(chunk(text="new"))])
 
     [found] = index.find(where=EVERYTHING)
     assert found.text == "new"
 
 
+@pytest.mark.parametrize("unfit", UNFIT)
 def test_put_stores_nothing_when_one_chunk_does_not_fit_the_schema(
-    index_with: IndexWith,
+    unfit: Callable[[], EmbeddedChunk], index_with: IndexWith
 ) -> None:
     index = index_with()
 
     with pytest.raises(SchemaMismatchError):
-        index.put([chunk(position=0), chunk(position=1), unfit_chunk()])
+        index.put([*embedded_all(chunk(position=0), chunk(position=1)), unfit()])
 
     assert index.find(where=EVERYTHING) == []
 
@@ -167,7 +200,7 @@ def test_put_stores_nothing_when_two_chunks_share_an_id(index_with: IndexWith) -
     repeated = chunk()
 
     with pytest.raises(ValueError, match=str(repeated.id)):
-        index.put([chunk(position=1), repeated, chunk(text="other text")])
+        index.put(embedded_all(chunk(position=1), repeated, chunk(text="other text")))
 
     assert index.find(where=EVERYTHING) == []
 
@@ -301,7 +334,8 @@ def typed_index_with(new_index: Callable[[type[Schema]], Index]) -> IndexWith:
 
     def open_with(*chunks: Chunk) -> Index:
         index = new_index(Typed)
-        index.put(chunks)
+        # Typed declares no vectors: an index of such a schema stores fields only.
+        index.put(EmbeddedChunk(chunk=c, vector_values=[]) for c in chunks)
         return index
 
     return open_with
@@ -450,7 +484,7 @@ def test_replace_swaps_the_matched_chunks_for_the_new_ones(
     new = [chunk(version=2, position=p) for p in range(2)]
     index = index_with(*old, other)
 
-    index.replace(where=Chunks.document_id.eq(DOCUMENT), with_=new)
+    index.replace(where=Chunks.document_id.eq(DOCUMENT), with_=embedded_all(*new))
 
     assert ids(index.find(where=EVERYTHING)) == ids([*new, other])
 
@@ -463,7 +497,8 @@ def test_replace_accepts_new_chunks_that_do_not_match_its_filter(
     index = index_with(v1)
 
     index.replace(
-        where=and_(Chunks.document_id.eq(DOCUMENT), Chunks.version.eq(1)), with_=[v2]
+        where=and_(Chunks.document_id.eq(DOCUMENT), Chunks.version.eq(1)),
+        with_=[embedded(v2)],
     )
 
     assert ids(index.find(where=EVERYTHING)) == {v2.id}
@@ -474,8 +509,8 @@ def test_repeating_a_replace_gives_the_same_chunks(index_with: IndexWith) -> Non
     index = index_with(chunk(version=1))
     where = Chunks.document_id.eq(DOCUMENT)
 
-    index.replace(where=where, with_=new)
-    index.replace(where=where, with_=new)
+    index.replace(where=where, with_=embedded_all(*new))
+    index.replace(where=where, with_=embedded_all(*new))
 
     assert ids(index.find(where=EVERYTHING)) == ids(new)
 
@@ -485,7 +520,9 @@ def test_replace_keeps_a_new_chunk_that_overwrites_a_matched_one(
 ) -> None:
     index = index_with(chunk(text="old"))
 
-    index.replace(where=Chunks.document_id.eq(DOCUMENT), with_=[chunk(text="new")])
+    index.replace(
+        where=Chunks.document_id.eq(DOCUMENT), with_=[embedded(chunk(text="new"))]
+    )
 
     [found] = index.find(where=EVERYTHING)
     assert found.text == "new"
@@ -500,8 +537,9 @@ def test_replace_with_no_chunks_removes_the_matched_ones(index_with: IndexWith) 
     assert ids(index.find(where=EVERYTHING)) == {other.id}
 
 
+@pytest.mark.parametrize("unfit", UNFIT)
 def test_replace_changes_nothing_when_a_new_chunk_does_not_fit_the_schema(
-    index_with: IndexWith,
+    unfit: Callable[[], EmbeddedChunk], index_with: IndexWith
 ) -> None:
     old = [chunk(position=p) for p in range(2)]
     index = index_with(*old)
@@ -509,7 +547,7 @@ def test_replace_changes_nothing_when_a_new_chunk_does_not_fit_the_schema(
     with pytest.raises(SchemaMismatchError):
         index.replace(
             where=Chunks.document_id.eq(DOCUMENT),
-            with_=[chunk(version=2), unfit_chunk()],
+            with_=[embedded(chunk(version=2)), unfit()],
         )
 
     assert ids(index.find(where=EVERYTHING)) == ids(old)
@@ -524,7 +562,7 @@ def test_replace_changes_nothing_when_two_new_chunks_share_an_id(
     with pytest.raises(ValueError, match="duplicate"):
         index.replace(
             where=Chunks.document_id.eq(DOCUMENT),
-            with_=[chunk(version=2), chunk(version=2, text="other text")],
+            with_=embedded_all(chunk(version=2), chunk(version=2, text="other text")),
         )
 
     assert ids(index.find(where=EVERYTHING)) == {old.id}
@@ -537,6 +575,8 @@ def test_replace_changes_nothing_when_its_filter_uses_a_foreign_field(
     index = index_with(old)
 
     with pytest.raises(SchemaMismatchError):
-        index.replace(where=not_(Entries.version.eq(2)), with_=[chunk(version=2)])
+        index.replace(
+            where=not_(Entries.version.eq(2)), with_=[embedded(chunk(version=2))]
+        )
 
     assert ids(index.find(where=EVERYTHING)) == {old.id}

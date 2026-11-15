@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import ClassVar, Final, Literal, get_args
 
@@ -22,6 +22,8 @@ from salemdex_retrieval.errors import SchemaError
 type DenseDistance = Literal["cosine", "dot"]
 
 _DENSE_DISTANCES = get_args(DenseDistance.__value__)
+
+type VectorValue = DenseValue
 
 
 class Vector(Declaration):
@@ -137,7 +139,7 @@ class DenseValue:
     """
 
     vector: Dense
-    numbers: tuple[float, ...]
+    numbers: tuple[float, ...] = field(repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -150,4 +152,4 @@ class DenseQuery:
     """
 
     vector: Dense
-    numbers: tuple[float, ...]
+    numbers: tuple[float, ...] = field(repr=False)
