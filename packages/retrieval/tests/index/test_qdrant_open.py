@@ -12,7 +12,8 @@ from typing import Any
 import pytest
 from qdrant_client import QdrantClient, models
 
-from salemdex_retrieval.chunks import Chunk, SchemaMismatchError
+from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.index.qdrant import QdrantIndex
 from salemdex_retrieval.index.qdrant.payload import encode_payload
 from salemdex_retrieval.schema import Many, One, Schema

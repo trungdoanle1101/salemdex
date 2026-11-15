@@ -15,7 +15,8 @@ from typing import Final, Self
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-from salemdex_retrieval.chunks import Chunk, SchemaMismatchError
+from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter
 from salemdex_retrieval.index.protocol import check_batch, check_filter
 from salemdex_retrieval.index.qdrant.filters import build_qdrant_filter

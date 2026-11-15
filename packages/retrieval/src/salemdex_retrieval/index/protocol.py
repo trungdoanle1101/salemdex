@@ -8,7 +8,8 @@ import uuid
 from collections.abc import Iterable
 from typing import Protocol, assert_never
 
-from salemdex_retrieval.chunks import Chunk, SchemaMismatchError
+from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
 from salemdex_retrieval.schema import Schema
 

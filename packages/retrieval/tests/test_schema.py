@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from salemdex_retrieval.declarations import Declaration
+from salemdex_retrieval.errors import SchemaError
 from salemdex_retrieval.schema import (
     Field,
     Many,
@@ -15,8 +17,8 @@ from salemdex_retrieval.schema import (
     One,
     OneValue,
     Schema,
-    SchemaError,
 )
+from salemdex_retrieval.vectors import Dense
 
 
 class Level(int):
@@ -84,15 +86,15 @@ def test_fields_take_their_names_from_the_schema_class_body() -> None:
 @pytest.mark.parametrize(
     ("field", "example"),
     [
-        pytest.param(One(uuid.UUID), "One(UUID)", id="One"),
-        pytest.param(Many(str), "Many(str)", id="Many"),
+        pytest.param(One(uuid.UUID), "One", id="One"),
+        pytest.param(Many(str), "Many", id="Many"),
     ],
 )
 def test_a_field_outside_a_schema_class_body_has_no_name_and_says_how_to_declare_it(
     field: Field[Any], example: str
 ) -> None:
     with pytest.raises(
-        SchemaError, match=rf"field has no name.*my_field = {re.escape(example)}"
+        SchemaError, match=rf"{example} has no name.*my_field = {example}\(\.\.\.\)"
     ):
         _ = field.name
 
@@ -226,7 +228,9 @@ def test_inheriting_two_different_fields_with_one_name_is_rejected() -> None:
     class Second(Schema):
         position = One(int)
 
-    with pytest.raises(SchemaError, match="Both inherits two different fields named"):
+    with pytest.raises(
+        SchemaError, match="Both inherits two different declarations named 'position'"
+    ):
 
         class Both(First, Second):
             pass
@@ -240,22 +244,103 @@ def test_inheriting_two_different_fields_with_one_name_is_rejected() -> None:
     ],
 )
 def test_an_inherited_field_cannot_be_redefined_or_hidden(replacement: Any) -> None:
-    with pytest.raises(SchemaError, match="Chunks.position hides an inherited field"):
+    with pytest.raises(
+        SchemaError, match="Chunks.position hides an inherited declaration"
+    ):
         type("Chunks", (Standard,), {"position": replacement})
 
 
 def test_an_inherited_field_cannot_be_hidden_by_a_method() -> None:
-    with pytest.raises(SchemaError, match="Chunks.position hides an inherited field"):
+    with pytest.raises(
+        SchemaError, match="Chunks.position hides an inherited declaration"
+    ):
 
         class Chunks(Standard):
             def position(self) -> int:  # type: ignore[override]
                 return 0
 
 
-@pytest.mark.parametrize("name", ["fields", "_fields"])
+RESERVED_NAMES = ["fields", "vectors", "_fields", "_vectors", "_declarations"]
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
 def test_a_field_cannot_take_a_name_the_schema_uses(name: str) -> None:
     with pytest.raises(SchemaError, match=f"'{name}' is .*reserved"):
         type("Chunks", (Schema,), {name: Many(str)})
+
+
+# Fields and vectors in one schema
+
+
+class Embedded(Schema):
+    document_id = One(uuid.UUID)
+    dense = Dense(size=3, distance="cosine")
+
+
+def test_a_schema_lists_its_fields_and_its_vectors_apart() -> None:
+    assert list(Embedded.fields()) == ["document_id"]
+    assert list(Embedded.vectors()) == ["dense"]
+    assert Embedded.vectors()["dense"] is Embedded.dense
+
+
+def test_a_schema_lists_inherited_vectors_first() -> None:
+    class Chunks(Embedded):
+        sentence = Dense(size=2, distance="dot")
+
+    assert list(Chunks.vectors()) == ["dense", "sentence"]
+    assert list(Chunks.fields()) == ["document_id"]
+
+
+def test_the_base_schema_and_a_schema_of_fields_only_have_no_vectors() -> None:
+    assert dict(Schema.vectors()) == {}
+    assert dict(Standard.vectors()) == {}
+
+
+def test_the_vectors_of_a_schema_cannot_be_changed() -> None:
+    with pytest.raises(TypeError):
+        Embedded.vectors()["other"] = Dense(size=3, distance="cosine")  # type: ignore[index]
+
+
+def test_inheriting_a_field_and_a_vector_with_one_name_is_rejected() -> None:
+    class WithField(Schema):
+        dense = One(int)
+
+    with pytest.raises(
+        SchemaError, match="Both inherits two different declarations named 'dense'"
+    ):
+        type("Both", (WithField, Embedded), {})
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        pytest.param("dense", One(int), id="a vector by a field"),
+        pytest.param(
+            "document_id", Dense(size=3, distance="cosine"), id="a field by a vector"
+        ),
+    ],
+)
+def test_an_inherited_declaration_cannot_be_hidden_by_one_of_the_other_kind(
+    name: str, replacement: Any
+) -> None:
+    with pytest.raises(
+        SchemaError, match=f"Chunks.{name} hides an inherited declaration"
+    ):
+        type("Chunks", (Embedded,), {name: replacement})
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
+def test_a_vector_cannot_take_a_name_the_schema_uses(name: str) -> None:
+    with pytest.raises(SchemaError, match=f"'{name}' is .*reserved"):
+        type("Chunks", (Schema,), {name: Dense(size=3, distance="cosine")})
+
+
+def test_a_declaration_that_is_neither_a_field_nor_a_vector_is_rejected() -> None:
+    class Note(Declaration):
+        _kind = "note"
+
+    with pytest.raises(SchemaError, match="'remark' .*unknown declaration .*Note"):
+        type("Chunks", (Schema,), {"remark": Note()})
 
 
 class Record(Schema):

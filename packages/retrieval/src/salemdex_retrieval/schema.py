@@ -1,7 +1,8 @@
-"""The typed fields a chunk holds, and the checked values written for them.
+"""The typed fields a chunk holds, the checked values written for them, and `Schema`.
 
-A schema subclasses `Schema` and declares `One` and `Many` fields. Each field checks
-values where they enter: for writes (`value`) and for filters (`eq`, `any_of`).
+A schema subclasses `Schema` and declares `One` and `Many` fields, and the vectors of
+`vectors.py`. Each field checks values where they enter: for writes (`value`) and for
+filters (`eq`, `any_of`).
 """
 
 from __future__ import annotations
@@ -12,9 +13,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, ClassVar, Final
 
+from salemdex_retrieval.declarations import Declaration
+from salemdex_retrieval.errors import SchemaError
 from salemdex_retrieval.filters import AnyOf, Equals
+from salemdex_retrieval.vectors import Vector
 
 _VALUE_TYPES = (str, int, float, bool, uuid.UUID, datetime)
 
@@ -23,11 +27,7 @@ _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 
-class SchemaError(Exception):
-    """Raised when a schema or a field is declared against the rules."""
-
-
-class Field[T]:
+class Field[T](Declaration):
     """A typed, named field of a schema.
 
     `One` and `Many` add what differs by kind: how a chunk's value is given, and which
@@ -42,6 +42,8 @@ class Field[T]:
         indexed: Whether backends build an index on the field for filtering.
     """
 
+    _kind: ClassVar[str] = "field"
+
     def __init__(self, value_type: type[T], *, indexed: bool = False) -> None:
         """Declare a field whose values are of `value_type`.
 
@@ -54,6 +56,7 @@ class Field[T]:
         Raises:
             TypeError: `value_type` isn't one of the supported types.
         """
+        super().__init__()
         if value_type not in _VALUE_TYPES:
             supported_types = ", ".join(t.__name__ for t in _VALUE_TYPES)
             raise TypeError(
@@ -61,21 +64,6 @@ class Field[T]:
             )
         self.value_type: Final = value_type
         self.indexed: Final = indexed
-        self._name: str | None = None
-
-    def __set_name__(self, owner: type[Any], name: str) -> None:
-        """Take the attribute's name as the field's name.
-
-        Raises:
-            SchemaError: The field already has a name, in this class or another.
-        """
-        if self._name is not None:
-            raise SchemaError(
-                f"this {type(self).__name__}(...) is already the field {self._name!r}; "
-                f"declare a new {type(self).__name__}(...) for {name!r} "
-                f"in {owner.__name__}"
-            )
-        self._name = name
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
@@ -83,21 +71,6 @@ class Field[T]:
             f"{self.value_type.__name__}, name={self._name!r}, indexed={self.indexed}"
         )
         return f"{type_name}({arguments})"
-
-    @property
-    def name(self) -> str:
-        """The name the field was declared under.
-
-        Raises:
-            SchemaError: The field wasn't declared in a class body.
-        """
-        if self._name is None:
-            declaration = f"{type(self).__name__}({self.value_type.__name__})"
-            raise SchemaError(
-                f"field has no name; declare it in a schema class body, "
-                f"e.g. my_field = {declaration}"
-            )
-        return self._name
 
     def _check(self, value: object, *, position: int | None = None) -> T:
         """Return `value` checked against this field, an `int` widened for a `float`.
@@ -280,53 +253,74 @@ type FieldValue = OneValue[Any] | ManyValues[Any]
 
 
 class Schema:
-    """Base class for a schema: the fields every chunk of an index holds.
+    """Base class for a schema: the fields and vectors of every chunk in an index.
 
-    Declare `One` and `Many` fields in the class body. Fields come only from the class
-    body and from `Schema` bases. A field in a plain mixin isn't part of the schema, so
-    shared fields belong in a `Schema` preset.
+    Declare `One` and `Many` fields and vectors such as `Dense` in the class body.
+    Fields and vectors share one set of names. They come only from the class body and
+    from `Schema` bases. A declaration in a plain mixin isn't part of the schema, so
+    shared ones belong in a `Schema` preset.
 
     Example:
         class KbChunks(Schema):
             document_id = One(UUID, indexed=True)
             headings = Many(str)
             groups = Many(UUID, indexed=True)
+            dense = Dense(size=1024, distance="cosine")
     """
 
+    _declarations: Mapping[str, Declaration] = MappingProxyType({})
     _fields: Mapping[str, Field[Any]] = MappingProxyType({})
+    _vectors: Mapping[str, Vector] = MappingProxyType({})
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Collect the subclass's fields, inherited ones first.
+        """Collect the subclass's fields and vectors, inherited ones first.
 
         Raises:
-            SchemaError: Two bases give different fields one name, the class body
-                hides an inherited field, or a field takes a name `Schema` uses.
+            SchemaError: Two bases give different declarations one name (whether
+                fields, vectors or one of each), the class body hides an inherited
+                declaration, a declaration takes a name `Schema` uses, or one is
+                neither a field nor a vector.
         """
         super().__init_subclass__(**kwargs)
+        declarations: dict[str, Declaration] = {}
         fields: dict[str, Field[Any]] = {}
+        vectors: dict[str, Vector] = {}
         for base in cls.__bases__:
             if not issubclass(base, Schema):
                 continue
-            for name, field in base._fields.items():
-                if name in fields and fields[name] is not field:
+            for name, declaration in base._declarations.items():
+                if name in declarations and declarations[name] is not declaration:
                     raise SchemaError(
-                        f"{cls.__name__} inherits two different fields named {name!r}; "
+                        f"{cls.__name__} inherits two different declarations named {name!r}; "
                         "rename one in its preset"
                     )
-                fields[name] = field
+                declarations[name] = declaration
 
         for name, value in vars(cls).items():
-            if name in fields:
+            if name in declarations:
                 raise SchemaError(
-                    f"{cls.__name__}.{name} hides an inherited field; "
-                    "inherited fields can't be redefined or hidden"
+                    f"{cls.__name__}.{name} hides an inherited declaration; "
+                    "inherited declarations can't be redefined or hidden"
                 )
-            if isinstance(value, Field):
+
+            if isinstance(value, Declaration):
                 if name in dir(Schema):
                     raise SchemaError(f"{name!r} is a reserved name; use another name")
-                fields[name] = value
+                declarations[name] = value
 
+        for name, declaration in declarations.items():
+            if isinstance(declaration, Field):
+                fields[name] = declaration
+            elif isinstance(declaration, Vector):
+                vectors[name] = declaration
+            else:
+                raise SchemaError(
+                    f"{name!r} uses an unknown declaration of type {type(declaration).__name__}"
+                )
+
+        cls._declarations = MappingProxyType(declarations)
         cls._fields = MappingProxyType(fields)
+        cls._vectors = MappingProxyType(vectors)
 
     @classmethod
     def fields(cls) -> Mapping[str, Field[Any]]:
@@ -336,3 +330,12 @@ class Schema:
             A read-only mapping, inherited fields first, each in declaration order.
         """
         return cls._fields
+
+    @classmethod
+    def vectors(cls) -> Mapping[str, Vector]:
+        """Return the schema's vectors by name.
+
+        Returns:
+            A read-only mapping, inherited vectors first, each in declaration order.
+        """
+        return cls._vectors

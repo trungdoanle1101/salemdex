@@ -10,7 +10,8 @@ from typing import Protocol
 
 import pytest
 
-from salemdex_retrieval.chunks import Chunk, SchemaMismatchError
+from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter, and_, not_, or_
 from salemdex_retrieval.index import Index
 from salemdex_retrieval.schema import Many, One, Schema

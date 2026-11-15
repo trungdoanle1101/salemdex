@@ -6,17 +6,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, assert_never
 
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.schema import Field, FieldValue, ManyValues, OneValue, Schema
-
-
-class SchemaMismatchError(ValueError):
-    """Raised when a chunk, a filter or a stored index doesn't fit its schema.
-
-    A chunk's field values don't match the schema's fields, a filter uses a field
-    that isn't one of them, or what a backend holds contradicts the schema (a stored
-    point, a payload index of the wrong type). The schema itself is fine (that would be
-    a `SchemaError`), so retrying the same call can't help.
-    """
 
 
 @dataclass(frozen=True, kw_only=True, init=False)
