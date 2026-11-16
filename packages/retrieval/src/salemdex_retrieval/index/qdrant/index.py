@@ -240,7 +240,7 @@ class QdrantIndex:
             if offset is None:
                 return records
 
-    def _to_chunk(self, record: models.Record | models.ScoredPoint) -> Chunk:
+    def _to_chunk(self, point: models.Record | models.ScoredPoint) -> Chunk:
         """Return the chunk a point holds.
 
         Raises:
@@ -248,7 +248,7 @@ class QdrantIndex:
         """
         # No payload reads as an empty one, so the error names the missing keys.
         return decode_payload(
-            point_id=record.id, payload=record.payload or {}, schema=self.schema
+            point_id=point.id, payload=point.payload or {}, schema=self.schema
         )
 
     def _delete(self, qdrant_filter: models.Filter) -> None:
