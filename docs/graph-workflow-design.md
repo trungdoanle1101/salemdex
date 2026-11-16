@@ -1,7 +1,7 @@
 # Retrieval as a graph of stages
 
-Status: build steps 1 and 2 done, and `Index.search`, the first piece of step 3 (section
-10). Branch: `features/retrieval-redesign`.
+Status: build steps 1 and 2 done; of step 3, `Index.search` (section 10) and the embedder
+protocol with `embed_chunks` (section 6, "Embedders"). Branch: `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
@@ -27,19 +27,19 @@ Status: build steps 1 and 2 done, and `Index.search`, the first piece of step 3 
     field, plus `written_fields`), and refuses to open on vectors that differ from the
     schema's, on an index of the wrong type, or on points that don't fit the schema
     (section 6, "The schema"); `tests/index/test_qdrant_open.py` tests it, the payload
-    indexes against a server only.
+    indexes against a server only;
+  - `embedders/protocol.py`: the `DenseEmbedder` protocol, `DenseBinding` and the closed
+    union `VectorBinding`, and `embed_chunks(chunks, *, bindings)` (section 6,
+    "Embedders"), tested in `tests/embedders/test_embed_chunks.py`.
 - **Pick up here** (as of 2026-11-16; the folder layout is in section 10):
-  1. Leftover nit: `QdrantIndex._to_chunk` takes `ScoredPoint`s too now, so rename its
-     `record` parameter to `point`.
-  2. `embedders/`: the `Embedder` protocol, `embed_chunks(chunks, *, embedder)` building
-     `EmbeddedChunk`s, and a deterministic fake embedder in `src`, with
-     `tests/embedders/test_embed_chunks.py`.
-  3. `engine/`, in dependency order: statements (`search(question)` and the type-state
+  1. `embedders/fake.py`: a deterministic fake `DenseEmbedder` in `src`, for the engine's
+     tests and the server's (without torch).
+  2. `engine/`, in dependency order: statements (`search(question)` and the type-state
      steps), stages (retrieve, merge, rerank, take), candidates (`Candidate`, the trail,
      `Passage`), the executor, the session (`Engine`, `Session(access=…)`,
      `AllowEverything`) and the gates. The executor turns each source's `Hit`s into
      candidates and merges sources by rank.
-  4. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
+  3. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
 - Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
   `One`, filtering by chunk ids.
 
@@ -580,6 +580,122 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
   produce them, since `check_fits` demands every vector, and a missing vector costs recall,
   not access. If that's ever needed, Qdrant's `HasVectorCondition` can count them.
 
+### Embedders
+
+```python
+# the app's adapter: plain data in and out, no salemdex_retrieval types
+class TeiDenseEmbedder:
+    def embed_queries(self, texts: Sequence[str]) -> list[list[float]]: ...
+    def embed_passages(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+
+# writing: a binding pairs a schema vector with the embedder that fills it
+embedded = embed_chunks(
+    chunks, bindings=[DenseBinding(vector=KbChunks.dense, embedder=TeiDenseEmbedder(…))]
+)
+index.put(embedded)
+
+# searching: the retrieve stage embeds the question through the same binding, with
+# embed_queries and Dense.query
+```
+
+- **An embedder is a port; the app plugs in an adapter** (ports and adapters). Models are often
+  hosted elsewhere (TEI, a vendor API) or loaded locally, and the framework never creates or
+  configures them. Why: otherwise the framework would have to know how every model is built.
+- **The protocol speaks plain data:** strings in, rows of numbers out. No `Dense`, `DenseValue`
+  or schema. Why: an adapter is then a thin client over a service, written without knowing the
+  framework.
+- **The protocol asks for as little as the framework needs:** `Sequence[str]` in,
+  `Sequence[Sequence[float]]` out. Why: a protocol's return type is a demand on adapters, not a
+  promise to callers, so "return concrete types" applies from the other side. The framework
+  only needs `len` (the row check) and iteration (each row is copied by `Dense.value`). Each
+  adapter still declares its own concrete type (`list[list[float]]`), which fits, since return
+  types are covariant. `Sequence`, not `Iterable`, for the input: the row check needs
+  `len(texts)`, and an adapter splitting a batch may go over it twice. A numpy array isn't a
+  `Sequence` for mypy, so a local adapter returns `.tolist()`.
+- **The framework pairs each embedder with its vector through a binding:**
+  `DenseBinding(vector=…, embedder=…)`. `embed_chunks(chunks, *, bindings)` fills one vector
+  per binding, and the retrieve stage uses the same binding for searches. The numbers are
+  wrapped with `Dense.value` / `Dense.query`. Why:
+  - the checks on the numbers (size, finite) run where they enter, whoever wrote the adapter;
+  - which model fills which vector is stated in one place;
+  - a binding ties the kinds together: a `Dense` vector only takes a `DenseEmbedder`. A
+    `Mapping[Vector, Embedder]` couldn't, since a mapping can't tie each key's type to its
+    value's.
+- **`type VectorBinding = DenseBinding` is a closed union** (later `| SparseBinding`), matched
+  with `assert_never` like `VectorValue`. The signatures take the whole union now, and each
+  `match` handles the kinds that exist. Why not a union of embedder protocols: protocols are
+  matched by structure, so `isinstance` (even with `@runtime_checkable`) checks method names
+  only. A dense and a sparse embedder share their method names, so a `match` couldn't tell
+  them apart, and each branch would need a `cast`. The vector classes are nominal, so the
+  binding is where the kinds are told apart.
+- **The embedder sees every chunk of a call in one batch,** once per binding. No chunks call no
+  embedder (some services refuse an empty batch). An embedder returning a different number of
+  rows than texts raises a `ValueError` naming the vector: rows would otherwise pair with the
+  wrong chunks.
+- **Two bindings for one vector name are refused before anything is embedded.** Why:
+  `EmbeddedChunk` refuses them too, but only after every model call has been paid for.
+- **No bindings are allowed,** giving chunks without vectors. Why: a schema may declare no
+  vectors, and `embed_chunks` doesn't know the schema, so it can't tell "forgot the binding"
+  from "nothing to bind". The check belongs where the schema is known: `put` runs
+  `check_fits`, which refuses a chunk missing a vector before anything is stored. (Unlike an
+  empty `and_()`, nothing dangerous slips through: an empty AND would match everything with no
+  later check.)
+- **`embed_chunks` embeds `embedded_text`, never `text`.** Why: it takes chunks, not strings, so
+  no caller can pick the wrong one, and the headings context lives only in `embedded_text`.
+- **Two operations, by role: queries and passages.** Why: many models encode them differently
+  (e5's `query: ` and `passage: ` prefixes), and a question sent through the passage path ranks
+  worse without any error.
+- **Both take batches:** `embed_queries(texts)` and `embed_passages(texts)`, one row per text,
+  in order. Why: with a remote model a round trip costs more than the work. The worker sends a
+  document's chunks in one call, and query transforms (multi-query, decomposition) produce
+  several questions at once.
+- **One protocol per vector kind, named after it:** `DenseEmbedder` now, a sparse one
+  (`Mapping[int, float]` per text) when a source needs it. Why:
+  - each kind's output has its own shape, so a sparse embedder could never implement the dense
+    protocol, and a plain `Embedder` would claim a generality it lacks;
+  - services serve the kinds from separate endpoints (TEI's `/embed` and `/embed_sparse`);
+  - adapters live in apps, so renaming `Embedder` once sparse arrives would break them all.
+- **No identity in the protocol.** Why:
+  - the framework can't verify it: for a hosted model, it's a string the adapter reports about
+    itself, so a check on it would look like a guarantee without being one;
+  - a model mismatch breaks ranking, not one of the three guarantees (section 2). The framework
+    enforces the guarantees; quality is measured;
+  - the app chooses the model in its config and already records it per version (the server's
+    `provenance["index"]["embedder"]`).
+
+  The framework checks what it can verify: the size and finite numbers (`Dense.value`,
+  `Dense.query`). What that misses: another model with the same size (bge-m3 and
+  multilingual-e5-large both give 1024 numbers), which silently ruins ranking until a re-index.
+  **The app owns that check:** the server compares the configured embedder with the one recorded
+  for the indexed versions (build step 4).
+
+  Rejected: an `identity` on the protocol, stored in the collection and compared at `open`. It
+  rests on the adapter's word, and it ties model configuration to the framework.
+- **Synchronous.** Why:
+  - the server is synchronous (`def` routes, synchronous SQLAlchemy), and the worker's embedding
+    is CPU work, which async doesn't speed up;
+  - synchronous code can be called from anywhere (async code uses `asyncio.to_thread`), async
+    code only from inside an event loop (in Jupyter, the running loop makes `asyncio.run` fail);
+  - an async protocol would make every adapter async, wrappers of synchronous-only libraries
+    included;
+  - on an event loop, one hidden blocking call stalls every request; in a thread pool it stalls
+    only its own.
+
+  The cost for agents is small (estimated, not yet measured): LLM calls dominate each round, and
+  independent statements run in a thread pool as concurrently as with `asyncio.gather`. Two gaps
+  remain:
+  - inside one statement, sources run one after another (roughly 50–100 ms per extra source). A
+    thread pool inside the executor can remove that without changing any API;
+  - a thread can't be cancelled: a controller's timeout stops waiting, but the statement runs to
+    its end. The executor checks a deadline between stages, and adapters set timeouts on their
+    HTTP clients. An abandoned statement only reads, so only work is lost.
+
+  **When to add async:** agents run many statements in parallel, or the trace shows fan-out
+  taking a large share of a search. Then add async protocols (`AsyncDenseEmbedder`,
+  `AsyncIndex`) and an async executor beside the synchronous ones. Statements and stages are
+  data, so they stay unchanged.
+
 ### Filter expressions
 
 - **AND / OR / NOT over schema fields and chunk ids.** One mechanism for every filter. Why:
@@ -833,9 +949,10 @@ src/salemdex_retrieval/
 
   embedders/               used by both writes and searches
     __init__.py
-    protocol.py            Embedder, and embed_chunks(chunks, *, embedder)
+    protocol.py            DenseEmbedder, DenseBinding, VectorBinding, and
+                           embed_chunks(chunks, *, bindings)
     fake.py                a deterministic embedder for tests, the server's too
-    huggingface.py         bge-m3, behind the `huggingface` extra
+    huggingface.py         a local adapter (bge-m3), behind the `huggingface` extra
 
   engine/                  retrieval itself (build step 3)
     statements.py          search(question) and the type-state steps:
@@ -865,7 +982,7 @@ tests/                     mirrors the source folders, each with its own __init_
 - **`Hit` lives in `chunks.py`, beside `EmbeddedChunk`.** One wraps a chunk on its way into the
   index, the other on its way out. The executor then imports it from the core, not from
   `index/`, to start each candidate's trail.
-- **`embed_chunks` sits beside the `Embedder` protocol,** as `check_batch` sits beside `Index`:
+- **`embed_chunks` sits beside the embedder protocols,** as `check_batch` sits beside `Index`:
   it's the one helper every caller of the protocol shares.
 - **The fake embedder lives in `src`,** as `InMemoryIndex` does. Why: the server's tests need
   one without loading torch.
