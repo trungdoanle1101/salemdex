@@ -936,6 +936,7 @@ subfolder when it first arrives. The public API is re-exported from
 src/salemdex_retrieval/
   __init__.py              public API re-exports (before build step 4)
   declarations.py  errors.py  schema.py  filters.py                       core
+  checks.py                checks on plain values: check_positive_int, to_finite_float
   vectors.py               Dense, VectorValue, VectorQuery (closed unions)
   chunks.py                Chunk, EmbeddedChunk, Hit (chunk, score)
 
@@ -1004,7 +1005,8 @@ tests/                     mirrors the source folders, each with its own __init_
   source and merges by rank.
 - **`check_query(query, *, schema)`** in `index/protocol.py`: the query's vector must be the
   schema's own, compared as an object, as `check_filter` compares fields. Another schema's
-  vector with the same name raises `SchemaMismatchError`.
+  vector with the same name raises `SchemaMismatchError`. Both call
+  `schema.check_declares(field_or_vector)`, which a statement's sources use too.
 - **`where` is required, with no default.** Every search carries a filter, and a required
   argument can't be forgotten. Tests that want everything pass a filter matching everything.
 - **`limit` must be a positive `int`,** checked where it enters (`check_limit`, a

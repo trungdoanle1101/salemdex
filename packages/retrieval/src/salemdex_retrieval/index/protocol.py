@@ -8,8 +8,8 @@ import uuid
 from collections.abc import Iterable
 from typing import Protocol, assert_never
 
+from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
-from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
 from salemdex_retrieval.schema import Schema
 from salemdex_retrieval.vectors import VectorQuery
@@ -170,17 +170,9 @@ def check_filter(where: Filter, *, schema: type[Schema]) -> None:
         SchemaMismatchError: `where` uses a field that isn't in `schema`, or another
             schema's field with the same name. The message names the first one found.
     """
-    schema_fields = schema.fields()
     match where:
         case Equals(field=field) | AnyOf(field=field):
-            if schema_fields.get(field.name) is field:
-                return
-            in_another = (
-                " (another schema's field)" if field.name in schema_fields else ""
-            )
-            raise SchemaMismatchError(
-                f"field {field.name!r}{in_another} not in schema {schema.__name__}"
-            )
+            schema.check_declares(field)
         case And(filters=filters) | Or(filters=filters):
             for f in filters:
                 check_filter(f, schema=schema)
@@ -205,15 +197,7 @@ def check_query(query: VectorQuery, *, schema: type[Schema]) -> None:
         SchemaMismatchError: The query's vector isn't in `schema`, or is another
             schema's vector with the same name.
     """
-    vector = query.vector
-    schema_vectors = schema.vectors()
-    if vector is not schema_vectors.get(vector.name):
-        in_another = (
-            " (another schema's vector)" if vector.name in schema_vectors else ""
-        )
-        raise SchemaMismatchError(
-            f"vector {vector.name!r}{in_another} not in schema {schema.__name__}"
-        )
+    schema.check_declares(query.vector)
 
 
 def check_limit(limit: int) -> None:
@@ -228,5 +212,4 @@ def check_limit(limit: int) -> None:
     Raises:
         ValueError: `limit` isn't an `int` (a `bool` doesn't count), or is below 1.
     """
-    if type(limit) is not int or limit <= 0:
-        raise ValueError(f"limit must be a positive integer, got {limit}")
+    check_positive_int(limit, name="limit")

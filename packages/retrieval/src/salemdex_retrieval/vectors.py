@@ -10,12 +10,11 @@ of `Vector` when a source needs them.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from numbers import Real
 from typing import ClassVar, Final, Literal, get_args
 
+from salemdex_retrieval.checks import to_finite_float
 from salemdex_retrieval.declarations import Declaration
 from salemdex_retrieval.errors import SchemaError
 
@@ -117,17 +116,10 @@ class Dense(Vector):
                 f"values (size {len(values)}) does not match vector size {self.size}"
             )
 
-        checked: list[float] = []
-        for position, value in enumerate(values):
-            if not (isinstance(value, Real) and not isinstance(value, bool)):
-                raise TypeError(f"Dense[{position}] is {value!r}; expected a float")
-
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"Dense[{position}] is {value!r}; expected a finite number"
-                )
-            checked.append(float(value))
-        return tuple(checked)
+        return tuple(
+            to_finite_float(value, name=f"Dense[{position}]")
+            for position, value in enumerate(values)
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

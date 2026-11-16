@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Final
 
 from salemdex_retrieval.declarations import Declaration
-from salemdex_retrieval.errors import SchemaError
+from salemdex_retrieval.errors import SchemaError, SchemaMismatchError
 from salemdex_retrieval.filters import AnyOf, Equals
 from salemdex_retrieval.vectors import Vector
 
@@ -339,3 +339,27 @@ class Schema:
             A read-only mapping, inherited vectors first, each in declaration order.
         """
         return cls._vectors
+
+    @classmethod
+    def check_declares(cls, declaration: Declaration) -> None:
+        """Check that `declaration`, a field or a vector, is one of this schema's.
+
+        Declarations are compared as objects, not by name: another schema's field with
+        the same name is a different field, and filtering or searching by it here would
+        match nothing.
+
+        Args:
+            declaration: The field or vector about to be used with this schema.
+
+        Raises:
+            SchemaMismatchError: `declaration` isn't in this schema, or is another
+                schema's with the same name.
+        """
+        name = declaration.name
+        if cls._declarations.get(name) is declaration:
+            return
+        kind = declaration._kind
+        in_another = f" (another schema's {kind})" if name in cls._declarations else ""
+        raise SchemaMismatchError(
+            f"{kind} {name!r}{in_another} not in schema {cls.__name__}"
+        )

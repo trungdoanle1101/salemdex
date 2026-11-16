@@ -7,10 +7,10 @@ speaking plain data only. The framework checks every score it returns
 (`score_texts`), so an adapter needn't.
 """
 
-import math
 from collections.abc import Sequence
-from numbers import Real
 from typing import Protocol
+
+from salemdex_retrieval.checks import to_finite_float
 
 
 class Reranker(Protocol):
@@ -73,18 +73,8 @@ def score_texts(
         raise ValueError(
             f"the reranker returned {len(scores)} scores for {len(texts)} texts"
         )
-    checked: list[float] = []
-    for position, score in enumerate(scores):
-        if not (isinstance(score, Real) and not isinstance(score, bool)):
-            raise TypeError(
-                f"the rerank score for texts[{position}] is {score!r}; expected a float"
-            )
-
-        # A nan compares false with everything, so sorting would go wrong silently
-        if not math.isfinite(score):
-            raise ValueError(
-                f"the rerank score for texts[{position}] is {score!r}; "
-                "expected a finite number"
-            )
-        checked.append(float(score))
-    return checked
+    # A nan compares false with everything, so sorting would go wrong silently
+    return [
+        to_finite_float(score, name=f"the rerank score for texts[{position}]")
+        for position, score in enumerate(scores)
+    ]

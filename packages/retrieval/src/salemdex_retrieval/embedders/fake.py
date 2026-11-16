@@ -13,6 +13,8 @@ import unicodedata
 from collections.abc import Sequence
 from typing import Final
 
+from salemdex_retrieval.checks import check_positive_int
+
 
 class FakeDenseEmbedder:
     """A dense embedder whose rows are bags of hashed words, for tests.
@@ -44,8 +46,7 @@ class FakeDenseEmbedder:
         Raises:
             ValueError: `size` isn't a positive `int` (a `bool` doesn't count).
         """
-        if not (type(size) is int and size > 0):
-            raise ValueError(f"size must be a positive integer, got {size!r}")
+        check_positive_int(size, name="size")
         self.size: Final = size
 
     def embed_queries(self, texts: Sequence[str]) -> list[list[float]]:

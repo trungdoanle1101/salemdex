@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from salemdex_retrieval.declarations import Declaration
-from salemdex_retrieval.errors import SchemaError
+from salemdex_retrieval.errors import SchemaError, SchemaMismatchError
 from salemdex_retrieval.schema import (
     Field,
     Many,
@@ -486,3 +486,43 @@ def test_a_field_value_cannot_be_changed_after_it_is_built() -> None:
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         field_value.value = "Other"  # type: ignore[misc]
+
+
+# Whether a field or vector is one of a schema's
+
+
+class Twin(Schema):
+    dense = Dense(size=3, distance="cosine")
+
+
+def test_a_schema_declares_its_own_and_its_inherited_fields_and_vectors() -> None:
+    class Chunks(Embedded):
+        groups = Many(uuid.UUID)
+
+    for declaration in (Chunks.groups, Chunks.document_id, Chunks.dense):
+        Chunks.check_declares(declaration)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        pytest.param(
+            Standard.position, "field 'position' not in schema Embedded", id="a field"
+        ),
+        pytest.param(
+            Standard.document_id,
+            "field 'document_id' (another schema's field) not in schema Embedded",
+            id="another schema's field with the same name",
+        ),
+        pytest.param(
+            Twin.dense,
+            "vector 'dense' (another schema's vector) not in schema Embedded",
+            id="another schema's vector with the same name",
+        ),
+    ],
+)
+def test_a_declaration_of_another_schema_is_refused_naming_it(
+    declaration: Declaration, message: str
+) -> None:
+    with pytest.raises(SchemaMismatchError, match=f"^{re.escape(message)}$"):
+        Embedded.check_declares(declaration)
