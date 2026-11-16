@@ -30,16 +30,17 @@ protocol with `embed_chunks` (section 6, "Embedders"). Branch: `features/retriev
     indexes against a server only;
   - `embedders/protocol.py`: the `DenseEmbedder` protocol, `DenseBinding` and the closed
     union `VectorBinding`, and `embed_chunks(chunks, *, bindings)` (section 6,
-    "Embedders"), tested in `tests/embedders/test_embed_chunks.py`.
+    "Embedders"), tested in `tests/embedders/test_embed_chunks.py`;
+  - `embedders/fake.py`: `FakeDenseEmbedder(size=…)`, a deterministic embedder by feature
+    hashing (signed, NFC and case-folded words), so texts sharing words score higher;
+    tested in `tests/embedders/test_fake.py`.
 - **Pick up here** (as of 2026-11-16; the folder layout is in section 10):
-  1. `embedders/fake.py`: a deterministic fake `DenseEmbedder` in `src`, for the engine's
-     tests and the server's (without torch).
-  2. `engine/`, in dependency order: statements (`search(question)` and the type-state
+  1. `engine/`, in dependency order: statements (`search(question)` and the type-state
      steps), stages (retrieve, merge, rerank, take), candidates (`Candidate`, the trail,
      `Passage`), the executor, the session (`Engine`, `Session(access=…)`,
      `AllowEverything`) and the gates. The executor turns each source's `Hit`s into
      candidates and merges sources by rank.
-  3. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
+  2. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
 - Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
   `One`, filtering by chunk ids.
 
