@@ -167,26 +167,18 @@ class Rrf:
 
 @dataclass(frozen=True, kw_only=True)
 class Rerank:
-    """A stage scoring the top candidates again with a reranker, and reordering them.
+    """A stage scoring every candidate again with a reranker, and reordering them.
 
-    The candidates below `depth` are dropped: a reranker can only lift what it sees,
-    and each candidate it sees costs a model call.
+    It scores all the candidates it receives, so its cost is set by the stages before
+    it: each bound in a statement limits what a stage keeps, never what it reads.
+    With one source that's the source's `depth`; after a merge, the union of the
+    sources' lists.
 
     Attributes:
         reranker: The model scoring each candidate against the question.
-        depth: How many of the top candidates it scores.
     """
 
     reranker: Reranker
-    depth: int
-
-    def __post_init__(self) -> None:
-        """Check the depth.
-
-        Raises:
-            ValueError: `depth` isn't a positive `int`.
-        """
-        check_positive_int(self.depth, name="depth")
 
 
 @dataclass(frozen=True, kw_only=True)

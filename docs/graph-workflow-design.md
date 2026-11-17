@@ -1,8 +1,9 @@
 # Retrieval as a graph of stages
 
-Status: build steps 1 and 2 done; of step 3, `Index.search` (section 10), the embedder
-protocol with `embed_chunks` (section 6, "Embedders"), rerankers, and the engine's stages,
-statements and results (section 5). Branch: `features/retrieval-redesign`.
+Status: build steps 1 and 2 done; step 3 done except the session: `Index.search` (section
+10), the embedder protocol with `embed_chunks` (section 6, "Embedders"), rerankers, and the
+engine's stages, statements, results, validity port and executor (sections 5 and 6). Branch:
+`features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
@@ -42,12 +43,26 @@ statements and results (section 5). Branch: `features/retrieval-redesign`.
     `Rerank`, `Take`, as data;
   - `engine/statements.py`: `search(question)`, the type-state steps, and `replay`;
   - `engine/results.py`: the trail entries (`Found`, `Fused`, `Reranked`), `Candidate`
-    and `Passage`.
+    and `Passage`;
+  - `engine/validity.py`: the `Validity` port (`valid_ids(chunks) -> ids to keep`) and
+    `AlwaysValid`;
+  - `engine/executor.py`: `execute(statement, *, access, validity)`. It replays the
+    statement, searches every source with the access filter, gates where candidates enter
+    (one validity call per retrieve) and again inside `Take`, fuses by RRF, and reranks
+    every candidate it receives. Tested in `tests/engine/test_executor.py` with a scripted
+    index and spies that count embedder, validity and reranker calls.
 - **Pick up here** (as of 2026-11-17; the folder layout is in section 10):
-  1. `engine/`, in dependency order: the executor, the session (`Engine`,
-     `Session(access=…)`, `AllowEverything`) and the gates. The executor replays the
-     statement, turns each source's `Hit`s into candidates and merges sources by rank.
-  2. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
+  1. `engine/session.py`: `Engine(validity=…)`, `engine.session(access=…)`,
+     `Session.execute(statement)`, the one caller of `execute`. Open question first:
+     `AllowEverything` can't be a `Filter` (an empty `and_` is refused, and
+     `Index.search` requires `where`), so decide what the session hands the index for it.
+  2. The executor checks the access filter against every source's schema before any model
+     is called (section 6, "One filter for every schema"). Today `Index.search` checks it,
+     but only after the question was embedded.
+  3. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
+- Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
+  rerank), resolving sources for generated entries, caller filters
+  (`search(q).where(…)`), `expand`, query transforms (sections 5 and 6).
 - Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
   `One`, filtering by chunk ids.
 
@@ -156,7 +171,8 @@ passages = engine.session(access=access).execute(stmt)
 ```
 
 - **Access is bound to the session, not the statement.** Why: a statement can't forget the
-  access filter. The executor adds it to every source and puts the currency gate at the end.
+  access filter. The executor adds it to every source and runs the validity gate where
+  candidates enter and again before `Take`.
   (How the slots plug in: section 6.)
 - **Type-state builder:** each method returns a type that offers only the steps allowed next, so
   mypy checks the order:
@@ -196,9 +212,17 @@ passages = engine.session(access=access).execute(stmt)
     `case`.
   - Why not in `Search.__post_init__`: replaying ends with `take()`, which builds a
     `Search`, which would replay again.
-  - Each bound is local to its stage. A `take` limit above a rerank depth isn't refused: every
-    count is "at most" (a source can return fewer hits, access and validity remove more), so
-    it's loose, not wrong.
+  - **Every bound limits what a stage keeps, never what it reads:** a source's `depth`, a
+    take's `limit` (later a merge's). Each is "at most" (a source can return fewer hits,
+    access and validity remove more), and none is compared with another: a loose statement
+    isn't a wrong one.
+  - **A rerank scores every candidate it receives,** so its cost is set by the stages before
+    it: the source's `depth`, or after a merge the union of the sources' lists. Why: the
+    usual convention for rerankers (Cohere's and LlamaIndex's score everything they're given),
+    and a number on the rerank would be the one bound on input, reading as "depth" beside
+    the sources' output bound. Search engines' alternative, a window of the top N to rescore
+    (Elasticsearch's `window_size`, Vespa's `rerank-count`), returns as an output bound on
+    `merge` when fusing deep lists leaves too many to rerank.
 - **Every state checks its question:** stripped, and refused when it's empty, in the base's
   `__post_init__`. Why: a state built by hand skips `search()`.
 - **Immutable and generative:** each method returns a new statement. Statements are data: they
@@ -828,30 +852,81 @@ schema: declared fields, types, indexes  ← document_id, version, groups, colle
 chunk = id + text + field values
 filter expressions over fields
 access slot:   a filter, given per session ← "shares a group OR manages the collection"
-validity slot: candidates → kept ones      ← "document active, last indexed version"
+validity slot: chunks → ids to keep        ← "document active, last indexed version"
 stages, executor, plan, gates
 ```
 
 - **Every slot must be filled.** An engine can't be built without an access policy. An app that
   wants no access control says so with an explicit `AllowEverything`, so the absence is visible.
 - The executor still decides *where* the slots apply: the access filter goes into every source
-  and expand stage, and the validity check runs before rerank and again at the final gate.
+  and expand stage, and the validity gate runs where candidates enter and again before `Take`.
 - **What access means is the app's design, not the framework's.** The framework only requires
   the access slot to be a filter expression. How the app builds it (which fields,
   combinators or a denormalised field) is decided in the app.
+
+### Filters, gates, validity and cuts
+
+One word per idea, since all four narrow the results:
+
+| Word | Means | Applied |
+|---|---|---|
+| **filter** | a `Filter` expression over chunk fields, evaluated by the index; the access filter is one | inside the index, before ranking |
+| **gate** | a point in the executor where every candidate must pass a check, whatever the statement says | in code, after search |
+| **validity** | the check a gate runs: should anyone be served this chunk now? Its truth lives outside the index | at each gate |
+| **cut** | keeping the top N by rank, judging no content (`depth`, `limit`) | in each stage |
+
+- **Access is a filter, validity isn't.** Access's truth is on the chunks (their groups) and
+  must apply before ranking, so `limit` fills with visible chunks and hidden ones never leave
+  the index. Validity's truth is in the app's database (document active, `indexed_version`)
+  and changes without the chunks being rewritten: the version switch is one row. As a filter
+  it would list every document's served version, or need a flag on every chunk, rewritten at
+  each switch, which would lose the one-row switch. Stale chunks are few and short-lived, so
+  checking after search costs little recall.
+- **A condition whose truth is kept on the chunks belongs in a filter,** not in validity: a
+  filter applies before ranking. A regulation's legal effect (in force, replaced) is such a
+  field: a filter ("in force only") or a marker on the passage, the app's choice, never hidden
+  silently by validity.
+- **Later:** caller filters (a collection, "in force only") are `Filter` expressions the executor
+  ANDs with access; prunes (thresholds, dedupe) are stages that cut by score. Neither is a
+  gate: a gate always runs, and a statement can leave a stage out.
 
 ### How the slots plug in
 
 **Validity: a port the engine holds.**
 
 ```text
-engine = Engine(index=…, validity=ServerValidity(session_factory))   # Protocol: candidates → kept
+engine = Engine(validity=ServerValidity(session_factory))   # Protocol: chunks → ids to keep
 ```
 
 - It is part of the frame, not a stage the app writes into statements. Why: a statement author
   or an agent could leave a stage out, and stale results would pass.
 - It doesn't depend on the asker ("is the document active, is this its indexed version?"), so
-  it belongs to the long-lived engine. The executor runs it before rerank and at the final gate.
+  it belongs to the long-lived engine.
+- **The port: `valid_ids(chunks: Sequence[Chunk]) -> Set[UUID]`, the ids to keep.** A port
+  (ports and adapters): the package defines the shape, the server's adapter queries Postgres,
+  and the package never imports a database. Why this shape:
+  - **It can only narrow.** The executor keeps a candidate only if its id is returned, so an
+    adapter can't add, swap or reorder chunks, and extra ids are ignored.
+  - **It fails closed.** A buggy adapter returning nothing serves nothing, which is noticed at
+    once. Returning the ids to drop would fail open: stale and deleted chunks served.
+  - **It's batched:** one call, so one query, per gate. Never one per chunk (the N+1 problem).
+  - **It takes chunks,** so the adapter reads its own schema's fields (`document_id`,
+    `version`); the package needn't know which fields identify a version. Not candidates:
+    the app never imports engine internals.
+  - Rejected: returning chunks (could widen), one flag per chunk (positional, so a misaligned
+    list keeps the wrong chunk), one chunk per call (N+1), verdicts with reasons (no need yet).
+  - Synchronous for now; an async port comes with the async executor.
+- **Where the executor runs it:**
+  - **where candidates enter:** after `Retrieve` (later after `expand` too), so no stale chunk
+    costs a reranker call and every later stage works on valid candidates. After a retrieve with
+    several sources, the chunks of every list go in one call, then each list is filtered: the
+    ranks fusion reads stay the sources' own.
+  - **again inside `Take`, before the cut:** a safety net, since a document can be deleted or
+    its version switched while a reranker runs (a second or more on CPU), and a future stage
+    could add candidates without its gate. It costs one query, on the candidates left.
+    `Take` cuts from what passes, so `limit` still fills when it can, and it is the one place
+    passages are built: "only after the final gate" is then true in the code.
+  - An app with nothing to check passes an explicit `AlwaysValid()`.
 
 **Access: the filter is passed when a session opens.**
 
@@ -985,7 +1060,7 @@ decision agent (controller)
 | Concern | Provided by |
 |---|---|
 | No recommendation rests on, or hints at, hidden knowledge | every statement runs in a session with the user's access |
-| No deciding on outdated knowledge | the currency gate on every statement |
+| No deciding on outdated knowledge | the validity gate on every statement |
 | "Why did it recommend this?" | passages with origin; statements logged and replayable |
 | Coverage: every constraint that applies, counter-evidence | different statements per need ("supports A", "argues against A", "everything in scope") |
 | Knowing when not to recommend | scores and gates, so the agent can abstain |
@@ -1016,7 +1091,7 @@ stage kinds afterwards is cheap.
   | schema, chunks, filter expressions | the data being retrieved and the language for selecting it |
   | index backends, reads and writes (`put`, `replace`, `delete`) | the index is what retrieval reads; writing it is the other half (as SQLAlchemy has `insert` beside `select`) |
   | embedders, rerankers | used by both writes and searches |
-  | statements, stages, executor, session, gates | retrieval itself |
+  | statements, stages, executor, session, validity | retrieval itself |
 
   | In a later package (e.g. `salemdex_agents`) | Why separate |
   |---|---|
@@ -1070,9 +1145,9 @@ src/salemdex_retrieval/
     results.py             Candidate, the trail entries (Found, Fused, Reranked),
                            Passage
     executor.py            compiles a statement and runs it: adds the access filter to every
-                           source, the currency gate before rerank and at the end
+                           source, the validity gate where candidates enter and before Take
     session.py             Engine, Session(access=…), AllowEverything
-    gates.py               the Validity protocol, the currency check
+    validity.py            the Validity port, AlwaysValid
 
   rerankers/               with the rerank stage
     protocol.py  fake.py  huggingface.py
@@ -1080,7 +1155,7 @@ src/salemdex_retrieval/
 tests/                     mirrors the source folders, each with its own __init__.py
   index/                   test_contract.py holds the search cases too
   embedders/               test_embed_chunks.py
-  engine/                  test_statements.py  test_executor.py  test_access.py  test_gates.py
+  engine/                  test_statements.py  test_executor.py  test_access.py  test_validity.py
 ```
 
 - **`engine/`, not `search/`.** "Search" would otherwise name three things:
@@ -1098,8 +1173,11 @@ tests/                     mirrors the source folders, each with its own __init_
   one without loading torch.
 - **Backends and models sit behind extras** (`qdrant`, `huggingface`). No package
   `__init__.py` imports them.
-- **`engine/` modules depend only on those listed above them:** statements, stages,
-  candidates, executor, session, gates.
+- **`engine/` modules depend only on those before them here:** stages, statements, results,
+  validity, executor, session.
+- **`validity.py`, not `gates.py`:** the module holds the check, not the place it runs. A
+  *gate* is where the executor runs it; "the validity gate" stays a word in the executor's
+  docstrings, with no module of its own.
 
 **`Index.search` (built):**
 `index.search(query, *, where, limit) -> list[Hit]`.
@@ -1158,7 +1236,7 @@ tests/                     mirrors the source folders, each with its own __init_
    startup check, `put` / `find` / `replace` / `delete`, with the in-memory index's tests run
    against it too. Extract the `Index` protocol the two share. **(done)**
 3. **Statements and the executor** with retrieve, merge, rerank and take, plus the session, the
-   access filter and the validity check.
+   access filter and the validity check. **(done but the session)**
 4. **Port the server's indexing handlers** to the new API, then build search on it. The
    server's schema declares `access_group_ids` and every other field each search filters by
    with `indexed=True` ("`Index.search`" above).
@@ -1166,13 +1244,14 @@ tests/                     mirrors the source folders, each with its own __init_
 **Migration:** build the new API alongside the old one, port the callers (server indexing
 handlers, search, evaluation, tests), then delete the old API.
 
-**Rerank depth is a per-stage setting** (`rerank(name, depth=…)`), never hard-coded. Its default
-is chosen later, by measurement: latency per depth on the target hardware, and hit rate / MRR per
-depth on the evaluation set (build step 9). Pick the smallest depth where quality stops
-improving, within the waiting-time budget. Why it matters: a cross-encoder scores each
-question–passage pair through a large model, so depth trades recall (it can only lift what it
-sees) against waiting time and throughput, and `limit` ≤ depth caps k. For the measurement, the
-executor records each stage's duration in the session's trace.
+**What the reranker reads is set by the stages before it,** never hard-coded: each source's
+`depth`, and later a merge's limit (section 5). Their defaults are chosen later, by measurement:
+latency per candidate count on the target hardware, and hit rate / MRR per depth on the
+evaluation set (build step 9). Pick the smallest depths where quality stops improving, within
+the waiting-time budget. Why it matters: a cross-encoder scores each question–passage pair
+through a large model, so what reaches it trades recall (it can only lift what it sees) against
+waiting time and throughput. For the measurement, the executor records each stage's duration in
+the session's trace.
 
 ## 11. Open questions
 

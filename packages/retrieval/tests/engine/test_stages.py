@@ -188,19 +188,10 @@ def test_rrf_refuses_a_k_that_isnt_a_positive_int(k: Any) -> None:
 # Rerank
 
 
-def test_a_rerank_keeps_its_reranker_and_depth() -> None:
+def test_a_rerank_keeps_its_reranker() -> None:
     reranker = FakeReranker()
 
-    rerank = Rerank(reranker=reranker, depth=30)
-
-    assert rerank.reranker is reranker
-    assert rerank.depth == 30
-
-
-@pytest.mark.parametrize("depth", BAD_COUNTS)
-def test_a_rerank_refuses_a_depth_that_isnt_a_positive_int(depth: Any) -> None:
-    with pytest.raises(ValueError, match="depth must be a positive integer"):
-        Rerank(reranker=FakeReranker(), depth=depth)
+    assert Rerank(reranker=reranker).reranker is reranker
 
 
 # Take

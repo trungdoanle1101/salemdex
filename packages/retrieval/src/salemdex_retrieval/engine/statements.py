@@ -20,7 +20,7 @@ Example:
         search("thời hạn nộp hồ sơ")
         .retrieve(dense, sparse)
         .merge(Rrf())
-        .rerank(cross_encoder, depth=30)
+        .rerank(cross_encoder)
         .take(10)
     )
     passages = session.execute(statement)
@@ -162,20 +162,16 @@ class CandidateLists(_Statement):
 class Candidates(_Statement):
     """A statement whose candidates are in one ranked list, ready to refine or take."""
 
-    def rerank(self, reranker: Reranker, *, depth: int) -> Candidates:
-        """Return the statement with a stage reranking the top candidates.
+    def rerank(self, reranker: Reranker) -> Candidates:
+        """Return the statement with a stage reranking every candidate.
 
         Args:
             reranker: The model scoring each candidate against the question.
-            depth: How many of the top candidates it scores; the rest are dropped.
 
         Returns:
             The statement with its candidates reordered by the reranker's scores.
-
-        Raises:
-            ValueError: `depth` isn't a positive `int`.
         """
-        return self._add(Rerank(reranker=reranker, depth=depth), becomes=Candidates)
+        return self._add(Rerank(reranker=reranker), becomes=Candidates)
 
     def take(self, limit: int) -> Search:
         """Return the complete statement, keeping the best `limit` candidates.
@@ -229,8 +225,8 @@ def replay(statement: Search) -> Search:
                 state = state.retrieve(*sources)
             case CandidateLists(), Merge(fusion=fusion):
                 state = state.merge(fusion)
-            case Candidates(), Rerank(reranker=reranker, depth=depth):
-                state = state.rerank(reranker, depth=depth)
+            case Candidates(), Rerank(reranker=reranker):
+                state = state.rerank(reranker)
             case Candidates(), Take(limit=limit):
                 state = state.take(limit)
             case _:

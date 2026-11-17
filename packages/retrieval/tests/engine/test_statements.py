@@ -104,11 +104,7 @@ def test_merging_lists_gives_candidates() -> None:
 
 def test_a_full_statement_holds_every_stage_in_order_and_its_question() -> None:
     statement = (
-        search("q")
-        .retrieve(DENSE, TITLE)
-        .merge(Rrf(k=30))
-        .rerank(RERANKER, depth=30)
-        .take(10)
+        search("q").retrieve(DENSE, TITLE).merge(Rrf(k=30)).rerank(RERANKER).take(10)
     )
 
     assert isinstance(statement, Search)
@@ -116,18 +112,13 @@ def test_a_full_statement_holds_every_stage_in_order_and_its_question() -> None:
     assert statement.stages == (
         Retrieve(sources=(DENSE, TITLE)),
         Merge(fusion=Rrf(k=30)),
-        Rerank(reranker=RERANKER, depth=30),
+        Rerank(reranker=RERANKER),
         Take(limit=10),
     )
 
 
 def test_reranking_can_be_repeated() -> None:
-    candidates = (
-        search("q")
-        .retrieve(DENSE)
-        .rerank(RERANKER, depth=50)
-        .rerank(RERANKER, depth=10)
-    )
+    candidates = search("q").retrieve(DENSE).rerank(RERANKER).rerank(RERANKER)
 
     assert [type(stage) for stage in candidates.stages] == [Retrieve, Rerank, Rerank]
 
@@ -144,7 +135,7 @@ def test_branching_leaves_the_statement_and_the_other_branch_unchanged() -> None
     base = search("q").retrieve(DENSE)
 
     short = base.take(5)
-    reranked = base.rerank(RERANKER, depth=20).take(5)
+    reranked = base.rerank(RERANKER).take(5)
 
     assert base.stages == (Retrieve(sources=(DENSE,)),)
     assert len(short.stages) == 2
@@ -180,7 +171,7 @@ def test_nothing_but_a_merge_follows_several_lists() -> None:
     lists = search("q").retrieve(DENSE, TITLE)
 
     with pytest.raises(AttributeError):
-        lists.rerank(RERANKER, depth=10)  # type: ignore[attr-defined]
+        lists.rerank(RERANKER)  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         lists.take(10)  # type: ignore[attr-defined]
 
@@ -203,7 +194,7 @@ def test_a_complete_search_takes_no_further_step() -> None:
     with pytest.raises(AttributeError):
         complete.take(5)  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
-        complete.rerank(RERANKER, depth=5)  # type: ignore[attr-defined]
+        complete.rerank(RERANKER)  # type: ignore[attr-defined]
 
 
 # Statements built at run time are replayed through the steps
@@ -217,8 +208,8 @@ def test_a_complete_search_takes_no_further_step() -> None:
             search("q")
             .retrieve(DENSE, TITLE)
             .merge(Rrf())
-            .rerank(RERANKER, depth=20)
-            .rerank(RERANKER, depth=5)
+            .rerank(RERANKER)
+            .rerank(RERANKER)
             .take(3),
             id="retrieve, merge, rerank twice, take",
         ),
@@ -288,7 +279,7 @@ def test_replaying_refuses_a_stage_the_state_before_it_doesnt_offer(
         pytest.param((), "Question", id="no stages"),
         pytest.param((Retrieve(sources=(DENSE, TITLE)),), "CandidateLists", id="lists"),
         pytest.param(
-            (Retrieve(sources=(DENSE,)), Rerank(reranker=RERANKER, depth=5)),
+            (Retrieve(sources=(DENSE,)), Rerank(reranker=RERANKER)),
             "Candidates",
             id="one list",
         ),
