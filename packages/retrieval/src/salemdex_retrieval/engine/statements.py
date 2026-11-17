@@ -13,7 +13,7 @@ mypy checks the order:
 
 Statements are immutable data: a step never changes the statement it starts from, so
 one statement can branch into several. A statement built at run time, without these
-steps, is checked by the executor instead.
+steps, is checked by `replay`, which takes the steps for it.
 
 Example:
     statement = (
@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import overload
 
+from salemdex_retrieval.checks import to_stripped_str
 from salemdex_retrieval.engine.stages import (
     Fusion,
     Merge,
@@ -40,6 +41,7 @@ from salemdex_retrieval.engine.stages import (
     Stage,
     Take,
 )
+from salemdex_retrieval.errors import StatementError
 from salemdex_retrieval.rerankers.protocol import Reranker
 
 
@@ -56,12 +58,24 @@ class _Statement:
     questions reads `question` itself and stores it where its own rules apply.
 
     Attributes:
-        question: The question as asked.
+        question: The question as asked, stripped of whitespace at either end.
         stages: The stages so far, in the order they run.
     """
 
     question: str = field(repr=False)
     stages: tuple[Stage, ...]
+
+    def __post_init__(self) -> None:
+        """Strip the question and check it has text, however the state was built.
+
+        Raises:
+            TypeError: `question` isn't a `str`.
+            ValueError: `question` is empty or only whitespace.
+        """
+        # The dataclass is frozen; this is the one place its question is set
+        object.__setattr__(
+            self, "question", to_stripped_str(self.question, name="question")
+        )
 
     def _add[S: _Statement](self, stage: Stage, *, becomes: type[S]) -> S:
         """Return this statement with `stage` added, as the state `becomes`."""
@@ -79,12 +93,9 @@ def search(question: str) -> Question:
         A statement with no stages yet, ready to retrieve.
 
     Raises:
+        TypeError: `question` isn't a `str`.
         ValueError: `question` is empty or only whitespace.
     """
-    # An empty question would still be embedded and reranked, giving confident
-    # scores for nothing
-    if not question.strip():
-        raise ValueError("question is empty or only whitespace; ask something")
     return Question(question=question, stages=())
 
 
@@ -118,8 +129,8 @@ class Question(_Statement):
             `Candidates` for one source, `CandidateLists` for several.
 
         Raises:
-            ValueError: There are no sources, or two repeat each other or share a
-                name (see `Retrieve`).
+            ValueError: There are no sources, or they search different indexes, or
+                two repeat each other or share a name (see `Retrieve`).
             TypeError: A source isn't a `Source`.
         """
         stage = Retrieve(sources=sources)
@@ -185,6 +196,50 @@ class Candidates(_Statement):
 class Search(_Statement):
     """A complete search statement: the only state a session executes.
 
-    It offers no further steps. The executor still checks its stages, in case it was
-    built at run time without the steps above.
+    It offers no further steps. One built at run time, without the steps above, is
+    checked by `replay` before it runs.
     """
+
+
+def replay(statement: Search) -> Search:
+    """Return `statement` built again through the steps, checking the order of its stages.
+
+    A statement built at run time (from config, by an agent) never went through the
+    steps, so mypy never saw its order. Replaying takes the step each stage stands for,
+    in order: every stage must be a step the state so far offers, and the last state
+    must be a `Search`. The order rules thus live only in the steps.
+
+    Args:
+        statement: The statement to check, however it was built.
+
+    Returns:
+        An equal statement, built from checked steps; run this one, not the one given.
+
+    Raises:
+        StatementError: A stage isn't one the state before it offers (or isn't a stage
+            at all), or the stages stop before a `Take`.
+        ValueError: A stage's settings are wrong, found as its step builds it again
+            (see the steps).
+        TypeError: The question isn't a `str`, or a source isn't a `Source`.
+    """
+    state: _Statement = search(statement.question)
+    for position, stage in enumerate(statement.stages):
+        match state, stage:
+            case Question(), Retrieve(sources=sources):
+                state = state.retrieve(*sources)
+            case CandidateLists(), Merge(fusion=fusion):
+                state = state.merge(fusion)
+            case Candidates(), Rerank(reranker=reranker, depth=depth):
+                state = state.rerank(reranker, depth=depth)
+            case Candidates(), Take(limit=limit):
+                state = state.take(limit)
+            case _:
+                raise StatementError(
+                    f"stages[{position}] is a {type(stage).__name__}, "
+                    f"which can't follow {type(state).__name__}"
+                )
+    if not isinstance(state, Search):
+        raise StatementError(
+            f"the statement ends at {type(state).__name__}; end with a Take"
+        )
+    return state

@@ -1,7 +1,8 @@
 # Retrieval as a graph of stages
 
-Status: build steps 1 and 2 done; of step 3, `Index.search` (section 10) and the embedder
-protocol with `embed_chunks` (section 6, "Embedders"). Branch: `features/retrieval-redesign`.
+Status: build steps 1 and 2 done; of step 3, `Index.search` (section 10), the embedder
+protocol with `embed_chunks` (section 6, "Embedders"), rerankers, and the engine's stages,
+statements and results (section 5). Branch: `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
@@ -34,12 +35,18 @@ protocol with `embed_chunks` (section 6, "Embedders"). Branch: `features/retriev
   - `embedders/fake.py`: `FakeDenseEmbedder(size=…)`, a deterministic embedder by feature
     hashing (signed, NFC and case-folded words), so texts sharing words score higher;
     tested in `tests/embedders/test_fake.py`.
-- **Pick up here** (as of 2026-11-16; the folder layout is in section 10):
-  1. `engine/`, in dependency order: statements (`search(question)` and the type-state
-     steps), stages (retrieve, merge, rerank, take), candidates (`Candidate`, the trail,
-     `Passage`), the executor, the session (`Engine`, `Session(access=…)`,
-     `AllowEverything`) and the gates. The executor turns each source's `Hit`s into
-     candidates and merges sources by rank.
+  - `checks.py`: `check_positive_int`, `to_finite_float`, `to_stripped_str`, shared by
+    every layer;
+  - `rerankers/`: the `Reranker` protocol, `score_texts`, and `FakeReranker`;
+  - `engine/stages.py`: `Retrieve` (named sources, one index), `Merge` with `Rrf`,
+    `Rerank`, `Take`, as data;
+  - `engine/statements.py`: `search(question)`, the type-state steps, and `replay`;
+  - `engine/results.py`: the trail entries (`Found`, `Fused`, `Reranked`), `Candidate`
+    and `Passage`.
+- **Pick up here** (as of 2026-11-17; the folder layout is in section 10):
+  1. `engine/`, in dependency order: the executor, the session (`Engine`,
+     `Session(access=…)`, `AllowEverything`) and the gates. The executor replays the
+     statement, turns each source's `Hit`s into candidates and merges sources by rank.
   2. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
 - Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
   `One`, filtering by chunk ids.
@@ -178,6 +185,22 @@ passages = engine.session(access=access).execute(stmt)
   - **States are siblings over a private base** holding `question` and `stages`. Why: a
     state subclassing another would be accepted where the earlier one is expected.
 
+- **A statement built at run time is replayed through the steps.** `replay(statement)`
+  starts again from `search(statement.question)` and takes one step per stage. Each
+  (state, stage) pair must be a step that state offers, and the last state must be a
+  `Search`; anything else raises `StatementError` naming the stage's position. The executor
+  runs the replayed statement.
+  - Why: the order rules then live once, in the steps. A separate check over the whole
+    tuple ("first a retrieve, a merge exactly when…, one take at the end") would encode the
+    same state machine twice, and the copies would drift. A new step is one method and one
+    `case`.
+  - Why not in `Search.__post_init__`: replaying ends with `take()`, which builds a
+    `Search`, which would replay again.
+  - Each bound is local to its stage. A `take` limit above a rerank depth isn't refused: every
+    count is "at most" (a source can return fewer hits, access and validity remove more), so
+    it's loose, not wrong.
+- **Every state checks its question:** stripped, and refused when it's empty, in the base's
+  `__post_init__`. Why: a state built by hand skips `search()`.
 - **Immutable and generative:** each method returns a new statement. Statements are data: they
   can be inspected, logged as provenance and replayed.
 - **The question stays out of `repr`.** Why: it can reveal what the asker is after, and a
@@ -758,6 +781,41 @@ own schema with a field that points to chunk ids. A source stage searches the en
 returns the chunks they lead to, recording "found through" in each candidate's history. They
 become a separate source, not a special case inside the index.
 
+This is a **resolving source**: it searches one index (the entries) and returns chunks of
+another (its *target*, the chunks).
+
+- **It resolves through the target index's `find`, with the access filter.** What it returns is
+  then checked on the chunks' own schema, whatever the entries hold. Validity runs on the
+  resolved chunks as usual.
+- **It keeps one entry per chunk, the best ranked.** Several entries can lead to one chunk, and
+  RRF would otherwise count it several times in one list.
+- **Its ranks are given after resolution,** counting only the chunks it returns. Why: a gap in
+  the ranks would reveal that something hidden ranked above.
+
+### Several indexes
+
+**A `Retrieve` searches one index, for now.** Its sources may search different vectors of it,
+never different indexes. Why: a candidate is identified by its chunk id, which is only unique
+within one index, and one index means one schema, so one access filter fits every source.
+When resolving sources arrive, the rule becomes "every source returns chunks of the same
+target index", and the chunk id stays a sound merge key.
+
+Patterns that use several indexes, and where each belongs:
+
+| Pattern | What it does | Where it goes |
+|---|---|---|
+| Multi-representation indexing (generated entries: questions, summaries, keywords) | Searches another representation of the same chunks, fused with the chunk sources | A resolving source in the same `Retrieve` |
+| Two embedding models side by side (a model migration) | Compares or fuses old and new vectors | Two vectors of one index, as now |
+| Hierarchical, coarse-to-fine retrieval | Finds the top documents (summaries, titles), then searches chunks only within them | A step on `Question` before retrieve, producing a scope (`document_id ∈ top N`), not candidates |
+| Small-to-big, parent document, neighbours | Fetches each candidate's parent section or adjacent chunks | `expand`, with the validity gate after it |
+| Citation following | Follows a references field to the cited articles ("theo quy định tại Điều 5 …") | An `expand` variant over a field |
+| Pseudo-relevance feedback, iterative retrieval | Reads the top hits and forms a better query | The controller, running two statements (section 8) |
+
+**Rejected: federated search,** fusing indexes that hold different things (regulations and an
+FAQ) in one `Retrieve`. Different schemas mean different access filters, a different meaning
+of validity and different fields on passages. Corpora go in one index with a `collection`
+field, or run as separate statements that the app shows separately.
+
 ### The guarantee slots
 
 The executor can't enforce access or currency on data it doesn't understand. So the frame has
@@ -814,6 +872,32 @@ session = engine.session(access=access)
 - **When to switch to an engine-held policy:** when agents or other entry points need to open
   sessions themselves. The engine sees a filter either way, so the switch stays cheap.
 
+**One filter for every schema: an access preset.** A session holds one filter, but a statement
+may search indexes with different schemas (chunks and generated entries), and a filter's
+fields are checked against each schema by identity. So the access fields live in a schema
+preset that every searchable schema inherits, and the app builds the filter over the
+preset's fields:
+
+```text
+class Restricted(Schema):  access_group_ids = Many(UUID, indexed=True)
+class KbChunks(Restricted): …
+class KbEntries(Restricted): …
+access = Restricted.access_group_ids.any_of(groups)   # valid on both schemas
+```
+
+- An inherited declaration is the same object in every subclass, so the existing identity
+  check accepts it on both, and refuses it on a schema without the preset: it fails closed.
+- The executor checks the filter against every source's schema before any model is called.
+- The cost: entries copy their chunk's access fields when indexed, so a change to a document's
+  groups updates its chunks and its entries. A missed update can't leak a passage: the
+  resolving source fetches chunks through the chunks index with the filter. On the chunks the
+  filter is the guarantee; on the entries it keeps recall (hidden entries don't fill the
+  depth) and closes the rank side channel.
+- Rejected: a filter per schema on the session (one rule built twice, which can drift; kept as
+  the fallback for a schema whose access really uses other fields), a schema → filter function
+  (the same, harder to inspect), entries stored in the chunks index with a `kind` field (an
+  entry's text isn't the source's words, and every chunk search would need `kind = chunk`).
+
 ### Currency: show the last indexed version
 
 How the server fills the validity slot. While a new version waits to be indexed, search keeps
@@ -856,11 +940,13 @@ Consequences:
 
 | When | What | Why |
 |---|---|---|
-| Before any work ("compile") | stage order, the index supports the filter, the tools exist, limits fit (k ≤ depth) | nothing is spent on a statement that would fail |
+| Before any work ("compile") | stage order, by replaying the stages through the steps; one index per retrieve; the access filter fits every source's schema | nothing is spent on a statement that would fail |
 | During the run | empty results, wrong score counts, a tool failing | only known as it runs |
 
 mypy covers statements written in code. Statements built at run time (from config, or by an
-agent) still need the compile check, so the executor always runs it.
+agent) still need the compile check, so the executor always replays the statement (section 5)
+and runs the replayed one. Limits aren't compared with depths: each is "at most" for its own
+stage.
 
 ## 8. Loops
 
@@ -1090,7 +1176,8 @@ executor records each stage's duration in the session's trace.
 
 ## 11. Open questions
 
-- **The standard schema preset:** which fields it holds.
+- **The standard schema preset:** which fields it holds. The access fields belong in it, or
+  in an access preset of their own (section 6, "One filter for every schema").
 - **The agent step API** (later, with the controller):
   - How a statement starts from earlier candidates. A likely shape: the LLM sees short handles
     (`p2`), and the controller maps them back; an invented handle doesn't resolve. Earlier

@@ -12,7 +12,6 @@ model is called or any index is read.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import get_args
 
 from salemdex_retrieval.checks import check_positive_int, to_stripped_str
 from salemdex_retrieval.embedders.protocol import VectorBinding
@@ -36,13 +35,14 @@ class Retrieve:
     session's access filter. Several sources give several lists, which a `Merge`
     must fuse before any other stage.
 
-    No two sources may search the same vector of the same index, whatever their
-    depths: the shallower list would be the start of the deeper one, and fusion would
-    count it twice. Indexes are compared as objects, so two index objects over one
-    stored collection aren't recognised as the same; build one object per collection.
+    Every source searches the same index, for now: a candidate is known by its chunk
+    id, which is unique only within one index, and one index has one schema, so one
+    access filter fits every source. Indexes are compared as objects, so build one
+    index object per stored collection.
 
-    No two sources may share a name either: each candidate's trail names the sources
-    that found it.
+    No two sources may search the same vector, whatever their depths: the shallower
+    list would be the start of the deeper one, and fusion would count it twice. No two
+    may share a name either: each candidate's trail names the sources that found it.
 
     Attributes:
         sources: Where to look, in order; at least one.
@@ -54,30 +54,36 @@ class Retrieve:
         """Check the sources.
 
         Raises:
-            ValueError: There are no sources, or two search the same vector of the
-                same index, or two share a name.
+            ValueError: There are no sources, or they search different indexes, or
+                two search the same vector or share a name.
             TypeError: A source isn't a `Source`.
         """
         if not self.sources:
             raise ValueError("a retrieve needs at least one source")
 
-        seen_index_vectors: set[tuple[int, Vector]] = set()
+        seen_vectors: set[Vector] = set()
         seen_source_names: set[str] = set()
         for position, source in enumerate(self.sources):
             if type(source) is not Source:
                 raise TypeError(
                     f"sources[{position}] is {type(source).__name__}; expected a Source"
                 )
-            # id(): an Index needn't be hashable; vectors hash by identity, as they
-            # compare
-            key = (id(source.index), source.binding.vector)
-            if key in seen_index_vectors:
-                vector_name = source.binding.vector.name
+
+            if source.index is not self.sources[0].index:
                 raise ValueError(
-                    f"two sources search vector {vector_name!r} of the same index; "
+                    "two sources search different indexes, which isn't supported yet; "
+                    "search one index, with one source per vector"
+                )
+
+            # One index, so the vector alone says what a source searches; vectors
+            # hash by identity, as they compare
+            vector = source.binding.vector
+            if vector in seen_vectors:
+                raise ValueError(
+                    f"two sources search vector {vector.name!r}; "
                     "give it once, with the depth you need"
                 )
-            seen_index_vectors.add(key)
+            seen_vectors.add(vector)
 
             if source.name in seen_source_names:
                 raise ValueError(
@@ -200,8 +206,3 @@ class Take:
             ValueError: `limit` isn't a positive `int`.
         """
         check_positive_int(self.limit, name="limit")
-
-
-# Read by the executor's compile check, to refuse anything else in a statement built
-# at run time
-_STAGE_CLASSES = get_args(Stage.__value__)

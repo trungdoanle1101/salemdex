@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
@@ -8,8 +10,10 @@ from salemdex_retrieval.engine.statements import (
     Candidates,
     Question,
     Search,
+    replay,
     search,
 )
+from salemdex_retrieval.errors import StatementError
 from salemdex_retrieval.index.in_memory import InMemoryIndex
 from salemdex_retrieval.rerankers.fake import FakeReranker
 from salemdex_retrieval.schema import One, Schema
@@ -54,6 +58,24 @@ def test_a_search_starts_from_its_question_with_no_stages() -> None:
 def test_a_search_refuses_a_question_without_text(question: str) -> None:
     with pytest.raises(ValueError, match="question"):
         search(question)
+
+
+def test_a_search_strips_whitespace_from_either_end_of_its_question() -> None:
+    assert search("  thời hạn nộp hồ sơ?\n").question == "thời hạn nộp hồ sơ?"
+
+
+@pytest.mark.parametrize("state", [Question, CandidateLists, Candidates, Search])
+@pytest.mark.parametrize("question", ["", "   "])
+def test_a_state_built_by_hand_refuses_a_question_without_text(
+    state: type[Search], question: str
+) -> None:
+    with pytest.raises(ValueError, match="question"):
+        state(question=question, stages=())
+
+
+def test_a_state_built_by_hand_refuses_a_question_that_isnt_a_str() -> None:
+    with pytest.raises(TypeError, match="question"):
+        Search(question=None, stages=())  # type: ignore[arg-type]
 
 
 # Each step adds one stage
@@ -182,3 +204,98 @@ def test_a_complete_search_takes_no_further_step() -> None:
         complete.take(5)  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         complete.rerank(RERANKER, depth=5)  # type: ignore[attr-defined]
+
+
+# Statements built at run time are replayed through the steps
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(search("q").retrieve(DENSE).take(10), id="retrieve, take"),
+        pytest.param(
+            search("q")
+            .retrieve(DENSE, TITLE)
+            .merge(Rrf())
+            .rerank(RERANKER, depth=20)
+            .rerank(RERANKER, depth=5)
+            .take(3),
+            id="retrieve, merge, rerank twice, take",
+        ),
+    ],
+)
+def test_replaying_a_statement_built_by_the_steps_gives_an_equal_one(
+    statement: Search,
+) -> None:
+    assert replay(statement) == statement
+
+
+def test_replaying_a_statement_built_by_hand_gives_it_as_the_steps_would() -> None:
+    # As config might give it: a list, not a tuple
+    by_hand = Search(
+        question=" q ",
+        stages=[Retrieve(sources=(DENSE,)), Take(limit=10)],  # type: ignore[arg-type]
+    )
+
+    assert replay(by_hand) == search("q").retrieve(DENSE).take(10)
+
+
+@pytest.mark.parametrize(
+    ("stages", "message"),
+    [
+        pytest.param(
+            (Take(limit=5),),
+            r"stages\[0\] is a Take, which can't follow Question",
+            id="no retrieve first",
+        ),
+        pytest.param(
+            (Retrieve(sources=(DENSE,)), Retrieve(sources=(TITLE,)), Take(limit=5)),
+            r"stages\[1\] is a Retrieve, which can't follow Candidates",
+            id="a second retrieve",
+        ),
+        pytest.param(
+            (Retrieve(sources=(DENSE, TITLE)), Take(limit=5)),
+            r"stages\[1\] is a Take, which can't follow CandidateLists",
+            id="several lists not merged",
+        ),
+        pytest.param(
+            (Retrieve(sources=(DENSE,)), Merge(fusion=Rrf()), Take(limit=5)),
+            r"stages\[1\] is a Merge, which can't follow Candidates",
+            id="one list merged",
+        ),
+        pytest.param(
+            (Retrieve(sources=(DENSE,)), Take(limit=5), Take(limit=3)),
+            r"stages\[2\] is a Take, which can't follow Search",
+            id="a stage after the take",
+        ),
+        pytest.param(
+            (Retrieve(sources=(DENSE,)), "rerank", Take(limit=5)),
+            r"stages\[1\] is a str, which can't follow Candidates",
+            id="something that isn't a stage",
+        ),
+    ],
+)
+def test_replaying_refuses_a_stage_the_state_before_it_doesnt_offer(
+    stages: tuple[Any, ...], message: str
+) -> None:
+    with pytest.raises(StatementError, match=message):
+        replay(Search(question="q", stages=stages))
+
+
+@pytest.mark.parametrize(
+    ("stages", "state"),
+    [
+        pytest.param((), "Question", id="no stages"),
+        pytest.param((Retrieve(sources=(DENSE, TITLE)),), "CandidateLists", id="lists"),
+        pytest.param(
+            (Retrieve(sources=(DENSE,)), Rerank(reranker=RERANKER, depth=5)),
+            "Candidates",
+            id="one list",
+        ),
+    ],
+)
+def test_replaying_refuses_stages_that_stop_before_a_take(
+    stages: tuple[Any, ...], state: str
+) -> None:
+    with pytest.raises(StatementError, match=f"ends at {state}; end with a Take"):
+        replay(Search(question="q", stages=stages))

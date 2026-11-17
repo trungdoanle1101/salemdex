@@ -129,11 +129,12 @@ def test_a_retrieve_takes_two_vectors_of_one_index() -> None:
     Retrieve(sources=(build_source(Chunks.dense), build_source(Chunks.title)))
 
 
-def test_a_retrieve_takes_the_same_vector_of_two_index_objects() -> None:
-    # Two in-memory indexes hold different chunks, so neither repeats the other
+def test_a_retrieve_refuses_sources_searching_different_indexes() -> None:
+    # A candidate is known by its chunk id, unique only within one index
     other = InMemoryIndex(schema=Chunks)
 
-    Retrieve(sources=(build_source(), build_source(name="other", index=other)))
+    with pytest.raises(ValueError, match="different indexes"):
+        Retrieve(sources=(build_source(), build_source(name="other", index=other)))
 
 
 def test_a_retrieve_refuses_two_sources_with_the_same_name() -> None:
@@ -155,13 +156,6 @@ def test_a_retrieve_refuses_names_that_differ_only_by_surrounding_whitespace() -
                 build_source(Chunks.title, name="meaning "),
             )
         )
-
-
-def test_a_retrieve_refuses_the_same_name_on_two_index_objects() -> None:
-    other = InMemoryIndex(schema=Chunks)
-
-    with pytest.raises(ValueError, match="'dense'"):
-        Retrieve(sources=(build_source(), build_source(index=other)))
 
 
 @pytest.mark.parametrize(
