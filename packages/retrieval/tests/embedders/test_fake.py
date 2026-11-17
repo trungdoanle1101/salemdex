@@ -11,7 +11,7 @@ from salemdex_retrieval.embedders.protocol import (
     DenseEmbedder,
     embed_chunks,
 )
-from salemdex_retrieval.filters import not_, or_
+from salemdex_retrieval.filters import Everything
 from salemdex_retrieval.index import InMemoryIndex
 from salemdex_retrieval.schema import One, Schema
 from salemdex_retrieval.vectors import Dense
@@ -22,7 +22,6 @@ class Chunks(Schema):
     dense = Dense(size=16, distance="cosine")
 
 
-EVERYTHING = or_(Chunks.position.eq(0), not_(Chunks.position.eq(0)))
 TEXTS = [
     "Điều 1. Phạm vi điều chỉnh",
     "Điều 2. Đối tượng áp dụng",
@@ -78,7 +77,7 @@ def test_a_question_finds_the_identical_passage_first() -> None:
     )
 
     [question_row] = embedder.embed_queries([TEXTS[1]])
-    hits = index.search(Chunks.dense.query(question_row), where=EVERYTHING, limit=3)
+    hits = index.search(Chunks.dense.query(question_row), where=Everything(), limit=3)
 
     assert hits[0].chunk == chunks[1]
     assert hits[0].score == pytest.approx(1.0)

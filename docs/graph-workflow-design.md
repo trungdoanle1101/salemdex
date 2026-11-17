@@ -8,7 +8,8 @@ engine's stages, statements, results, validity port and executor (sections 5 and
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
     the value checks;
-  - `filters.py`: `Equals` (`eq`), `AnyOf` (`any_of`), and `and_` / `or_` / `not_`;
+  - `filters.py`: `Equals` (`eq`), `AnyOf` (`any_of`), `and_` / `or_` / `not_`, and
+    `Everything`, matching every chunk;
   - `vectors.py`: `Dense` vectors, declared on the schema beside its fields, with checked
     values (`Dense.value`) and queries (`Dense.query`); the closed unions `VectorValue` and
     `VectorQuery`;
@@ -53,9 +54,8 @@ engine's stages, statements, results, validity port and executor (sections 5 and
     index and spies that count embedder, validity and reranker calls.
 - **Pick up here** (as of 2026-11-17; the folder layout is in section 10):
   1. `engine/session.py`: `Engine(validity=…)`, `engine.session(access=…)`,
-     `Session.execute(statement)`, the one caller of `execute`. Open question first:
-     `AllowEverything` can't be a `Filter` (an empty `and_` is refused, and
-     `Index.search` requires `where`), so decide what the session hands the index for it.
+     `Session.execute(statement)`, the one caller of `execute`. An app without access
+     control passes `access=Everything()` (section 6, "Filter expressions").
   2. The executor checks the access filter against every source's schema before any model
      is called (section 6, "One filter for every schema"). Today `Index.search` checks it,
      but only after the question was embedded.
@@ -774,13 +774,29 @@ index.put(embedded)
   the methods, only if they prove ugly.
 - **Combinators are functions, the nodes frozen dataclasses:** `and_(…)`, `or_(…)`, `not_(…)`
   build `And`, `Or`, `Not` (trailing underscores because `and`, `or`, `not` are keywords, as in
-  SQLAlchemy). `type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not` refers to itself.
+  SQLAlchemy). `type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not | Everything`
+  refers to itself.
   - **The checks live in the nodes' `__post_init__`**, so a node built directly is checked too.
     The functions only turn their arguments into a tuple.
   - **`and_` and `or_` need at least one filter.** Why: an empty AND matches everything, so
     `delete(where=and_(*conditions))` with an empty list would empty the index (the old
     `ChunkFilter()` problem). One filter is allowed: it's harmless, and lists of conditions
     vary in length.
+  - **`Everything()` matches every chunk, and is accepted wherever a filter is,** writes and
+    combinators included, like SQL with no `WHERE`: `delete(where=Everything())` empties the
+    index as `DELETE FROM chunks` empties a table. Why that's safe when an empty `and_()`
+    isn't: the danger is emptying the index by accident. An empty `and_()` comes from a list
+    of conditions that turned out empty; `Everything()` has to be written out, so the intent
+    is clear at the call site. It names no field, so it fits every schema. It's a frozen
+    dataclass with no fields, like the other nodes, so two compare equal.
+    - Its uses: an app without access control passes it as the session's access filter
+      ("The guarantee slots"); tests and indexing code read or clear a whole index with it.
+    - In Qdrant it becomes a filter with no conditions, which matches every point, also
+      nested (`not_(Everything())` matches none).
+    - Rejected: allowing it in reads only, with writes keeping `Filter` (a second filter type
+      on every write signature, for a case the call site already makes plain); `where:
+      Filter | None` on `search` (`None` meaning "everything" fails open when a variable is
+      `None` by accident).
   - **Each argument must be a filter**, checked at run time. Why: fields don't define `__eq__`,
     so `KbChunks.version == 2` is `False`, not an error; filters built at run time arrive as
     `Any`. The check reads its classes from the `Filter` alias, so a new node can't be missed.
@@ -857,7 +873,9 @@ stages, executor, plan, gates
 ```
 
 - **Every slot must be filled.** An engine can't be built without an access policy. An app that
-  wants no access control says so with an explicit `AllowEverything`, so the absence is visible.
+  wants no access control says so with an explicit `access=Everything()`, so the absence is
+  visible. Why no separate `AllowEverything`: `Everything` is already a `Filter`, so the
+  executor passes it to every source unchanged, and one idea keeps one word.
 - The executor still decides *where* the slots apply: the access filter goes into every source
   and expand stage, and the validity gate runs where candidates enter and again before `Take`.
 - **What access means is the app's design, not the framework's.** The framework only requires
@@ -1146,7 +1164,7 @@ src/salemdex_retrieval/
                            Passage
     executor.py            compiles a statement and runs it: adds the access filter to every
                            source, the validity gate where candidates enter and before Take
-    session.py             Engine, Session(access=…), AllowEverything
+    session.py             Engine, Session(access=…)
     validity.py            the Validity port, AlwaysValid
 
   rerankers/               with the rerank stage
@@ -1194,7 +1212,7 @@ tests/                     mirrors the source folders, each with its own __init_
   vector with the same name raises `SchemaMismatchError`. Both call
   `schema.check_declares(field_or_vector)`, which a statement's sources use too.
 - **`where` is required, with no default.** Every search carries a filter, and a required
-  argument can't be forgotten. Tests that want everything pass a filter matching everything.
+  argument can't be forgotten. Searching everything says so: `where=Everything()`.
 - **`limit` must be a positive `int`,** checked where it enters (`check_limit`, a
   `ValueError`; a `bool` doesn't count), so no backend has to decide what 0 means.
 - **Every backend checks before reading:** `check_limit`, `check_query`, then `check_filter`.

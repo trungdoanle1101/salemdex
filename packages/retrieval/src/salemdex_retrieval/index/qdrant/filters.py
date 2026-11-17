@@ -1,7 +1,8 @@
 """How a filter becomes a Qdrant filter over the stored payload.
 
 Each node becomes a Qdrant `Filter`: `And` its `must`, `Or` its `should`, `Not` its
-`must_not`. A condition on a `Many` matches when any of its values does, which is what
+`must_not`, and `Everything` one with no conditions, which matches every chunk. A
+condition on a `Many` matches when any of its values does, which is what
 `AnyOf` means. Two cases don't map one to one:
 
 - Floats and datetimes are matched by a range from the value to itself: Qdrant can't
@@ -19,7 +20,7 @@ from typing import assert_never
 
 from qdrant_client import models
 
-from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
+from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
 from salemdex_retrieval.index.qdrant.payload import field_key
 from salemdex_retrieval.schema import Field
 
@@ -47,6 +48,8 @@ def build_qdrant_filter(where: Filter) -> models.Filter:
             return models.Filter(should=[build_qdrant_filter(f) for f in filters])
         case Not(filter=f):
             return models.Filter(must_not=[build_qdrant_filter(f)])
+        case Everything():
+            return models.Filter()
         case _:
             assert_never(where)
 

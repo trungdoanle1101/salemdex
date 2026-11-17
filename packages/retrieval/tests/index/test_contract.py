@@ -12,7 +12,7 @@ import pytest
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.errors import SchemaMismatchError
-from salemdex_retrieval.filters import Filter, and_, not_, or_
+from salemdex_retrieval.filters import Everything, Filter, and_, not_, or_
 from salemdex_retrieval.index import Index
 from salemdex_retrieval.schema import Many, One, Schema
 from salemdex_retrieval.vectors import Dense
@@ -122,9 +122,6 @@ def ids(chunks: Iterable[Chunk]) -> set[uuid.UUID]:
     return {c.id for c in chunks}
 
 
-EVERYTHING = or_(Chunks.version.eq(1), not_(Chunks.version.eq(1)))
-
-
 # The schema
 
 
@@ -163,7 +160,7 @@ def test_put_accepts_any_iterable_such_as_a_generator(index_with: IndexWith) -> 
 
     index.put(embedded(chunk(position=p)) for p in range(3))
 
-    assert len(index.find(where=EVERYTHING)) == 3
+    assert len(index.find(where=Everything())) == 3
 
 
 def test_putting_the_same_chunks_again_changes_nothing(index_with: IndexWith) -> None:
@@ -172,7 +169,7 @@ def test_putting_the_same_chunks_again_changes_nothing(index_with: IndexWith) ->
 
     index.put(embedded_all(*chunks))
 
-    assert ids(index.find(where=EVERYTHING)) == ids(chunks)
+    assert ids(index.find(where=Everything())) == ids(chunks)
 
 
 def test_put_overwrites_a_stored_chunk_with_the_same_id(index_with: IndexWith) -> None:
@@ -180,7 +177,7 @@ def test_put_overwrites_a_stored_chunk_with_the_same_id(index_with: IndexWith) -
 
     index.put([embedded(chunk(text="new"))])
 
-    [found] = index.find(where=EVERYTHING)
+    [found] = index.find(where=Everything())
     assert found.text == "new"
 
 
@@ -193,7 +190,7 @@ def test_put_stores_nothing_when_one_chunk_does_not_fit_the_schema(
     with pytest.raises(SchemaMismatchError):
         index.put([*embedded_all(chunk(position=0), chunk(position=1)), unfit()])
 
-    assert index.find(where=EVERYTHING) == []
+    assert index.find(where=Everything()) == []
 
 
 def test_put_stores_nothing_when_two_chunks_share_an_id(index_with: IndexWith) -> None:
@@ -203,7 +200,7 @@ def test_put_stores_nothing_when_two_chunks_share_an_id(index_with: IndexWith) -
     with pytest.raises(ValueError, match=str(repeated.id)):
         index.put(embedded_all(chunk(position=1), repeated, chunk(text="other text")))
 
-    assert index.find(where=EVERYTHING) == []
+    assert index.find(where=Everything()) == []
 
 
 def test_put_with_no_chunks_keeps_the_stored_ones(index_with: IndexWith) -> None:
@@ -212,7 +209,7 @@ def test_put_with_no_chunks_keeps_the_stored_ones(index_with: IndexWith) -> None
 
     index.put([])
 
-    assert ids(index.find(where=EVERYTHING)) == {stored.id}
+    assert ids(index.find(where=Everything())) == {stored.id}
 
 
 def test_find_returns_every_match_however_many_there_are(
@@ -292,6 +289,43 @@ def test_not_any_of_matches_chunks_with_no_values(index_with: IndexWith) -> None
     index = index_with(no_groups, chunk(position=1, groups=[HR]))
 
     assert ids(index.find(where=not_(Chunks.groups.any_of([HR])))) == {no_groups.id}
+
+
+def test_everything_matches_every_chunk(index_with: IndexWith) -> None:
+    chunks = [
+        chunk(position=0, groups=[]),
+        chunk(position=1, version=2),
+        chunk(document=OTHER_DOCUMENT),
+    ]
+    index = index_with(*chunks)
+
+    assert ids(index.find(where=Everything())) == ids(chunks)
+
+
+def test_everything_under_not_matches_no_chunk(index_with: IndexWith) -> None:
+    index = index_with(chunk(position=0), chunk(position=1))
+
+    assert index.find(where=not_(Everything())) == []
+
+
+def test_everything_in_an_or_matches_every_chunk(index_with: IndexWith) -> None:
+    chunks = [chunk(version=1), chunk(version=2)]
+    index = index_with(*chunks)
+
+    where = or_(Chunks.version.eq(2), Everything())
+
+    assert ids(index.find(where=where)) == ids(chunks)
+
+
+def test_everything_in_an_and_leaves_the_other_filters_to_decide(
+    index_with: IndexWith,
+) -> None:
+    v1, v2 = chunk(version=1), chunk(version=2)
+    index = index_with(v1, v2)
+
+    where = and_(Everything(), Chunks.version.eq(2))
+
+    assert ids(index.find(where=where)) == {v2.id}
 
 
 # Values of every type: a backend may store some in another form (Qdrant: a UUID or
@@ -394,6 +428,13 @@ def test_any_of_matches_strings(typed_index_with: IndexWith) -> None:
     assert ids(index.find(where=Typed.labels.any_of(["hr", "legal"]))) == {tagged.id}
 
 
+def test_everything_fits_an_index_of_any_schema(typed_index_with: IndexWith) -> None:
+    stored = typed_chunk(0)
+    index = typed_index_with(stored)
+
+    assert index.find(where=Everything()) == [stored]
+
+
 # Filters on fields the index doesn't hold
 
 
@@ -418,7 +459,7 @@ def test_delete_with_a_field_from_another_schema_raises_and_removes_nothing(
     with pytest.raises(SchemaMismatchError, match="not in schema Chunks"):
         index.delete(where=where)
 
-    assert len(index.find(where=EVERYTHING)) == 2
+    assert len(index.find(where=Everything())) == 2
 
 
 @pytest.mark.parametrize("where", FOREIGN_FILTERS)
@@ -448,7 +489,7 @@ def test_delete_removes_only_the_chunks_the_filter_matches(
 
     index.delete(where=Chunks.document_id.eq(DOCUMENT))
 
-    assert ids(index.find(where=EVERYTHING)) == {kept.id}
+    assert ids(index.find(where=Everything())) == {kept.id}
 
 
 def test_delete_after_a_new_version_keeps_only_that_version(
@@ -463,7 +504,7 @@ def test_delete_after_a_new_version_keeps_only_that_version(
         where=and_(Chunks.document_id.eq(DOCUMENT), not_(Chunks.version.eq(2)))
     )
 
-    assert ids(index.find(where=EVERYTHING)) == ids([*v2, other])
+    assert ids(index.find(where=Everything())) == ids([*v2, other])
 
 
 def test_delete_matching_nothing_keeps_every_chunk(index_with: IndexWith) -> None:
@@ -471,7 +512,15 @@ def test_delete_matching_nothing_keeps_every_chunk(index_with: IndexWith) -> Non
 
     index.delete(where=Chunks.document_id.eq(OTHER_DOCUMENT))
 
-    assert len(index.find(where=EVERYTHING)) == 2
+    assert len(index.find(where=Everything())) == 2
+
+
+def test_delete_everything_empties_the_index(index_with: IndexWith) -> None:
+    index = index_with(chunk(position=0), chunk(document=OTHER_DOCUMENT))
+
+    index.delete(where=Everything())
+
+    assert index.find(where=Everything()) == []
 
 
 # Replacing
@@ -487,7 +536,7 @@ def test_replace_swaps_the_matched_chunks_for_the_new_ones(
 
     index.replace(where=Chunks.document_id.eq(DOCUMENT), with_=embedded_all(*new))
 
-    assert ids(index.find(where=EVERYTHING)) == ids([*new, other])
+    assert ids(index.find(where=Everything())) == ids([*new, other])
 
 
 def test_replace_accepts_new_chunks_that_do_not_match_its_filter(
@@ -502,7 +551,7 @@ def test_replace_accepts_new_chunks_that_do_not_match_its_filter(
         with_=[embedded(v2)],
     )
 
-    assert ids(index.find(where=EVERYTHING)) == {v2.id}
+    assert ids(index.find(where=Everything())) == {v2.id}
 
 
 def test_repeating_a_replace_gives_the_same_chunks(index_with: IndexWith) -> None:
@@ -513,7 +562,7 @@ def test_repeating_a_replace_gives_the_same_chunks(index_with: IndexWith) -> Non
     index.replace(where=where, with_=embedded_all(*new))
     index.replace(where=where, with_=embedded_all(*new))
 
-    assert ids(index.find(where=EVERYTHING)) == ids(new)
+    assert ids(index.find(where=Everything())) == ids(new)
 
 
 def test_replace_keeps_a_new_chunk_that_overwrites_a_matched_one(
@@ -525,7 +574,7 @@ def test_replace_keeps_a_new_chunk_that_overwrites_a_matched_one(
         where=Chunks.document_id.eq(DOCUMENT), with_=[embedded(chunk(text="new"))]
     )
 
-    [found] = index.find(where=EVERYTHING)
+    [found] = index.find(where=Everything())
     assert found.text == "new"
 
 
@@ -535,7 +584,16 @@ def test_replace_with_no_chunks_removes_the_matched_ones(index_with: IndexWith) 
 
     index.replace(where=Chunks.document_id.eq(DOCUMENT), with_=[])
 
-    assert ids(index.find(where=EVERYTHING)) == {other.id}
+    assert ids(index.find(where=Everything())) == {other.id}
+
+
+def test_replace_everything_leaves_only_the_new_chunks(index_with: IndexWith) -> None:
+    new = [chunk(version=2, position=p) for p in range(2)]
+    index = index_with(chunk(position=0), chunk(document=OTHER_DOCUMENT))
+
+    index.replace(where=Everything(), with_=embedded_all(*new))
+
+    assert ids(index.find(where=Everything())) == ids(new)
 
 
 @pytest.mark.parametrize("unfit", UNFIT)
@@ -551,7 +609,7 @@ def test_replace_changes_nothing_when_a_new_chunk_does_not_fit_the_schema(
             with_=[embedded(chunk(version=2)), unfit()],
         )
 
-    assert ids(index.find(where=EVERYTHING)) == ids(old)
+    assert ids(index.find(where=Everything())) == ids(old)
 
 
 def test_replace_changes_nothing_when_two_new_chunks_share_an_id(
@@ -566,7 +624,7 @@ def test_replace_changes_nothing_when_two_new_chunks_share_an_id(
             with_=embedded_all(chunk(version=2), chunk(version=2, text="other text")),
         )
 
-    assert ids(index.find(where=EVERYTHING)) == {old.id}
+    assert ids(index.find(where=Everything())) == {old.id}
 
 
 def test_replace_changes_nothing_when_its_filter_uses_a_foreign_field(
@@ -580,7 +638,7 @@ def test_replace_changes_nothing_when_its_filter_uses_a_foreign_field(
             where=not_(Entries.version.eq(2)), with_=[embedded(chunk(version=2))]
         )
 
-    assert ids(index.find(where=EVERYTHING)) == {old.id}
+    assert ids(index.find(where=Everything())) == {old.id}
 
 
 # Searching
@@ -619,7 +677,7 @@ def test_search_returns_hits_best_first_with_their_scores(
         ]
     )
 
-    hits = index.search(QUERY, where=EVERYTHING, limit=10)
+    hits = index.search(QUERY, where=Everything(), limit=10)
 
     assert hit_ids(hits) == [best.id, good.id, fair.id]
     assert pytest.approx([1.0, 0.8, 0.6], abs=1e-6) == scores(hits)
@@ -629,7 +687,7 @@ def test_a_hit_holds_the_chunk_as_it_was_stored(index_with: IndexWith) -> None:
     stored = chunk(text="Article 1. Scope", groups=[HR, LEGAL])
     index = index_with(stored)
 
-    [hit] = index.search(QUERY, where=EVERYTHING, limit=1)
+    [hit] = index.search(QUERY, where=Everything(), limit=1)
 
     assert hit.chunk == stored
     assert hit.chunk.text == "Article 1. Scope"
@@ -649,7 +707,7 @@ def test_search_returns_at_most_limit_hits_keeping_the_best(
         ]
     )
 
-    hits = index.search(QUERY, where=EVERYTHING, limit=2)
+    hits = index.search(QUERY, where=Everything(), limit=2)
 
     assert hit_ids(hits) == [best.id, good.id]
 
@@ -660,7 +718,7 @@ def test_search_returns_every_match_when_fewer_than_limit(
     index = index_with()
     index.put([embedded(chunk(position=0), numbers=GOOD), embedded(chunk(position=1))])
 
-    assert len(index.search(QUERY, where=EVERYTHING, limit=10)) == 2
+    assert len(index.search(QUERY, where=Everything(), limit=10)) == 2
 
 
 def test_search_applies_where_before_ranking(index_with: IndexWith) -> None:
@@ -692,7 +750,7 @@ def test_search_returns_no_hits_when_where_matches_nothing(
 
 
 def test_search_in_an_empty_index_returns_no_hits(index_with: IndexWith) -> None:
-    assert index_with().search(QUERY, where=EVERYTHING, limit=10) == []
+    assert index_with().search(QUERY, where=Everything(), limit=10) == []
 
 
 def test_cosine_ignores_how_long_a_vector_is(index_with: IndexWith) -> None:
@@ -705,7 +763,7 @@ def test_cosine_ignores_how_long_a_vector_is(index_with: IndexWith) -> None:
         ]
     )
 
-    hits = index.search(QUERY, where=EVERYTHING, limit=10)
+    hits = index.search(QUERY, where=Everything(), limit=10)
 
     assert hit_ids(hits) == [short_and_aligned.id, long_but_off.id]
     assert pytest.approx([1.0, 0.8], abs=1e-6) == scores(hits)
@@ -750,7 +808,7 @@ def test_search_with_another_schemas_vector_raises(index_with: IndexWith) -> Non
         SchemaMismatchError,
         match="vector 'dense' \\(another schema's vector\\) not in schema Chunks",
     ):
-        index.search(Entries.dense.query([1.0, 0.0]), where=EVERYTHING, limit=10)
+        index.search(Entries.dense.query([1.0, 0.0]), where=Everything(), limit=10)
 
 
 def test_search_with_a_vector_not_in_the_schema_raises(index_with: IndexWith) -> None:
@@ -759,7 +817,7 @@ def test_search_with_a_vector_not_in_the_schema_raises(index_with: IndexWith) ->
     with pytest.raises(
         SchemaMismatchError, match="vector 'summary' not in schema Chunks"
     ):
-        index.search(Other.summary.query([1.0, 0.0]), where=EVERYTHING, limit=10)
+        index.search(Other.summary.query([1.0, 0.0]), where=Everything(), limit=10)
 
 
 @pytest.mark.parametrize("where", FOREIGN_FILTERS)
@@ -775,4 +833,4 @@ def test_search_with_a_limit_that_is_not_a_positive_int_raises(
     limit: int, index_with: IndexWith
 ) -> None:
     with pytest.raises(ValueError, match="limit must be a positive integer"):
-        index_with(chunk()).search(QUERY, where=EVERYTHING, limit=limit)
+        index_with(chunk()).search(QUERY, where=Everything(), limit=limit)

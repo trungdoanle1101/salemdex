@@ -5,7 +5,17 @@ from typing import Any
 
 import pytest
 
-from salemdex_retrieval.filters import And, AnyOf, Equals, Not, Or, and_, not_, or_
+from salemdex_retrieval.filters import (
+    And,
+    AnyOf,
+    Equals,
+    Everything,
+    Not,
+    Or,
+    and_,
+    not_,
+    or_,
+)
 from salemdex_retrieval.schema import Many, One, Schema
 
 
@@ -131,6 +141,14 @@ def test_combinators_nest() -> None:
 
     assert isinstance(where.filters[1], Not)
     assert isinstance(where.filters[1].filter, Or)
+
+
+def test_everything_is_a_filter_the_combinators_accept() -> None:
+    everything = Everything()
+
+    assert and_(everything, Chunks.version.eq(2)).filters[0] is everything
+    assert or_(Chunks.version.eq(2), everything).filters[1] is everything
+    assert not_(everything).filter is everything
 
 
 @pytest.mark.parametrize(

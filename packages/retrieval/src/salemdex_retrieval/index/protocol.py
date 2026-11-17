@@ -10,7 +10,7 @@ from typing import Protocol, assert_never
 
 from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
-from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
+from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
 from salemdex_retrieval.schema import Schema
 from salemdex_retrieval.vectors import VectorQuery
 
@@ -178,6 +178,8 @@ def check_filter(where: Filter, *, schema: type[Schema]) -> None:
                 check_filter(f, schema=schema)
         case Not(filter=inner):
             check_filter(inner, schema=schema)
+        case Everything():
+            pass
         case _:
             assert_never(where)
 

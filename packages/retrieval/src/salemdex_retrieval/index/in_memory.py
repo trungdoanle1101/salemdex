@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable
 from typing import Final, assert_never
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
-from salemdex_retrieval.filters import And, AnyOf, Equals, Filter, Not, Or
+from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
 from salemdex_retrieval.index.protocol import (
     check_batch,
     check_filter,
@@ -106,6 +106,8 @@ class InMemoryIndex:
             case Not(filter=f):
                 part = self._build_matcher(f)
                 return lambda chunk: not part(chunk)
+            case Everything():
+                return lambda chunk: True
             case _:
                 assert_never(where)
 

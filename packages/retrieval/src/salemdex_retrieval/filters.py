@@ -1,6 +1,7 @@
 """Filters choosing which chunks a search or a write applies to.
 
-Build them from a schema's fields (`One.eq`, `Many.any_of`), which check the values.
+Build them from a schema's fields (`One.eq`, `Many.any_of`), which check the values,
+combine them with `and_`, `or_` and `not_`, or match every chunk with `Everything()`.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
     from salemdex_retrieval.schema import Many, One
 
 # Any filter, whatever its field's type: what searches, writes and backends accept.
-type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not
+type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not | Everything
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -133,6 +134,23 @@ def or_(*filters: Filter) -> Or:
         TypeError: An argument isn't a filter.
     """
     return Or(filters=filters)
+
+
+@dataclass(frozen=True)
+class Everything:
+    """A filter matching every chunk, like SQL with no `WHERE`.
+
+    Accepted wherever a filter is, writes included: `delete(where=Everything())`
+    empties the index, as `DELETE FROM chunks` empties a table. It has to be written
+    out, so the intent is clear where it's used. An empty `and_()` is refused instead,
+    because it comes from a list of conditions that turned out empty, by accident.
+
+    It names no field, so it fits every schema. A session given it as its access
+    filter lets every asker see every chunk.
+
+    Example:
+        index.delete(where=Everything())
+    """
 
 
 def _check_filters(filters: tuple[Filter, ...], *, owner: str) -> None:
