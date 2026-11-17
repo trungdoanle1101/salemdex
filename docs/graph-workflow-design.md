@@ -1,15 +1,15 @@
 # Retrieval as a graph of stages
 
-Status: build steps 1 and 2 done; step 3 done except the session: `Index.search` (section
-10), the embedder protocol with `embed_chunks` (section 6, "Embedders"), rerankers, and the
-engine's stages, statements, results, validity port and executor (sections 5 and 6). Branch:
+Status: build steps 1 to 3 done: the core, both index backends with `Index.search`
+(section 10), embedders and rerankers (section 6, "Embedders"), and the engine with its
+session (sections 5 and 6). Next: build step 4, in the server. Branch:
 `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
     the value checks;
   - `filters.py`: `Equals` (`eq`), `AnyOf` (`any_of`), `and_` / `or_` / `not_`, and
-    `Everything`, matching every chunk;
+    `Everything`, matching every chunk; `check_is_filter`, for filters arriving untyped;
   - `vectors.py`: `Dense` vectors, declared on the schema beside its fields, with checked
     values (`Dense.value`) and queries (`Dense.query`); the closed unions `VectorValue` and
     `VectorQuery`;
@@ -48,18 +48,29 @@ engine's stages, statements, results, validity port and executor (sections 5 and
   - `engine/validity.py`: the `Validity` port (`valid_ids(chunks) -> ids to keep`) and
     `AlwaysValid`;
   - `engine/executor.py`: `execute(statement, *, access, validity)`. It replays the
-    statement, searches every source with the access filter, gates where candidates enter
-    (one validity call per retrieve) and again inside `Take`, fuses by RRF, and reranks
-    every candidate it receives. Tested in `tests/engine/test_executor.py` with a scripted
-    index and spies that count embedder, validity and reranker calls.
-- **Pick up here** (as of 2026-11-17; the folder layout is in section 10):
-  1. `engine/session.py`: `Engine(validity=…)`, `engine.session(access=…)`,
-     `Session.execute(statement)`, the one caller of `execute`. An app without access
-     control passes `access=Everything()` (section 6, "Filter expressions").
-  2. The executor checks the access filter against every source's schema before any model
-     is called (section 6, "One filter for every schema"). Today `Index.search` checks it,
-     but only after the question was embedded.
-  3. Before build step 4: re-export the public API from `salemdex_retrieval/__init__.py`.
+    statement and checks the access filter against every source's schema, before any
+    model is called; then it searches every source with the access filter, gates where
+    candidates enter (one validity call per retrieve) and again inside `Take`, fuses by
+    RRF, and reranks every candidate it receives. Tested in `tests/engine/test_executor.py`
+    with a scripted index and spies that count embedder, validity and reranker calls.
+  - `engine/session.py`: `Engine(validity=…)` and `Session`, from `engine.session(access=…)`,
+    both frozen; `Session.execute(statement)` is the one public way to run a statement.
+    Tested in `tests/engine/test_session.py`.
+  - The re-exports, in three tiers (section 10, "Import paths"); `tests/test_public_api.py`
+    pins the top level's `__all__`.
+- **Pick up here** (as of 2026-11-18): build step 4, in the server (section 10):
+  1. The server's schema: `KbChunks` on an access preset whose `access_group_ids` is
+     `indexed=True`, as is every other field each search filters by; chunk ids
+     `uuid5(document_id, version, position)` (section 6, "The chunk" and "One filter for
+     every schema"). Settle which fields the standard preset holds first (section 11).
+  2. Port `run_index_job` to `embed_chunks` and `index.put`, with the version switch:
+     `documents.indexed_version` (one migration), set in the transaction that marks the
+     index job done, then `delete` of the document's other versions after the commit
+     (section 6, "Currency").
+  3. The server's validity adapter: a hit is kept when its document is active and its
+     version is `indexed_version`, one query per gate (section 6, "How the slots plug in").
+  4. Then search on it (server build step 5): one service opens sessions, a test of the
+     access filter it builds for each kind of asker, and the import-boundary check.
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
   rerank), resolving sources for generated entries, caller filters
   (`search(q).where(…)`), `expand`, query transforms (sections 5 and 6).
@@ -1116,8 +1127,10 @@ stage kinds afterwards is cheap.
   | the controller, agent loops, LLM tools | the controller sits above the executor (section 8); a package boundary makes that layering real |
   | answer generation, LLM providers | separate dependencies; retrieval stays usable without an LLM |
 
-  Why the split also helps safety: an agents package can only use retrieval's public API, so
-  agents must go through a session with the user's access. The package boundary enforces it.
+  Why the split also helps safety: an agents package uses retrieval's public API, where
+  the only way to run a statement is a session with the user's access. The boundary
+  doesn't enforce it fully, though: a `Source` holds its `Index`, whose `find` and `search`
+  apply no access filter of their own (section 11).
 
 - It never imports `document_processor`. An import-boundary check in CI enforces it. Why: the
   engine is generic; turning `chunking.Chunk` into an index chunk (today's `ingest` and
@@ -1129,12 +1142,11 @@ stage kinds afterwards is cheap.
   `kb_server`). The GitHub repo is already `salemdex`.
 
 **Folder layout.** The core modules stay at the top level. Each new kind of part gets a
-subfolder when it first arrives. The public API is re-exported from
-`salemdex_retrieval/__init__.py` before build step 4, when the server starts using it.
+subfolder when it first arrives.
 
 ```text
 src/salemdex_retrieval/
-  __init__.py              public API re-exports (before build step 4)
+  __init__.py              the top level's names ("Import paths" below)
   declarations.py  errors.py  schema.py  filters.py                       core
   checks.py                checks on plain values: check_positive_int, to_finite_float
   vectors.py               Dense, VectorValue, VectorQuery (closed unions)
@@ -1173,7 +1185,8 @@ src/salemdex_retrieval/
 tests/                     mirrors the source folders, each with its own __init__.py
   index/                   test_contract.py holds the search cases too
   embedders/               test_embed_chunks.py
-  engine/                  test_statements.py  test_executor.py  test_access.py  test_validity.py
+  engine/                  test_statements.py  test_executor.py  test_session.py
+  test_public_api.py       the top level's __all__, written out in full
 ```
 
 - **`engine/`, not `search/`.** "Search" would otherwise name three things:
@@ -1196,6 +1209,34 @@ tests/                     mirrors the source folders, each with its own __init_
 - **`validity.py`, not `gates.py`:** the module holds the check, not the place it runs. A
   *gate* is where the executor runs it; "the validity gate" stays a word in the executor's
   docstrings, with no module of its own.
+
+**Import paths (built).** Each public name has exactly one path to import it from. The
+question isn't what's public, but which path is the one to use:
+
+| Tier | Holds | Names |
+|---|---|---|
+| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `Source`, `Rrf`, `Engine` |
+| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Session`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
+| a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
+| not exported | what only the package uses | `execute`, `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
+
+- **Why not everything at the top:** where a name lives tells the reader what it is.
+  `errors.SchemaMismatchError` says more than a bare name, and the protocols adapter
+  authors implement shouldn't crowd the namespace every app reads.
+- **Why not only the deep modules:** paths like `engine.statements` would become public by
+  use, and moving a module would break callers. Deep modules (`engine/statements.py`,
+  `index/in_memory.py`) are never an import path; they can move freely.
+- **Fakes stay in their own module,** not in their subpackage's `__init__`: the import line
+  then says it's test code, and `.fake import` outside `tests/` is easy to find.
+  `InMemoryIndex` isn't a fake: it's a real backend for single-process runs and the
+  reference behaviour, so `index` exports it.
+- **`execute` is exported nowhere,** so `Session.execute` is the one public way to run a
+  statement, and no search runs without an access filter.
+- **`AlwaysValid` isn't at the top,** though it's built: only apps with nothing to check
+  and tests use it, and the top level shouldn't suggest it's the usual choice.
+- **`tests/test_public_api.py` pins the top level's `__all__`,** written out in full, as
+  the golden payload test does: a name joins or leaves the top level only by a change a
+  reviewer sees.
 
 **`Index.search` (built):**
 `index.search(query, *, where, limit) -> list[Hit]`.
@@ -1254,7 +1295,7 @@ tests/                     mirrors the source folders, each with its own __init_
    startup check, `put` / `find` / `replace` / `delete`, with the in-memory index's tests run
    against it too. Extract the `Index` protocol the two share. **(done)**
 3. **Statements and the executor** with retrieve, merge, rerank and take, plus the session, the
-   access filter and the validity check. **(done but the session)**
+   access filter and the validity check. **(done)**
 4. **Port the server's indexing handlers** to the new API, then build search on it. The
    server's schema declares `access_group_ids` and every other field each search filters by
    with `indexed=True` ("`Index.search`" above).
@@ -1283,3 +1324,11 @@ the session's trace.
   - What the controller, and so the LLM, sees after a tool call: passage text and handles, how
     much of the trail, how many passages per round (the context window limits this).
   - Everything the LLM writes is untrusted input. The session's access is what keeps that safe.
+- **Keeping agents inside a session.** A `Source` holds its `Index`, and `Index` is
+  public, so code holding a statement can call `source.index.find(where=Everything())`
+  with no access filter. Python can't hide the attribute, so the package boundary alone
+  doesn't keep agents inside a session (section 10). A likely shape, with the agents
+  package: agents never hold `Source` objects. Statements name their sources, and the
+  engine resolves the names from sources the app registered with it, so an agent gets a
+  session and source names, never an index. Until then, the rule rests on code review
+  and on agents being given sessions only.

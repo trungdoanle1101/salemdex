@@ -34,6 +34,7 @@ from salemdex_retrieval.engine.stages import (
 from salemdex_retrieval.engine.statements import Search, replay
 from salemdex_retrieval.engine.validity import Validity
 from salemdex_retrieval.filters import Filter
+from salemdex_retrieval.index.protocol import check_filter
 from salemdex_retrieval.rerankers.protocol import Reranker, score_texts
 from salemdex_retrieval.vectors import VectorQuery
 
@@ -42,7 +43,8 @@ def execute(statement: Search, *, access: Filter, validity: Validity) -> list[Pa
     """Run `statement` and return its passages, best first.
 
     The statement is replayed first, so one built at run time is checked before any
-    model is called or any index is read, and the replayed one is what runs.
+    model is called or any index is read, and the replayed one is what runs. The
+    access filter is checked then too, against every source's schema.
 
     Args:
         statement: The search to run.
@@ -54,11 +56,14 @@ def execute(statement: Search, *, access: Filter, validity: Validity) -> list[Pa
 
     Raises:
         StatementError: The stages come in an order the steps don't allow.
+        SchemaMismatchError: `access` uses a field that isn't in a source's schema.
         ValueError: An embedder or the reranker returned the wrong number of rows or
             scores, or a number that doesn't fit.
         TypeError: A score or a vector number isn't a real number.
     """
     statement = replay(statement)
+    _check_access(statement, access=access)
+
     lists: list[list[Candidate]] = []
     for stage in statement.stages:
         match stage:
@@ -76,6 +81,26 @@ def execute(statement: Search, *, access: Filter, validity: Validity) -> list[Pa
             case _:
                 assert_never(stage)
     raise AssertionError("replay guarantees a Take ends every Search statement")
+
+
+def _check_access(statement: Search, *, access: Filter) -> None:
+    """Check that `access` fits the schema of every index the statement searches.
+
+    Raises:
+        SchemaMismatchError: `access` uses a field that isn't in a source's schema.
+    """
+    all_sources: list[Source] = []
+    for stage in statement.stages:
+        match stage:
+            case Retrieve(sources=sources):
+                all_sources.extend(sources)
+            case Merge() | Rerank() | Take():
+                pass
+            case _:
+                assert_never(stage)
+
+    for source in all_sources:
+        check_filter(access, schema=source.index.schema)
 
 
 def _retrieve(

@@ -12,8 +12,8 @@ from salemdex_retrieval.engine.results import Found, Fused, Reranked
 from salemdex_retrieval.engine.stages import Retrieve, Rrf, Source, Take
 from salemdex_retrieval.engine.statements import Search, search
 from salemdex_retrieval.engine.validity import AlwaysValid
-from salemdex_retrieval.errors import StatementError
-from salemdex_retrieval.filters import Filter
+from salemdex_retrieval.errors import SchemaMismatchError, StatementError
+from salemdex_retrieval.filters import Everything, Filter, and_, not_
 from salemdex_retrieval.index.in_memory import InMemoryIndex
 from salemdex_retrieval.schema import One, Schema
 from salemdex_retrieval.vectors import Dense, Vector, VectorQuery
@@ -194,6 +194,51 @@ def test_every_source_searches_with_the_access_filter() -> None:
     )
 
     assert [where for _, where, _ in index.searches] == [PUBLIC, PUBLIC]
+
+
+def test_everything_as_access_reaches_every_source_as_it_is() -> None:
+    index = scripted(dense=[A], title=[B])
+
+    execute(
+        search("q")
+        .retrieve(source(index), source(index, Chunks.title))
+        .merge(Rrf())
+        .take(5),
+        access=Everything(),
+        validity=AlwaysValid(),
+    )
+
+    assert [where for _, where, _ in index.searches] == [Everything(), Everything()]
+
+
+class Other(Schema):
+    group = One(str, indexed=True)
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        pytest.param(Other.group.eq("public"), id="same name, another schema"),
+        pytest.param(
+            and_(PUBLIC, not_(Other.group.eq("hr"))), id="nested after a fitting part"
+        ),
+    ],
+)
+def test_access_that_does_not_fit_a_sources_schema_fails_before_any_model_is_called(
+    access: Filter,
+) -> None:
+    embedder = SpyEmbedder()
+    index = scripted(dense=[A])
+
+    with pytest.raises(SchemaMismatchError, match="not in schema Chunks"):
+        execute(
+            search("q").retrieve(source(index, embedder=embedder)).take(5),
+            access=access,
+            validity=AlwaysValid(),
+        )
+
+    assert embedder.calls == []
+    assert index.searches == []
 
 
 # Retrieve

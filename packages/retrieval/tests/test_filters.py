@@ -13,6 +13,7 @@ from salemdex_retrieval.filters import (
     Not,
     Or,
     and_,
+    check_is_filter,
     not_,
     or_,
 )
@@ -149,6 +150,33 @@ def test_everything_is_a_filter_the_combinators_accept() -> None:
     assert and_(everything, Chunks.version.eq(2)).filters[0] is everything
     assert or_(Chunks.version.eq(2), everything).filters[1] is everything
     assert not_(everything).filter is everything
+
+
+def test_everything_equals_another_everything() -> None:
+    assert Everything() == Everything()
+    assert not_(Everything()) == not_(Everything())
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        pytest.param(Chunks.version.eq(2), id="eq"),
+        pytest.param(Chunks.groups.any_of([HR]), id="any_of"),
+        pytest.param(and_(Chunks.version.eq(2)), id="and_"),
+        pytest.param(or_(Chunks.version.eq(2)), id="or_"),
+        pytest.param(not_(Chunks.version.eq(2)), id="not_"),
+        pytest.param(Everything(), id="Everything"),
+    ],
+)
+def test_check_is_filter_accepts_every_kind_of_filter(where: object) -> None:
+    check_is_filter(where, owner="access")
+
+
+def test_check_is_filter_names_where_the_value_was_given_and_its_type() -> None:
+    with pytest.raises(
+        TypeError, match=re.escape("access: bool is not a valid Filter")
+    ):
+        check_is_filter(Chunks.version == 2, owner="access")  # type: ignore[comparison-overlap]
 
 
 @pytest.mark.parametrize(

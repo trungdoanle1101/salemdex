@@ -59,10 +59,7 @@ class Not:
     filter: Filter
 
     def __post_init__(self) -> None:
-        if not isinstance(self.filter, _FILTER_CLASSES):
-            raise TypeError(
-                f"Not(...): {type(self.filter).__name__} is not a valid Filter"
-            )
+        check_is_filter(self.filter, owner="Not(...)")
 
 
 def not_(ft: Filter, /) -> Not:
@@ -153,6 +150,24 @@ class Everything:
     """
 
 
+def check_is_filter(value: object, *, owner: str) -> None:
+    """Check that `value` is a filter, for filters arriving untyped at run time.
+
+    Fields don't define `__eq__`, so `KbChunks.version == 2` gives `False`, not an
+    error, and a filter built at run time (from config, or by an agent) arrives as
+    `Any`. mypy passes both; this catches them where they enter.
+
+    Args:
+        value: What should be a filter.
+        owner: Where it was given, starting the message, e.g. `"Not(...)"`.
+
+    Raises:
+        TypeError: `value` isn't one of the `Filter` classes.
+    """
+    if not isinstance(value, _FILTER_CLASSES):
+        raise TypeError(f"{owner}: {type(value).__name__} is not a valid Filter")
+
+
 def _check_filters(filters: tuple[Filter, ...], *, owner: str) -> None:
     """Check that `filters` holds at least one filter, and only filters.
 
@@ -163,10 +178,7 @@ def _check_filters(filters: tuple[Filter, ...], *, owner: str) -> None:
     if not filters:
         raise ValueError(f"{owner}: needs at least one Filter")
     for i, filter in enumerate(filters):
-        if not isinstance(filter, _FILTER_CLASSES):
-            raise TypeError(
-                f"{owner}, filters[{i}]: {type(filter).__name__} is not a valid Filter"
-            )
+        check_is_filter(filter, owner=f"{owner}, filters[{i}]")
 
 
 # The classes in `Filter`, for isinstance; read from the alias so a new node can't be

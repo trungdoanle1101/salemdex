@@ -58,3 +58,6 @@ class AlwaysValid:
             The id of each chunk.
         """
         return {chunk.id for chunk in chunks}
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
