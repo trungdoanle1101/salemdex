@@ -118,8 +118,8 @@ class Question(_Statement):
             `Candidates` for one source, `CandidateLists` for several.
 
         Raises:
-            ValueError: There are no sources, or two repeat each other (see
-                `Retrieve`).
+            ValueError: There are no sources, or two repeat each other or share a
+                name (see `Retrieve`).
             TypeError: A source isn't a `Source`.
         """
         stage = Retrieve(sources=sources)

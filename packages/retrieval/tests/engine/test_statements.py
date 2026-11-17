@@ -25,10 +25,16 @@ class Chunks(Schema):
 CHUNKS = InMemoryIndex(schema=Chunks)
 EMBEDDER = FakeDenseEmbedder(size=8)
 DENSE = Source(
-    index=CHUNKS, binding=DenseBinding(vector=Chunks.dense, embedder=EMBEDDER), depth=50
+    name="dense",
+    index=CHUNKS,
+    binding=DenseBinding(vector=Chunks.dense, embedder=EMBEDDER),
+    depth=50,
 )
 TITLE = Source(
-    index=CHUNKS, binding=DenseBinding(vector=Chunks.title, embedder=EMBEDDER), depth=50
+    name="title",
+    index=CHUNKS,
+    binding=DenseBinding(vector=Chunks.title, embedder=EMBEDDER),
+    depth=50,
 )
 RERANKER = FakeReranker()
 

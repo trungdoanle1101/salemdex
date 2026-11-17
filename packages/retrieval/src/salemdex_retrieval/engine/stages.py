@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import get_args
 
-from salemdex_retrieval.checks import check_positive_int
+from salemdex_retrieval.checks import check_positive_int, to_stripped_str
 from salemdex_retrieval.embedders.protocol import VectorBinding
 from salemdex_retrieval.index.protocol import Index
 from salemdex_retrieval.rerankers.protocol import Reranker
@@ -41,6 +41,9 @@ class Retrieve:
     count it twice. Indexes are compared as objects, so two index objects over one
     stored collection aren't recognised as the same; build one object per collection.
 
+    No two sources may share a name either: each candidate's trail names the sources
+    that found it.
+
     Attributes:
         sources: Where to look, in order; at least one.
     """
@@ -52,13 +55,14 @@ class Retrieve:
 
         Raises:
             ValueError: There are no sources, or two search the same vector of the
-                same index.
+                same index, or two share a name.
             TypeError: A source isn't a `Source`.
         """
         if not self.sources:
             raise ValueError("a retrieve needs at least one source")
 
-        seen: set[tuple[int, Vector]] = set()
+        seen_index_vectors: set[tuple[int, Vector]] = set()
+        seen_source_names: set[str] = set()
         for position, source in enumerate(self.sources):
             if type(source) is not Source:
                 raise TypeError(
@@ -67,13 +71,20 @@ class Retrieve:
             # id(): an Index needn't be hashable; vectors hash by identity, as they
             # compare
             key = (id(source.index), source.binding.vector)
-            if key in seen:
-                name = source.binding.vector.name
+            if key in seen_index_vectors:
+                vector_name = source.binding.vector.name
                 raise ValueError(
-                    f"two sources search vector {name!r} of the same index; "
+                    f"two sources search vector {vector_name!r} of the same index; "
                     "give it once, with the depth you need"
                 )
-            seen.add(key)
+            seen_index_vectors.add(key)
+
+            if source.name in seen_source_names:
+                raise ValueError(
+                    f"two sources have the same name {source.name!r}; "
+                    "give them different names"
+                )
+            seen_source_names.add(source.name)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -84,24 +95,31 @@ class Source:
     returns the nearest chunks the access filter lets through.
 
     Attributes:
+        name: What the source is called in each candidate's trail, e.g. "dense";
+            unique within a retrieve, and stripped of whitespace at either end.
         index: The index to search.
         binding: The vector to search, and the embedder for the question; the vector
             must be one of the index's schema.
         depth: The most candidates this source returns.
     """
 
+    name: str
     index: Index
     binding: VectorBinding
     depth: int
 
     def __post_init__(self) -> None:
-        """Check the depth, and that the index's schema declares the vector.
+        """Strip the name, check it and the depth, and that the schema has the vector.
 
         Raises:
-            ValueError: `depth` isn't a positive `int`.
+            TypeError: `name` isn't a `str`.
+            ValueError: `name` is empty or only whitespace, or `depth` isn't a
+                positive `int`.
             SchemaMismatchError: The vector isn't one of the index's schema, checked
                 here so that no question is embedded for it.
         """
+        # The dataclass is frozen; this is the one place its name is set
+        object.__setattr__(self, "name", to_stripped_str(self.name, name="name"))
         check_positive_int(self.depth, name="depth")
         self.index.schema.check_declares(self.binding.vector)
 

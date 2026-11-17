@@ -155,14 +155,35 @@ passages = engine.session(access=access).execute(stmt)
   mypy checks the order:
 
   ```text
-  Question   → .rewrite() .split()                  → Queries
-  Queries    → .retrieve(sources…)                  → Candidates
-  Candidates → .merge() .rerank() .expand() .prune() → Candidates
-  Candidates → .take(k)                             → Passages   (terminal)
+  search(question)                                   → Question
+  Question       → .retrieve(source)                 → Candidates
+  Question       → .retrieve(a, b, …)                → CandidateLists
+  CandidateLists → .merge(fusion)                    → Candidates
+  Candidates     → .rerank() (later .expand() .prune()) → Candidates
+  Candidates     → .take(limit)                      → Search   (complete)
+
+  later, with query transforms:
+  Question       → .rewrite()                        → Question
+  Question       → .split()                          → Queries
+  Queries        → .retrieve(sources…)               → CandidateLists (always)
   ```
+
+  - **A state is named after what it guarantees,** so later steps only add. `Question` holds
+    exactly one question, which is why one source gives one list; `Queries` (several) arrives
+    with `split`, and its `retrieve` always gives lists to merge.
+  - **Several lists must be merged before anything else.** `CandidateLists` offers only
+    `merge`, so mypy refuses `retrieve(a, b).rerank(…)`.
+  - **The complete state is `Search`, not `Passages`:** `execute(search: Search) ->
+    list[Passage]` would otherwise put the plan and its result under nearly one name.
+  - **States are siblings over a private base** holding `question` and `stages`. Why: a
+    state subclassing another would be accepted where the earlier one is expected.
 
 - **Immutable and generative:** each method returns a new statement. Statements are data: they
   can be inspected, logged as provenance and replayed.
+- **The question stays out of `repr`.** Why: it can reveal what the asker is after, and a
+  traceback or a debug line would print it. Auditing questions is the app's choice: it reads
+  `statement.question` and stores it under its own rules (access, retention). The executor's
+  trace, like the trail, holds no text.
 - **Composite stages:** a stage can contain stages (a merge over several sources). That gives a
   tree, which covers fan-out and fan-in. There is no free-form graph of untyped nodes. Why: it
   would lose strict typing and make the guarantees hard to prove.
@@ -958,16 +979,17 @@ src/salemdex_retrieval/
 
   engine/                  retrieval itself (build step 3)
     statements.py          search(question) and the type-state steps:
-                           Question → Queries → Candidates → Passages
-    stages.py              retrieve, merge (rrf), rerank, take, as data
-    candidates.py          Candidate, TrailEntry, Passage
+                           Question → CandidateLists → Candidates → Search
+    stages.py              retrieve (named sources), merge (rrf), rerank, take, as data
+    results.py             Candidate, the trail entries (Found, Fused, Reranked),
+                           Passage
     executor.py            compiles a statement and runs it: adds the access filter to every
                            source, the currency gate before rerank and at the end
     session.py             Engine, Session(access=…), AllowEverything
     gates.py               the Validity protocol, the currency check
 
   rerankers/               with the rerank stage
-    protocol.py  huggingface.py
+    protocol.py  fake.py  huggingface.py
 
 tests/                     mirrors the source folders, each with its own __init__.py
   index/                   test_contract.py holds the search cases too

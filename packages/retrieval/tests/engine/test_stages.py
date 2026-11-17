@@ -28,11 +28,21 @@ EMBEDDER = FakeDenseEmbedder(size=8)
 
 
 def build_source(
-    vector: Dense = Chunks.dense, *, index: InMemoryIndex = CHUNKS, depth: int = 20
+    vector: Dense = Chunks.dense,
+    *,
+    name: str | None = None,
+    index: InMemoryIndex = CHUNKS,
+    depth: int = 20,
 ) -> Source:
-    """Return a source searching `vector` of `index`, keeping `depth` hits."""
+    """Return a source searching `vector` of `index`, keeping `depth` hits.
+
+    It's named after the vector unless `name` is given.
+    """
     return Source(
-        index=index, binding=DenseBinding(vector=vector, embedder=EMBEDDER), depth=depth
+        name=vector.name if name is None else name,
+        index=index,
+        binding=DenseBinding(vector=vector, embedder=EMBEDDER),
+        depth=depth,
     )
 
 
@@ -46,9 +56,10 @@ BAD_COUNTS = [
 # Source
 
 
-def test_a_source_keeps_its_index_binding_and_depth() -> None:
-    source = build_source(depth=50)
+def test_a_source_keeps_its_name_index_binding_and_depth() -> None:
+    source = build_source(name="meaning", depth=50)
 
+    assert source.name == "meaning"
     assert source.index is CHUNKS
     assert source.binding.vector is Chunks.dense
     assert source.depth == 50
@@ -58,6 +69,26 @@ def test_a_source_keeps_its_index_binding_and_depth() -> None:
 def test_a_source_refuses_a_depth_that_isnt_a_positive_int(depth: Any) -> None:
     with pytest.raises(ValueError, match="depth must be a positive integer"):
         build_source(depth=depth)
+
+
+@pytest.mark.parametrize("name", ["", "   ", "\n\t"])
+def test_a_source_refuses_a_name_without_text(name: str) -> None:
+    with pytest.raises(ValueError, match="name"):
+        build_source(name=name)
+
+
+def test_a_source_strips_whitespace_from_either_end_of_its_name() -> None:
+    assert build_source(name=" meaning\n").name == "meaning"
+
+
+def test_a_source_refuses_a_name_that_isnt_a_str() -> None:
+    with pytest.raises(TypeError, match="name"):
+        Source(
+            name=None,  # type: ignore[arg-type]
+            index=CHUNKS,
+            binding=DenseBinding(vector=Chunks.dense, embedder=EMBEDDER),
+            depth=20,
+        )
 
 
 def test_a_source_refuses_a_vector_its_index_doesnt_declare() -> None:
@@ -102,7 +133,35 @@ def test_a_retrieve_takes_the_same_vector_of_two_index_objects() -> None:
     # Two in-memory indexes hold different chunks, so neither repeats the other
     other = InMemoryIndex(schema=Chunks)
 
-    Retrieve(sources=(build_source(), build_source(index=other)))
+    Retrieve(sources=(build_source(), build_source(name="other", index=other)))
+
+
+def test_a_retrieve_refuses_two_sources_with_the_same_name() -> None:
+    # The trail names each source, so two of one name couldn't be told apart
+    with pytest.raises(ValueError, match="'meaning'"):
+        Retrieve(
+            sources=(
+                build_source(Chunks.dense, name="meaning"),
+                build_source(Chunks.title, name="meaning"),
+            )
+        )
+
+
+def test_a_retrieve_refuses_names_that_differ_only_by_surrounding_whitespace() -> None:
+    with pytest.raises(ValueError, match="'meaning'"):
+        Retrieve(
+            sources=(
+                build_source(Chunks.dense, name="meaning"),
+                build_source(Chunks.title, name="meaning "),
+            )
+        )
+
+
+def test_a_retrieve_refuses_the_same_name_on_two_index_objects() -> None:
+    other = InMemoryIndex(schema=Chunks)
+
+    with pytest.raises(ValueError, match="'dense'"):
+        Retrieve(sources=(build_source(), build_source(index=other)))
 
 
 @pytest.mark.parametrize(
