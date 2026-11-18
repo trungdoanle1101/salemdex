@@ -81,7 +81,7 @@ def read(
 
 def test_the_payload_has_the_stored_layout() -> None:
     # Changing this layout breaks existing indexes: re-index them, and update the
-    # layout in docs/graph-workflow-design.md ("The Qdrant payload layout").
+    # layout in docs/salemdex-retrieval-plan.md ("The Qdrant payload layout").
     assert encode_payload(build(embedded_text="Part 1\nArticle 1. Scope")) == {
         "text": "Article 1. Scope",
         "embedded_text": "Part 1\nArticle 1. Scope",

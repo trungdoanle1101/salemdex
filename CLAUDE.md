@@ -13,7 +13,7 @@ with access control by group.
   permissions and raise; repositories only report. Job handlers never touch the database.
 - `apps/cli/`: an HTTP-only client, later.
 - `packages/retrieval/` (`salemdex_retrieval`): the new retrieval engine, being built
-  alongside the framework's retrieval (design: `docs/graph-workflow-design.md`).
+  alongside the framework's retrieval (design: `docs/salemdex-retrieval-plan.md`).
 
 The design, with the reason for each decision and the build order:
 @docs/backend-design.md
