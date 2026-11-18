@@ -177,26 +177,71 @@ one, and the override is a decision with its own author and time.
 - The same file (sha256) as a document's current version in the same collection → 409
   `duplicate_file` with that document's id.
 - A single upload is `active` at once; `draft` is for batches.
-- Changing title, groups, tags or attributes → a `sync_attributes` job, no re-embedding.
+- Changing groups, tags or attributes → a `sync_attributes` job, no re-embedding. Changing the
+  title changes only the database: the title isn't on the chunks (section 5).
 - A new file → a new version → a `prepare` job. A profile override → a `prepare` job for the
   current version.
 - Deleting a document removes it everywhere (section 8, "Deleting").
 
 ---
 
-## 5. Index (Qdrant): chunk attributes
+## 5. Index (Qdrant): the chunk schema
 
 ```text
-built in run_index_job          access_group_ids   collection_id   document_version
-later                           tags   status   retired_on   part
+built in run_index_job (framework)   access_group_ids   collection_id   document_version
+next, on salemdex_retrieval          the schema below
+later                                tags   retired_on   part
 ```
 
-- The index holds one version per document: indexing replaces all of the document's chunks.
-- Search filters inside the index: `access_group_ids` contains one of the reader's groups.
-  Why: filtering only after the search loses results and reveals that hidden hits exist.
-  A private document has no groups, so no group filter matches it.
-- After retrieval: drop hits whose `document_version` isn't the document's current version, or
-  whose document is no longer `active`.
+```python
+class Guarded(Schema):  # every searchable schema inherits it
+    access_group_ids = Many(UUID, indexed=True)
+    collection_id = One(UUID, indexed=True)
+    document_id = One(UUID, indexed=True)
+    document_version = One(int)
+
+
+class KbChunks(Guarded):
+    position = One(int)
+    headings = Many(str)  # where the passage sits, for citing it; empty for `plain`
+    dense = Dense(size=1024, distance="cosine")
+```
+
+- **A field goes in `Guarded` when a guarantee slot reads it from every source:** the access
+  filter (`access_group_ids`, `collection_id`) and validity (`document_id`,
+  `document_version`). Why: a session holds one filter and the engine one validity check, and
+  both apply to every index a statement searches. A field on one schema only would be refused
+  on the others (retrieval design, section 6, "One filter for every schema"). Generated
+  entries will inherit it too.
+- **The access filter, by asker:**
+
+  ```python
+  reader = Guarded.access_group_ids.any_of(groups)
+  manager = or_(reader, Guarded.collection_id.in_(managed_collections))
+  admin = Everything()
+  ```
+
+  Why `collection_id`: managers see every document of the collections they manage, private
+  ones included (section 4, "Rules"), and a private document has no groups. An empty `in_`
+  matches nothing, so a manager of no collection sees what their groups allow. A front end
+  acting for someone gets that user's reader or manager filter, never `Everything()`
+  (`is_admin` is false while acting for someone).
+- **Search filters inside the index.** Why: filtering only after the search loses results and
+  reveals that hidden hits exist.
+- **Indexed fields are the ones filtered by:** groups and collection (every search),
+  `document_id` (replacing and deleting a document's chunks). `document_version` isn't:
+  validity reads it from the hit, and deleting a document's other versions is narrowed by
+  `document_id` first.
+- **Chunk ids:** `uuid5(document_id, f"{version}:{position}")`. The version is in the id, so a
+  new version's chunks never overwrite the old one's while both are in the index.
+- **Kept off the chunks:** `status` and the indexed version (their truth is in the database,
+  so validity checks them: a hit is kept when its document is `active` and its version is
+  `indexed_version`), and `title` (read from the database when passages are shaped, so a
+  rename doesn't touch the index). Why: a condition whose truth lives in the database would go
+  stale on the chunks.
+- While a new version is being indexed, the index briefly holds two versions of a document;
+  validity shows only `indexed_version`, and the old chunks are deleted after the commit
+  (retrieval design, section 6, "Currency").
 
 ---
 
@@ -559,8 +604,8 @@ kb-server gc                        remove originals no row needs
 5. Search: `POST /search` with the access filter. Moved ahead of the read side because it is
    the reason the system exists, and it tests the index decisions early.
 6. Read side: list with paging, versions, download, review page, `GET /jobs/{id}`.
-7. Editing: title and groups (`sync_attributes`), new versions, outline preview, profile
-   override.
+7. Editing: title (database only) and groups (`sync_attributes`), new versions, outline
+   preview, profile override.
 8. Operations: `reprepare`, re-index after an embedder change, `gc`, backups.
 9. Retrieval evaluation: a labelled question set under `data/`, hit rate and MRR.
 10. Answers, the OpenAI-compatible surface, batches, relations and retirements, feedback, CLI.
@@ -591,6 +636,7 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | `DocumentRepository.delete` needs status `deleting` | A bug can't hard-delete an active document |
 | Adding an enum value has a no-op downgrade | Narrowing it would fail or lose the rows that use the value |
 | `vn_regulation` isn't the default | Most documents aren't regulations; `plain` is the safe fallback |
+| Fields the access filter and validity read live in one preset (`Guarded`) | One filter and one validity check apply to every index a statement searches |
 
 ## 16. Later
 

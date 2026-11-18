@@ -61,10 +61,9 @@ session (sections 5 and 6). Next: build step 4, in the server. Branch:
   - The re-exports, in three tiers (section 10, "Import paths"); `tests/test_public_api.py`
     pins the top level's `__all__`.
 - **Pick up here** (as of 2026-11-18): build step 4, in the server (section 10):
-  1. The server's schema: `KbChunks` on an access preset whose `access_group_ids` is
-     `indexed=True`, as is every other field each search filters by; chunk ids
-     `uuid5(document_id, version, position)` (section 6, "The chunk" and "One filter for
-     every schema"). Settle which fields the standard preset holds first (section 11).
+  1. The server's schema: `KbChunks` on the `Guarded` preset, as `backend-design.md`
+     section 5 lays it out; chunk ids `uuid5(document_id, version, position)` (section 6,
+     "The chunk" and "One filter for every schema").
   2. Port `run_index_job` to `embed_chunks` and `index.put`, with the version switch:
      `documents.indexed_version` (one migration), set in the transaction that marks the
      index job done, then `delete` of the document's other versions after the commit
@@ -569,8 +568,10 @@ Chunk(
   `expand(neighbours, order_by=KbChunks.position, within=KbChunks.document_id)`,
   `prune(dedupe, by=KbChunks.document_id)`. The compile step checks that those fields exist
   and have the right types.
-- A **standard schema preset** (document id, position, headings) is offered as a convenience,
-  never as a requirement. Why: without one, every app would rebuild the basics.
+- **The package ships no schema preset.** Why: nothing in it reads a field by its role
+  (stages take fields as settings), so a preset would be a guess at an app's schema, and a
+  public name to keep. Apps declare their own; the server's is in `backend-design.md`,
+  section 5. Extract a shared one only when a second app repeats the same fields.
 
 ### Vectors
 
@@ -619,7 +620,7 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
 
   Planned changes that need neither re-embedding nor reading vectors back:
   - `update_fields(*, where, values)` (Qdrant's `set_payload`) for `sync_attributes` (server
-    build step 7), so a changed title or group isn't re-embedded;
+    build step 7), so a changed group isn't re-embedded;
   - later perhaps `export(where)`, for copying a collection.
 - **Kinds:** only `Dense` exists. More kinds become further `Vector` subclasses when a source
   needs them:
@@ -1003,6 +1004,10 @@ access = Restricted.access_group_ids.any_of(groups)   # valid on both schemas
 
 - An inherited declaration is the same object in every subclass, so the existing identity
   check accepts it on both, and refuses it on a schema without the preset: it fails closed.
+- The preset holds every field the access filter names, not only groups: an `or_` across
+  fields (my groups, or the collections I manage) must be valid on every schema too. Fields
+  the validity adapter reads belong there for the same reason: it is called on candidates
+  from every source. Which fields those are is the app's decision.
 - The executor checks the filter against every source's schema before any model is called.
 - The cost: entries copy their chunk's access fields when indexed, so a change to a document's
   groups updates its chunks and its entries. A missed update can't leak a passage: the
@@ -1326,8 +1331,6 @@ the session's trace.
 
 ## 11. Open questions
 
-- **The standard schema preset:** which fields it holds. The access fields belong in it, or
-  in an access preset of their own (section 6, "One filter for every schema").
 - **The agent step API** (later, with the controller):
   - How a statement starts from earlier candidates. A likely shape: the LLM sees short handles
     (`p2`), and the controller maps them back; an invented handle doesn't resolve. Earlier
