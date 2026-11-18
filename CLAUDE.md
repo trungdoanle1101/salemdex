@@ -31,6 +31,11 @@ cd apps/server && KB_TEST_DATABASE_URL=postgresql+psycopg://kb:kb@localhost/kb_t
 
 uv run pytest tests                           # framework tests, from the root
 cd packages/retrieval && uv run pytest        # retrieval tests: its tests/ package clashes too
+#   optional, each runs tests skipped without it:
+#   KB_TEST_QDRANT_URL=http://localhost:6333                    a Qdrant server (compose up qdrant)
+#   KB_TEST_EMBEDDER_MODEL=sentence-transformers/all-MiniLM-L6-v2   a real embedder, hub id or folder
+#   KB_TEST_RERANKER_MODEL=BAAI/bge-reranker-v2-m3              a real reranker, hub id or folder
+#   HF_HUB_OFFLINE=1 uses only models already in the Hugging Face cache
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src apps/server/src apps/server/tests packages/retrieval/src packages/retrieval/tests
 
