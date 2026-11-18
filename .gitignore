@@ -15,6 +15,7 @@ wheels/
 .ruff_cache
 .mypy_cache
 .pytest_cache
+.vscode
 
 # Data
 /data/

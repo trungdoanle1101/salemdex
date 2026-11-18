@@ -1,4 +1,5 @@
-"""The errors of a wrongly declared schema, of what doesn't fit one, and of bad statements.
+"""The errors of a wrongly declared schema, of what doesn't fit one, of bad statements,
+and of models that can't be loaded.
 
 They live apart from `schema.py` and `chunks.py` so every module can raise them without
 importing the others.
@@ -25,4 +26,14 @@ class StatementError(ValueError):
     Only a statement built at run time (from config, by an agent) can be out of order:
     the steps refuse it in code, and `replay` refuses it at run time. An API can answer
     it as a bad request.
+    """
+
+
+class ModelLoadError(Exception):
+    """Raised when a model can't be loaded.
+
+    No local folder or hub model has its name, or what is there isn't a model. Each
+    calls for the same fix, correcting the model's name, so they share one error; the
+    library's own error is chained as the cause and tells them apart. Neither an
+    `OSError` nor a `ValueError`, since each would be wrong for some of the causes.
     """

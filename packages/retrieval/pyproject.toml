@@ -15,3 +15,4 @@ build-backend = "uv_build"
 
 [project.optional-dependencies]
 qdrant = ["qdrant-client>=1.20.0"]
+huggingface = ["sentence-transformers>=6.2,<7", "torch>=2.14.1"]
