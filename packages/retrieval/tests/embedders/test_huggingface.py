@@ -1,33 +1,25 @@
-"""`HuggingFaceDenseEmbedder`: its settings and loading, and a real model when one is set.
+"""`HuggingFaceDenseEmbedder` with a real model; its settings and loading are tested with
+the reranker's, in tests/test_huggingface.py.
 
-The tests with a model run only when KB_TEST_EMBEDDER_MODEL names one, as a hub id or a
-local folder, e.g. `sentence-transformers/all-MiniLM-L6-v2`. They use English text, so
-any model can run them.
+They run only when KB_TEST_EMBEDDER_MODEL names a model, as a hub id or a local folder,
+e.g. `sentence-transformers/all-MiniLM-L6-v2`. They use English text, so any model can
+run them.
 """
 
 import math
 import os
-import re
 import uuid
 from collections.abc import Sequence
-from pathlib import Path
 
 import pytest
-import torch
 
 from salemdex_retrieval.chunks import Chunk
-from salemdex_retrieval.embedders.huggingface import (
-    Device,
-    HuggingFaceDenseEmbedder,
-    ResolvedDevice,
-    _resolve_device,
-)
+from salemdex_retrieval.embedders.huggingface import HuggingFaceDenseEmbedder
 from salemdex_retrieval.embedders.protocol import (
     DenseBinding,
     DenseEmbedder,
     embed_chunks,
 )
-from salemdex_retrieval.errors import ModelLoadError
 from salemdex_retrieval.filters import Everything
 from salemdex_retrieval.index import InMemoryIndex
 from salemdex_retrieval.schema import One, Schema
@@ -40,82 +32,6 @@ PASSAGES = [
     "Late payment of an invoice is charged interest of two percent per month.",
     "Annual leave is twelve working days for each full year of work.",
 ]
-
-
-# Settings, checked before the model loads
-
-
-@pytest.mark.parametrize("batch_size", [0, -1, True, 2.0])
-def test_a_batch_size_that_is_not_a_positive_int_is_refused(
-    batch_size: object, tmp_path: Path
-) -> None:
-    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
-        HuggingFaceDenseEmbedder(
-            tmp_path / "missing",
-            device="cpu",
-            batch_size=batch_size,  # type: ignore[arg-type]
-        )
-
-
-@pytest.mark.parametrize("device", ["cuda", "mps"])
-def test_a_gpu_pytorch_cannot_find_is_refused_naming_it(
-    device: Device, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _set_gpus(monkeypatch, cuda=False, mps=False)
-
-    message = f"device {device!r} was asked for, but PyTorch found no"
-    with pytest.raises(ValueError, match=re.escape(message)):
-        HuggingFaceDenseEmbedder(tmp_path / "missing", device=device, batch_size=8)
-
-
-@pytest.mark.parametrize(
-    ("device", "cuda", "mps", "expected"),
-    [
-        ("auto", True, True, "cuda"),
-        ("auto", False, True, "mps"),
-        ("auto", False, False, "cpu"),
-        ("cpu", True, True, "cpu"),
-        ("cuda", True, False, "cuda"),
-        ("mps", False, True, "mps"),
-    ],
-)
-def test_the_device_is_the_one_asked_for_or_the_best_one_for_auto(
-    device: Device,
-    cuda: bool,
-    mps: bool,
-    expected: ResolvedDevice,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _set_gpus(monkeypatch, cuda=cuda, mps=mps)
-
-    assert _resolve_device(device) == expected
-
-
-def test_a_model_that_cannot_be_found_raises_naming_it(tmp_path: Path) -> None:
-    missing = tmp_path / "missing"
-
-    message = f"can't load model {str(missing)!r} as a local folder or a hub model"
-    with pytest.raises(ModelLoadError, match=re.escape(message)) as raised:
-        HuggingFaceDenseEmbedder(missing, device="cpu", batch_size=8)
-
-    assert isinstance(raised.value.__cause__, OSError)
-
-
-def test_a_folder_that_is_not_a_model_raises_the_same_error(tmp_path: Path) -> None:
-    not_a_model = tmp_path / "notes"
-    not_a_model.mkdir()
-
-    message = f"can't load model {str(not_a_model)!r} as a local folder or a hub model"
-    with pytest.raises(ModelLoadError, match=re.escape(message)) as raised:
-        HuggingFaceDenseEmbedder(not_a_model, device="cpu", batch_size=8)
-
-    assert isinstance(raised.value.__cause__, ValueError)
-
-
-def test_a_load_error_is_neither_an_os_error_nor_a_value_error() -> None:
-    # Code catching a bad batch size (ValueError) or a file problem (OSError) mustn't
-    # swallow a model that can't be loaded by accident.
-    assert not issubclass(ModelLoadError, (OSError, ValueError))
 
 
 # A real model
@@ -194,12 +110,6 @@ def test_a_search_finds_the_passage_that_answers_the_question(
     [best] = index.search(Chunks.dense.query(question), where=Everything(), limit=1)
 
     assert best.chunk.text == PASSAGES[2]
-
-
-def _set_gpus(monkeypatch: pytest.MonkeyPatch, *, cuda: bool, mps: bool) -> None:
-    """Make PyTorch report the given GPUs as available or not."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
 
 
 def _close(row: Sequence[float], other: Sequence[float]) -> bool:

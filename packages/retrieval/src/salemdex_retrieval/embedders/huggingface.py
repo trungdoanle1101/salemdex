@@ -6,16 +6,12 @@ and document prompts, if it declares any, come from its own configuration.
 
 import os
 from collections.abc import Sequence
-from typing import Literal
+from typing import Final
 
-import torch
 from sentence_transformers import SentenceTransformer
 
+from salemdex_retrieval._huggingface import Device, load_model, resolve_device
 from salemdex_retrieval.checks import check_positive_int
-from salemdex_retrieval.errors import ModelLoadError
-
-type Device = Literal["auto", "cuda", "mps", "cpu"]
-type ResolvedDevice = Literal["cuda", "mps", "cpu"]
 
 
 class HuggingFaceDenseEmbedder:
@@ -23,6 +19,9 @@ class HuggingFaceDenseEmbedder:
 
     Queries go through the model's `encode_query` and passages through its
     `encode_document`, so each gets the prompt the model declares for it, or none.
+
+    Attributes:
+        device: Where the model runs, with `"auto"` already decided, for logging.
 
     Example:
         embedder = HuggingFaceDenseEmbedder("BAAI/bge-m3", device="auto", batch_size=16)
@@ -48,20 +47,10 @@ class HuggingFaceDenseEmbedder:
                 there isn't a model. The error from Hugging Face is chained.
         """
         check_positive_int(batch_size, name="batch_size")
-        self._device = _resolve_device(device)
-        try:
-            self._model = SentenceTransformer(
-                os.fspath(model),
-                device=self._device,
-                # Full precision on every device: vectors made on a GPU then match
-                # those made on the CPU, so moving the worker doesn't change ranking.
-                model_kwargs={"dtype": torch.float32},
-            )
-        except (OSError, ValueError) as error:
-            raise ModelLoadError(
-                f"can't load model {os.fspath(model)!r} as a local folder or a hub model"
-            ) from error
-
+        self.device: Final = resolve_device(device)
+        self._model = load_model(
+            model, model_class=SentenceTransformer, device=self.device
+        )
         self._batch_size = batch_size
 
     def embed_queries(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
@@ -95,33 +84,3 @@ class HuggingFaceDenseEmbedder:
         # The shape and the numbers are checked where the rows enter (Dense.value).
         rows: list[list[float]] = embeddings.tolist()
         return rows
-
-
-def _resolve_device(device: Device) -> ResolvedDevice:
-    """Return the device to run on: `device` itself, or the best one for `"auto"`.
-
-    Raises:
-        ValueError: `device` names a GPU PyTorch can't find.
-    """
-    cuda_available = torch.cuda.is_available()
-    if device == "cuda":
-        if not cuda_available:
-            raise ValueError(
-                "device 'cuda' was asked for, but PyTorch found no CUDA-compatible GPU; use 'auto' or 'cpu'"
-            )
-        return "cuda"
-
-    mps_available = torch.backends.mps.is_available()
-    if device == "mps":
-        if not mps_available:
-            raise ValueError(
-                "device 'mps' was asked for, but PyTorch found no MPS-compatible GPU; use 'auto' or 'cpu'"
-            )
-        return "mps"
-
-    if device == "auto":
-        if cuda_available:
-            return "cuda"
-        if mps_available:
-            return "mps"
-    return "cpu"

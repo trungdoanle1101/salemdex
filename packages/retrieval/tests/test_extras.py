@@ -5,8 +5,10 @@ import sys
 
 # The modules that need an extra, and the libraries the extras install.
 EXTRA_MODULES = (
+    "salemdex_retrieval._huggingface",
     "salemdex_retrieval.index.qdrant",
     "salemdex_retrieval.embedders.huggingface",
+    "salemdex_retrieval.rerankers.huggingface",
 )
 EXTRA_LIBRARIES = ("qdrant_client", "torch", "sentence_transformers", "transformers")
 
