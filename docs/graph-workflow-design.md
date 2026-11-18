@@ -8,12 +8,14 @@ session (sections 5 and 6). Next: build step 4, in the server. Branch:
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
     the value checks;
-  - `filters.py`: `Equals` (`eq`), `AnyOf` (`any_of`), `and_` / `or_` / `not_`, and
-    `Everything`, matching every chunk; `check_is_filter`, for filters arriving untyped;
+  - `filters.py`: `Equals` (`eq`), `In` (`in_`, on a `One`), `AnyOf` (`any_of`, on a
+    `Many`), `and_` / `or_` / `not_`, and `Everything`, matching every chunk;
+    `check_is_filter`, for filters arriving untyped;
   - `vectors.py`: `Dense` vectors, declared on the schema beside its fields, with checked
     values (`Dense.value`) and queries (`Dense.query`); the closed unions `VectorValue` and
     `VectorQuery`;
-  - `chunks.py`: `Chunk`, and `Chunk.check_fits(schema)` raising `SchemaMismatchError`;
+  - `chunks.py`: `Chunk`, with typed reads (`chunk[field]`), and
+    `Chunk.check_fits(schema)` raising `SchemaMismatchError`;
     `EmbeddedChunk`, a chunk with its vector values, which every write takes; `Hit`, a chunk
     with its score, which search returns;
   - `index/in_memory.py`: `InMemoryIndex` with `put`, `find`, `delete`, `replace` and
@@ -74,8 +76,7 @@ session (sections 5 and 6). Next: build step 4, in the server. Branch:
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
   rerank), resolving sources for generated entries, caller filters
   (`search(q).where(…)`), `expand`, query transforms (sections 5 and 6).
-- Later, when a caller needs it: `chunk.get(field)` for typed reads (step 3 or 4), `in_` on
-  `One`, filtering by chunk ids.
+- Later, when a caller needs it: filtering by chunk ids.
 
 The project is named **Salemdex**. This engine is its first package under that name,
 `salemdex-retrieval` (section 10).
@@ -303,6 +304,13 @@ Chunk
   `SchemaMismatchError` (a `ValueError`) naming the chunk id and every extra and missing
   field. Why a separate error from `SchemaError`: the schema is fine, the data doesn't fit it,
   so a caller (the worker) can treat it as permanent.
+- **Values are read with `chunk[field]`, typed by the field:** a `One[T]` gives `T`, a
+  `Many[T]` gives `tuple[T, ...]`. A field the chunk doesn't hold raises
+  `SchemaMismatchError` naming the field and the chunk id, and says when it's another
+  schema's field with the same name. Why `[]` and not `get`: `dict.get` returns `None` on a
+  miss, so `chunk.get(f)` would suggest a miss is normal. Every chunk read from an index fits
+  its schema, so a miss is a bug. Why not `value`: `One.value` already builds a value for a
+  write.
 
 - **The id is unique across the index**, not only within a document. The app derives it
   deterministically, e.g. `uuid5(document_id, version, position)`. Why: Qdrant takes UUIDs
@@ -391,8 +399,9 @@ the operations differ: `eq` and ranges fit one value, `any_of` / `all_of` fit se
 |---|---|---|
 | filter | `KbChunks.document_id.eq(doc_id)` | `eq("abc")`: a `str` where a `UUID` is expected |
 | ordered filters | `KbChunks.version.ge(2)` | `ge` on a `UUID` field. It exists only for int, float, datetime (a self-type on the method) |
+| one of several | `KbChunks.collection_id.in_(ids)` | `in_` on a `Many` |
 | multi-valued | `KbChunks.groups.any_of(ids)` | `eq` on a `Many`, `any_of` on a `One` |
-| read | `chunk.get(KbChunks.document_id)` → `UUID` | no `str` or `Any` coming back. It's generic: `get(col: One[T]) -> T` |
+| read | `chunk[KbChunks.document_id]` → `UUID`, `chunk[KbChunks.headings]` → `tuple[str, ...]` | no `str` or `Any` coming back. Two overloads: `One[T]` gives `T`, `Many[T]` gives `tuple[T, ...]` |
 | stage settings | `expand(order_by=KbChunks.position)` | `order_by` takes only ordered `One` fields |
 
 **Writing chunks: typed fields plus a value builder.**
@@ -780,12 +789,12 @@ index.put(embedded)
 
 - **AND / OR / NOT over schema fields and chunk ids.** One mechanism for every filter. Why:
   today's fixed fields plus `attributes` can't OR across fields.
-- **Methods are the API:** `KbChunks.document_id.eq(x)`, `any_of(…)`. Why: they read plainly and
+- **Methods are the API:** `KbChunks.document_id.eq(x)`, `in_(…)`, `any_of(…)`. Why: they read plainly and
   type-check under strict mypy. Operator overloading (`==`, `|`) may come later as sugar over
   the methods, only if they prove ugly.
 - **Combinators are functions, the nodes frozen dataclasses:** `and_(…)`, `or_(…)`, `not_(…)`
   build `And`, `Or`, `Not` (trailing underscores because `and`, `or`, `not` are keywords, as in
-  SQLAlchemy). `type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not | Everything`
+  SQLAlchemy). `type Filter = Equals[Any] | In[Any] | AnyOf[Any] | And | Or | Not | Everything`
   refers to itself.
   - **The checks live in the nodes' `__post_init__`**, so a node built directly is checked too.
     The functions only turn their arguments into a tuple.
@@ -819,11 +828,14 @@ index.put(embedded)
     compiles it, and compares each field with the schema's as an object, not by name.
   - **Two Qdrant conditions don't map one to one.** Floats and datetimes match by a range
     from the value to itself. Why: Qdrant can't match a float exactly, and a datetime stored
-    as a string would miss the same instant written with another offset. An `any_of` with no
-    values becomes a filter matching nothing. Why: Qdrant reads an empty `should` as no
+    as a string would miss the same instant written with another offset. An `in_` or
+    `any_of` with no values becomes a filter matching nothing. Why: Qdrant reads an empty `should` as no
     constraint and matches every point.
-- Not yet: filtering by chunk ids (first caller: re-checking earlier candidates, step 3) and
-  `in_` on `One` (first caller: scoping a search to collections or documents).
+- **`in_` on `One` is its own node, `In`, not an `AnyOf`.** Why: `AnyOf` treats the chunk's
+  value as a collection, so on a `str` field it would match by characters. Its first caller
+  is the access filter for a manager (`collection_id.in_(…)`); an empty `in_` matches
+  nothing, so a manager of no collection sees only what their groups allow.
+- Not yet: filtering by chunk ids (first caller: re-checking earlier candidates).
 
 ### Generated entries
 

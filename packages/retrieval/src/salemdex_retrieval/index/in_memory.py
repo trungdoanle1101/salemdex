@@ -99,15 +99,15 @@ class InMemoryIndex:
         """Return a function telling whether a chunk matches `where`.
 
         `where` must already be checked by `check_filter`: a field outside the schema
-        would raise `KeyError` on the first chunk.
+        would raise `SchemaMismatchError` on the first chunk.
         """
         match where:
             case Equals(field=field, value=value):
-                return lambda chunk: chunk.field_values[field] == value
+                return lambda chunk: chunk[field] == value
             case In(field=field, values=values):
-                return lambda chunk: chunk.field_values[field] in values
+                return lambda chunk: chunk[field] in values
             case AnyOf(field=field, values=values):
-                return lambda chunk: not values.isdisjoint(chunk.field_values[field])
+                return lambda chunk: not values.isdisjoint(chunk[field])
             case And(filters=filters):
                 parts = [self._build_matcher(f) for f in filters]
                 return lambda chunk: all(part(chunk) for part in parts)

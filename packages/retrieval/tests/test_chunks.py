@@ -1,4 +1,5 @@
 import dataclasses
+import re
 import uuid
 from typing import Any
 
@@ -77,7 +78,7 @@ def test_a_chunk_keys_its_field_values_by_field() -> None:
 def test_an_empty_many_is_kept_as_no_values() -> None:
     chunk = build(field_values=[Chunks.headings.value([])])
 
-    assert chunk.field_values[Chunks.headings] == ()
+    assert chunk[Chunks.headings] == ()
 
 
 def test_the_same_field_given_twice_is_rejected() -> None:
@@ -135,6 +136,47 @@ def test_a_chunk_does_not_show_its_text_in_its_repr() -> None:
 
     assert TEXT not in shown
     assert str(CHUNK_ID) in shown
+
+
+# Reading values
+
+
+class Notes(Schema):
+    note = One(str)
+
+
+def test_reading_a_one_field_gives_its_value() -> None:
+    chunk = build()
+
+    assert chunk[Chunks.document_id] == DOCUMENT_ID
+    assert chunk[Chunks.position] == 3
+
+
+def test_reading_a_many_field_gives_its_values_as_a_tuple_in_order() -> None:
+    headings = Chunks.headings.value(["Part 1", "Article 2"])
+    chunk = build(field_values=[Chunks.document_id.value(DOCUMENT_ID), headings])
+
+    assert chunk[Chunks.headings] == ("Part 1", "Article 2")
+
+
+def test_reading_another_schemas_field_with_the_same_name_raises_saying_so() -> None:
+    message = f"chunk {CHUNK_ID}: no field 'document_id' (another schema's field)"
+    with pytest.raises(SchemaMismatchError, match=re.escape(message)):
+        build()[Entries.document_id]
+
+
+def test_reading_a_field_the_chunk_lacks_raises_naming_it_and_the_chunk_id() -> None:
+    with pytest.raises(SchemaMismatchError) as raised:
+        build()[Notes.note]
+
+    assert str(raised.value) == f"chunk {CHUNK_ID}: no field 'note'"
+
+
+def test_a_failed_read_does_not_show_the_text() -> None:
+    with pytest.raises(SchemaMismatchError) as raised:
+        build()[Notes.note]
+
+    assert TEXT not in str(raised.value)
 
 
 class Standard(Schema):

@@ -4,11 +4,19 @@ import uuid
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, assert_never
+from typing import Any, Literal, assert_never, overload
 
 from salemdex_retrieval.declarations import Declaration
 from salemdex_retrieval.errors import SchemaMismatchError
-from salemdex_retrieval.schema import Field, FieldValue, ManyValues, OneValue, Schema
+from salemdex_retrieval.schema import (
+    Field,
+    FieldValue,
+    Many,
+    ManyValues,
+    One,
+    OneValue,
+    Schema,
+)
 from salemdex_retrieval.vectors import Vector, VectorValue
 
 
@@ -79,6 +87,41 @@ class Chunk:
             self, "embedded_text", embedded_text if embedded_text is not None else text
         )
         object.__setattr__(self, "field_values", MappingProxyType(by_field))
+
+    @overload
+    def __getitem__[T](self, field: One[T]) -> T: ...
+
+    @overload
+    def __getitem__[T](self, field: Many[T]) -> tuple[T, ...]: ...
+
+    def __getitem__(self, field: Field[Any]) -> Any:
+        """Return the chunk's value for `field`, typed by the field.
+
+        Example:
+            document_id = chunk[KbChunks.document_id]   # UUID
+            headings = chunk[KbChunks.headings]         # tuple[str, ...]
+
+        Args:
+            field: The field to read. Fields are compared as objects, not by name.
+
+        Returns:
+            The value for a `One` field; the values, as a tuple and possibly empty,
+            for a `Many` field.
+
+        Raises:
+            SchemaMismatchError: The chunk holds no value for `field`, such as another
+                schema's field with the same name as one of its own.
+        """
+        if field not in self.field_values:
+            in_another = (
+                " (another schema's field)"
+                if field.name in {f.name for f in self.field_values}
+                else ""
+            )
+            raise SchemaMismatchError(
+                f"chunk {self.id}: no field {field.name!r}{in_another}"
+            )
+        return self.field_values[field]
 
     def check_fits(self, schema: type[Schema]) -> None:
         """Check that the chunk has a value for each of `schema`'s fields, and no other.
