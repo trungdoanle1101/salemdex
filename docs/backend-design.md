@@ -316,6 +316,10 @@ a document without its job (the outbox idea).
 
 - Profiles describe how a kind of document is structured. Built in: `vn_regulation`
   (Chương, Điều, khoản…) and `plain` (no levels: chunked by size only).
+- Chunks are sized in the embedder's tokens (`KB_CHUNK_TOKENS`) for now, which assumes one
+  dense embedder. The rework sizes them in words, and checks fit against each model only by
+  that model's own tokenization (retrieval design, section 6, "Chunk length and the
+  models").
 - **Automatic choice:** `KB_PROFILES` lists candidates; each is tried in order, and the first
   whose outline has a section wins. If none does, `KB_FALLBACK_PROFILE` (`plain`) is used.
   List candidates from most specific to most general.

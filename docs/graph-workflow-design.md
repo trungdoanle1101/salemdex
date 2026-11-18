@@ -1,8 +1,9 @@
 # Retrieval as a graph of stages
 
 Status: build steps 1 to 3 done: the core, both index backends with `Index.search`
-(section 10), embedders and rerankers (section 6, "Embedders"), and the engine with its
-session (sections 5 and 6). Next: build step 4, in the server. Branch:
+(section 10), embedders and rerankers (section 6, "Embedders") with Hugging Face adapters,
+and the engine with its session (sections 5 and 6). Next: build step 4, in the server, as
+part of replacing the old retrieval ("Pick up here" below). Branch:
 `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
@@ -60,18 +61,77 @@ session (sections 5 and 6). Next: build step 4, in the server. Branch:
     Tested in `tests/engine/test_session.py`.
   - The re-exports, in three tiers (section 10, "Import paths"); `tests/test_public_api.py`
     pins the top level's `__all__`.
-- **Pick up here** (as of 2026-11-18): build step 4, in the server (section 10):
-  1. The server's schema: `KbChunks` on the `Guarded` preset, as `backend-design.md`
-     section 5 lays it out; chunk ids `uuid5(document_id, version, position)` (section 6,
-     "The chunk" and "One filter for every schema").
-  2. Port `run_index_job` to `embed_chunks` and `index.put`, with the version switch:
-     `documents.indexed_version` (one migration), set in the transaction that marks the
-     index job done, then `delete` of the document's other versions after the commit
-     (section 6, "Currency").
-  3. The server's validity adapter: a hit is kept when its document is active and its
-     version is `indexed_version`, one query per gate (section 6, "How the slots plug in").
-  4. Then search on it (server build step 5): one service opens sessions, a test of the
-     access filter it builds for each kind of asker, and the import-boundary check.
+  - `chunks.py`: typed reads, `chunk[field]`; `filters.py`: `In`, from `One.in_`.
+  - Behind the `huggingface` extra: `embedders/huggingface.py`
+    (`HuggingFaceDenseEmbedder`, `encode_query` / `encode_document`, so the model's own
+    prompts) and `rerankers/huggingface.py` (`HuggingFaceReranker`, a one-label
+    `CrossEncoder`, refusing a classifier at load). Both take the model as Hugging Face
+    names it, a hub id or a folder, and keep nothing about it; `_huggingface.py` holds the
+    device choice and `load_model`, which raises `errors.ModelLoadError`. Tested in
+    `tests/test_huggingface.py` (no model), `tests/rerankers/test_huggingface.py` (a tiny
+    model built in the test) and, with a real model set, the embedder's and reranker's
+    tests; `tests/test_extras.py` checks no core import loads an extra's library.
+- **Pick up here** (as of 2026-11-18): replace the old retrieval in the server, then delete
+  it (expand, migrate, contract; section 10, "Migration"). Nothing else in the framework
+  imports `document_processor.retrieval` or `integrations.{huggingface,qdrant}`: only the
+  server, `scripts/try_search.py`, `scripts/pin_model.py` and their own tests do.
+  1. **Index on salemdex** (build step 4):
+     - `Guarded` and `KbChunks` (`backend-design.md` section 5), and a pure function
+       turning one version's prepared chunks into salemdex `Chunk`s: ids
+       `uuid5(document_id, f"{version}:{position}")`, `embedded_text` with the headings
+       path. It replaces `to_indexed_chunks` and `index_document`;
+     - `run_index_job` on `embed_chunks` and `index.put`, with the version switch:
+       `documents.indexed_version` (one migration), set in the transaction that marks the
+       index job done, then `delete` of the document's other versions after the commit
+       (section 6, "Currency");
+     - `run_delete_job` on `index.delete(where=KbChunks.document_id.eq(…))`;
+     - wiring: `QdrantIndex.open(schema=KbChunks, …)`, whose payload indexes replace
+       `QDRANT_INDEXED_ATTRIBUTES` and its test, and `HuggingFaceDenseEmbedder`; settings
+       name the model as Hugging Face does, replacing `KB_EMBEDDER_SPEC` and
+       `KB_MODELS_FOLDER`;
+     - port `test_handlers.py`, `test_worker.py` and the smoke script
+       (`scripts/smoke_test.py`, `test_smoke_script.py`) to `InMemoryIndex` and
+       `FakeDenseEmbedder`.
+  2. **The old preparation sizes in words** with `WordTokenizer` (section 6, "Chunk length
+     and the models"), so it needs no model's tokenizer:
+     - `KB_CHUNK_TOKENS` becomes `KB_CHUNK_WORDS` (a new name, since the unit changes);
+       about 450 words keeps today's size (512 bge-m3 tokens at 1.10 tokens per word);
+     - `PreparationSettings` drops the embedder identity, and the index job drops its
+       "chunks sized for this embedder" check;
+     - the recorded chunker settings name the tokenizer (`"tokenizer": "words"`), so a
+       version sized in tokens and one sized in words differ for `reprepare --stale`;
+     - `WordTokenizer`'s docstring no longer says "not for production".
+  3. **Move the index to a new collection:** `QdrantIndex.open` refuses the old payload
+     layout, so the new code writes to a new `KB_QDRANT_COLLECTION` and every active
+     document needs an index job. Prepared output is unchanged: only re-embedding.
+  4. **Search** (build step 4, server build step 5): the validity adapter (a hit is kept
+     when its document is active and its version is `indexed_version`, one query per
+     gate), one service opening sessions, a test of the access filter it builds for each
+     kind of asker, `POST /search`, `HuggingFaceReranker` from a reranker setting, and the
+     import-boundary check.
+  5. **Evaluation:** hit rate and MRR on a labelled question set, which only
+     `document_processor.retrieval.evaluation` does today. It must exist before the old
+     package goes, or the two can't be compared.
+  6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
+     `integrations/qdrant`, their tests (`tests/retrieval`,
+     `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
+     rewrite it on the engine) and `scripts/pin_model.py`. The server's `worker` extra
+     becomes `salemdex-retrieval[huggingface,qdrant]`. Update `backend-design.md`
+     sections 3 (settings, the `KB_MODELS_FOLDER` paragraph), 8 (the index job, the
+     Qdrant indexes paragraph) and 15.
+
+  Decisions needed on the way:
+  - **What identifies a model in provenance** (blocks step 1's provenance). The old
+    identity held a pinned commit; a hub name alone can't tell an upstream update from the
+    indexed model. Passing Hugging Face's own `revision` through is one answer.
+  - **How to re-index into the new collection** (step 3): a one-off command now, or
+    server build step 8's re-index early.
+  - **Where evaluation lives** (step 5): in salemdex, running statements against labelled
+    questions, or in the server.
+  - **Reference keys:** the old index stored `reference_keys` (`address_keys` in
+    `retrieval/reference.py`), and `ChunkFilter` could filter by them; no server caller
+    searches by them. Drop them, or add a `Many(str)` field to `KbChunks` and move
+    `address_keys` out of the old package first.
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
   rerank), resolving sources for generated entries, caller filters
   (`search(q).where(…)`), `expand`, query transforms (sections 5 and 6).
@@ -786,6 +846,40 @@ index.put(embedded)
   `AsyncIndex`) and an async executor beside the synchronous ones. Statements and stages are
   data, so they stay unchanged.
 
+### Chunk length and the models
+
+The old preparation sized chunks in its one embedder's tokens. That assumed one dense
+vector, so one tokenizer and one way to count. A schema may now declare no dense vector or
+several, and the reranker reads every chunk too.
+
+- **Chunks are sized in words** (whitespace-separated; in Vietnamese, syllables), at sentence
+  boundaries, as Elasticsearch's `semantic_text` and Haystack's `DocumentSplitter` do. Why:
+  the size is chosen for retrieval quality (how much a hit holds), which no tokenizer
+  decides; a model change doesn't mean re-preparing; and words vary less than characters
+  between languages and tokenizers (measured once on Vietnamese and English text: XLM-R
+  1.10 and 1.31 tokens per word, MiniLM 1.72 and 1.16). The old preparation keeps counting
+  in `KB_CHUNK_TOKENS` until it is reworked.
+- **Two questions, kept apart:**
+
+  | Question | Can it be checked? | How |
+  |---|---|---|
+  | Does a model's pipeline cut a chunk off? | yes, exactly | run the model's own tokenization, with its truncation, on what that model reads, and compare the tokens kept with the tokens there were |
+  | Does a model read long input well? | no | evaluation (build step 9); a window can be longer than the text a model was trained on |
+
+  So if fit is checked, it is checked by the model's own tokenization, never by a declared
+  limit (MiniLM's tokenizer says 512, sentence-transformers cuts at 256) and never by our
+  word count. What each model reads counts: an embedder reads `embedded_text`, headings
+  included; a reranker reads the question with the text.
+- **Not built:** a fit check. With bge-m3 and bge-reranker-v2-m3 (8192 tokens each), a
+  250-word chunk is about 275 tokens, so it would always report nothing. Build it when a
+  model with a small window is configured. Counting stays outside the protocols: a local
+  adapter can offer it, a hosted model returns an error or truncates on its own (TEI refuses
+  long input unless `truncate=true`). It would be a measurement, not a refusal: a cut-off
+  chunk still returns its exact text, so ranking suffers, not a guarantee (section 2).
+- **The chat LLM is a different constraint:** it reads many passages at once, so its limit
+  decides how many passages fit its context when an answer is assembled, not how long a
+  chunk is.
+
 ### Filter expressions
 
 - **AND / OR / NOT over schema fields and chunk ids.** One mechanism for every filter. Why:
@@ -1183,7 +1277,8 @@ src/salemdex_retrieval/
     protocol.py            DenseEmbedder, DenseBinding, VectorBinding, and
                            embed_chunks(chunks, *, bindings)
     fake.py                a deterministic embedder for tests, the server's too
-    huggingface.py         a local adapter (bge-m3), behind the `huggingface` extra
+    huggingface.py         HuggingFaceDenseEmbedder: any sentence-transformers model, as
+                           Hugging Face names it, behind the `huggingface` extra
 
   engine/                  retrieval itself (build step 3)
     statements.py          search(question) and the type-state steps:
@@ -1197,7 +1292,10 @@ src/salemdex_retrieval/
     validity.py            the Validity port, AlwaysValid
 
   rerankers/               with the rerank stage
-    protocol.py  fake.py  huggingface.py
+    protocol.py  fake.py
+    huggingface.py         HuggingFaceReranker: a one-label CrossEncoder, same extra
+
+  _huggingface.py          what both adapters share: the device, load_model
 
 tests/                     mirrors the source folders, each with its own __init__.py
   index/                   test_contract.py holds the search cases too
@@ -1331,6 +1429,10 @@ the session's trace.
 
 ## 11. Open questions
 
+- **Chunk length against several models** (section 6, "Chunk length and the models"):
+  whether any case should fail rather than be reported, such as a model whose window is
+  shorter than the configured chunk size. Embedders, the reranker and later the chat LLM
+  all read chunks, in different roles; settle it when the preparation is reworked.
 - **The agent step API** (later, with the controller):
   - How a statement starts from earlier candidates. A likely shape: the LLM sees short handles
     (`p2`), and the controller maps them back; an invented handle doesn't resolve. Earlier
