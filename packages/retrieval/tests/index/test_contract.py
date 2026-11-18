@@ -232,6 +232,40 @@ def test_eq_matches_chunks_whose_value_is_equal(index_with: IndexWith) -> None:
     assert ids(index.find(where=Chunks.version.eq(2))) == {v2.id}
 
 
+def test_in_matches_chunks_whose_value_is_one_of_the_values(
+    index_with: IndexWith,
+) -> None:
+    v1, v2, v3 = chunk(version=1), chunk(version=2), chunk(version=3)
+    index = index_with(v1, v2, v3)
+
+    assert ids(index.find(where=Chunks.version.in_([1, 3]))) == ids([v1, v3])
+
+
+def test_in_with_no_values_matches_no_chunk(index_with: IndexWith) -> None:
+    index = index_with(chunk(version=1), chunk(version=2))
+
+    assert index.find(where=Chunks.version.in_([])) == []
+
+
+def test_not_in_with_no_values_matches_every_chunk(index_with: IndexWith) -> None:
+    chunks = [chunk(version=1), chunk(version=2)]
+    index = index_with(*chunks)
+
+    assert ids(index.find(where=not_(Chunks.version.in_([])))) == ids(chunks)
+
+
+def test_in_with_no_values_in_an_or_leaves_the_other_filters_to_decide(
+    index_with: IndexWith,
+) -> None:
+    # A manager who manages no collections still sees what their groups allow.
+    hr, legal = chunk(position=0, groups=[HR]), chunk(position=1, groups=[LEGAL])
+    index = index_with(hr, legal)
+
+    where = or_(Chunks.groups.any_of([HR]), Chunks.document_id.in_([]))
+
+    assert ids(index.find(where=where)) == {hr.id}
+
+
 def test_any_of_matches_chunks_sharing_at_least_one_value(
     index_with: IndexWith,
 ) -> None:
@@ -421,6 +455,33 @@ def test_eq_tells_instants_a_microsecond_apart(typed_index_with: IndexWith) -> N
     assert ids(index.find(where=Typed.at.eq(NOON))) == {noon.id}
 
 
+def test_in_matches_floats_exactly(typed_index_with: IndexWith) -> None:
+    exact, close = typed_chunk(0, score=0.3), typed_chunk(1, score=0.1 + 0.2)
+    index = typed_index_with(exact, close, typed_chunk(2, score=0.5))
+
+    assert ids(index.find(where=Typed.score.in_([0.3, 0.7]))) == {exact.id}
+
+
+def test_in_matches_the_same_instant_written_with_another_offset(
+    typed_index_with: IndexWith,
+) -> None:
+    noon = typed_chunk(0, at=NOON)
+    index = typed_index_with(noon, typed_chunk(1, at=NOON + timedelta(hours=1)))
+
+    seven_pm_in_hanoi = NOON.astimezone(timezone(timedelta(hours=7)))
+    where = Typed.at.in_([seven_pm_in_hanoi, NOON - timedelta(days=1)])
+
+    assert ids(index.find(where=where)) == {noon.id}
+
+
+def test_in_tells_true_from_false(typed_index_with: IndexWith) -> None:
+    yes, no = typed_chunk(0, flag=True), typed_chunk(1, flag=False)
+    index = typed_index_with(yes, no)
+
+    assert ids(index.find(where=Typed.flag.in_([True]))) == {yes.id}
+    assert ids(index.find(where=Typed.flag.in_([True, False]))) == ids([yes, no])
+
+
 def test_any_of_matches_strings(typed_index_with: IndexWith) -> None:
     tagged = typed_chunk(0, labels=["scope", "hr"])
     index = typed_index_with(tagged, typed_chunk(1, labels=["finance"]))
@@ -441,6 +502,7 @@ def test_everything_fits_an_index_of_any_schema(typed_index_with: IndexWith) -> 
 FOREIGN_FILTERS = [
     pytest.param(Entries.version.eq(2), id="same name, another schema"),
     pytest.param(Other.owner_id.eq(DOCUMENT), id="name not in the schema"),
+    pytest.param(Entries.version.in_([2]), id="in_, another schema"),
     pytest.param(not_(Entries.version.eq(2)), id="under not_"),
     pytest.param(
         or_(Chunks.version.eq(1), Entries.version.eq(2)),

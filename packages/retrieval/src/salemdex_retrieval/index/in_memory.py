@@ -11,7 +11,16 @@ from collections.abc import Callable, Iterable
 from typing import Final, assert_never
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
-from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
+from salemdex_retrieval.filters import (
+    And,
+    AnyOf,
+    Equals,
+    Everything,
+    Filter,
+    In,
+    Not,
+    Or,
+)
 from salemdex_retrieval.index.protocol import (
     check_batch,
     check_filter,
@@ -95,6 +104,8 @@ class InMemoryIndex:
         match where:
             case Equals(field=field, value=value):
                 return lambda chunk: chunk.field_values[field] == value
+            case In(field=field, values=values):
+                return lambda chunk: chunk.field_values[field] in values
             case AnyOf(field=field, values=values):
                 return lambda chunk: not values.isdisjoint(chunk.field_values[field])
             case And(filters=filters):

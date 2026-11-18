@@ -21,6 +21,10 @@ type OpenIndex = Callable[[type[Schema]], Index]
 
 QDRANT_URL = os.environ.get("KB_TEST_QDRANT_URL")
 
+# A server on a slow disk can take over 5 seconds, the client's default, to create a
+# payload index; a timeout then fails whichever test happened to be waiting.
+QDRANT_TIMEOUT_SECONDS = 30
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Silence the local client's warning that payload indexes do nothing there.
@@ -57,7 +61,8 @@ def new_index(request: pytest.FixtureRequest) -> Iterator[OpenIndex]:
             with _opening_qdrant_indexes(QdrantClient(":memory:")) as open_index:
                 yield open_index
         case "qdrant-server":
-            with _opening_qdrant_indexes(QdrantClient(url=QDRANT_URL)) as open_index:
+            server = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
+            with _opening_qdrant_indexes(server) as open_index:
                 yield open_index
         case other:
             raise ValueError(f"unknown backend {other!r}")

@@ -10,6 +10,7 @@ from salemdex_retrieval.filters import (
     AnyOf,
     Equals,
     Everything,
+    In,
     Not,
     Or,
     and_,
@@ -26,6 +27,10 @@ class Chunks(Schema):
     position = One(int)
     groups = Many(uuid.UUID, indexed=True)
     headings = Many(str)
+
+
+class Titles(Schema):
+    title = One(str)
 
 
 DOCUMENT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -109,6 +114,54 @@ def test_any_of_rejects_a_string_bytes_or_mapping_naming_its_type(
         Chunks.headings.any_of(wrong)
 
 
+def test_in_describes_the_field_and_the_values() -> None:
+    where = Chunks.version.in_([1, 2])
+
+    assert where == In(field=Chunks.version, values=frozenset({1, 2}))
+    assert where.field.name == "version"
+
+
+def test_in_ignores_the_order_and_repeats_of_its_values() -> None:
+    assert Chunks.version.in_([1, 2]) == Chunks.version.in_([2, 1, 1])
+
+
+def test_in_keeps_its_own_copy_of_the_values() -> None:
+    versions = [1]
+    where = Chunks.version.in_(versions)
+
+    versions.append(2)
+
+    assert where == In(field=Chunks.version, values=frozenset({1}))
+
+
+def test_in_accepts_any_iterable_such_as_a_generator() -> None:
+    where = Chunks.version.in_(version for version in [1, 2])
+
+    assert where == In(field=Chunks.version, values=frozenset({1, 2}))
+
+
+def test_in_names_the_position_of_a_value_not_of_the_field_type() -> None:
+    with pytest.raises(TypeError, match=re.escape("version[1] is 'str', expected int")):
+        Chunks.version.in_([1, "2"])  # type: ignore[list-item]
+
+
+def test_in_with_no_values_keeps_no_values() -> None:
+    assert Chunks.version.in_([]) == In(field=Chunks.version, values=frozenset())
+
+
+@pytest.mark.parametrize(
+    ("wrong", "type_name"),
+    [("intro", "str"), (b"ab", "bytes"), ({"a": 1}, "dict")],
+    ids=["str", "bytes", "dict"],
+)
+def test_in_rejects_a_string_bytes_or_mapping_naming_its_type(
+    wrong: Any, type_name: str
+) -> None:
+    message = f"in_(...) needs a collection of values, not {type_name!r}"
+    with pytest.raises(TypeError, match=re.escape(message)):
+        Titles.title.in_(wrong)
+
+
 def test_and_holds_its_filters_in_order() -> None:
     first, second = Chunks.document_id.eq(DOCUMENT_ID), Chunks.version.eq(2)
 
@@ -161,6 +214,7 @@ def test_everything_equals_another_everything() -> None:
     "where",
     [
         pytest.param(Chunks.version.eq(2), id="eq"),
+        pytest.param(Chunks.version.in_([2]), id="in_"),
         pytest.param(Chunks.groups.any_of([HR]), id="any_of"),
         pytest.param(and_(Chunks.version.eq(2)), id="and_"),
         pytest.param(or_(Chunks.version.eq(2)), id="or_"),

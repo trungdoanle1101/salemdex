@@ -1,26 +1,37 @@
 """How a filter becomes a Qdrant filter over the stored payload.
 
 Each node becomes a Qdrant `Filter`: `And` its `must`, `Or` its `should`, `Not` its
-`must_not`, and `Everything` one with no conditions, which matches every chunk. A
-condition on a `Many` matches when any of its values does, which is what
-`AnyOf` means. Two cases don't map one to one:
+`must_not`, and `Everything` one with no conditions, which matches every chunk. `In`
+and `AnyOf` both become a `should` of one condition per value: a condition on a `Many`
+matches when any of its values does, which is what `AnyOf` means. Two cases don't map
+one to one:
 
 - Floats and datetimes are matched by a range from the value to itself: Qdrant can't
   match a float exactly, and a datetime stored as a string would miss the same instant
   written with another offset.
-- `AnyOf` with no values matches nothing. It can't become an empty `should`: Qdrant
-  reads a filter with no conditions as no constraint and matches every chunk.
+- `In` and `AnyOf` with no values match nothing. They can't become an empty `should`:
+  Qdrant reads a filter with no conditions as no constraint and matches every chunk.
 
 The fields aren't checked against a schema here; the index does that first.
 """
 
 import uuid
+from collections.abc import Set as AbstractSet
 from datetime import datetime
 from typing import assert_never
 
 from qdrant_client import models
 
-from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
+from salemdex_retrieval.filters import (
+    And,
+    AnyOf,
+    Equals,
+    Everything,
+    Filter,
+    In,
+    Not,
+    Or,
+)
 from salemdex_retrieval.index.qdrant.payload import field_key
 from salemdex_retrieval.schema import Field
 
@@ -40,8 +51,8 @@ def build_qdrant_filter(where: Filter) -> models.Filter:
     match where:
         case Equals(field=field, value=value):
             return models.Filter(must=[_build_equals_condition(field, value)])
-        case AnyOf():
-            return _build_any_of(where)
+        case In(field=field, values=values) | AnyOf(field=field, values=values):
+            return _build_any_value(field, values)
         case And(filters=filters):
             return models.Filter(must=[build_qdrant_filter(f) for f in filters])
         case Or(filters=filters):
@@ -54,11 +65,11 @@ def build_qdrant_filter(where: Filter) -> models.Filter:
             assert_never(where)
 
 
-def _build_any_of[T](where: AnyOf[T]) -> models.Filter:
+def _build_any_value[T](field: Field[T], values: AbstractSet[T]) -> models.Filter:
     """Return a filter matching chunks with any of the values, or nothing if none."""
-    if not where.values:
+    if not values:
         return _MATCHES_NOTHING
-    conditions = [_build_equals_condition(where.field, v) for v in where.values]
+    conditions = [_build_equals_condition(field, v) for v in values]
     return models.Filter(should=conditions)
 
 

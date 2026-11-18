@@ -17,7 +17,7 @@ from typing import Any, ClassVar, Final
 
 from salemdex_retrieval.declarations import Declaration
 from salemdex_retrieval.errors import SchemaError, SchemaMismatchError
-from salemdex_retrieval.filters import AnyOf, Equals
+from salemdex_retrieval.filters import AnyOf, Equals, In
 from salemdex_retrieval.vectors import Vector
 
 _VALUE_TYPES = (str, int, float, bool, uuid.UUID, datetime)
@@ -77,7 +77,7 @@ class Field[T](Declaration):
 
         Args:
             value: The value to check.
-            position: The value's position within a `Many`, named in errors.
+            position: The value's position within the given values, named in errors.
 
         Returns:
             The value, as a `float` when an `int` was given for a `float` field.
@@ -115,8 +115,20 @@ class Field[T](Declaration):
         return value
 
     def _label(self, position: int | None) -> str:
-        """Return the field's name for messages, with `[position]` within a `Many`."""
+        """Return the field's name for messages, with `[position]` within the given values."""
         return self.name + (f"[{position}]" if position is not None else "")
+
+    def _check_iterable(self, values: Iterable[T], *, owner: str) -> None:
+        """Refuse an iterable that would be taken apart into characters, ints or keys.
+
+        Raises:
+            TypeError: `values` is a `str`, `bytes` or mapping.
+        """
+        if isinstance(values, (str, bytes, Mapping)):
+            message = (
+                f"{owner} needs a collection of values, not {type(values).__name__!r}"
+            )
+            raise TypeError(message)
 
 
 class One[T](Field[T]):
@@ -151,6 +163,29 @@ class One[T](Field[T]):
             ValueError: The value can't be stored (see `Field`).
         """
         return Equals(field=self, value=self._check(value))
+
+    def in_(self, values: Iterable[T]) -> In[T]:
+        """Return a filter matching chunks whose value for this field is in `values`.
+
+        Args:
+            values: The values to match, in any iterable but a `str`, `bytes` or
+                mapping. Order and repeats don't matter; no values matches no chunk.
+
+        Returns:
+            An `In` filter.
+
+        Raises:
+            TypeError: `values` is a `str`, `bytes` or mapping, or a value is of the
+                wrong type (see `Field`).
+            ValueError: A value can't be stored (see `Field`).
+        """
+        self._check_iterable(values, owner="in_(...)")
+        return In(
+            field=self,
+            values=frozenset(
+                self._check(value, position=i) for i, value in enumerate(values)
+            ),
+        )
 
 
 class Many[T](Field[T]):
@@ -207,18 +242,6 @@ class Many[T](Field[T]):
                 self._check(value, position=i) for i, value in enumerate(values)
             ),
         )
-
-    def _check_iterable(self, values: Iterable[T], *, owner: str) -> None:
-        """Refuse an iterable that would be taken apart into characters, ints or keys.
-
-        Raises:
-            TypeError: `values` is a `str`, `bytes` or mapping.
-        """
-        if isinstance(values, (str, bytes, Mapping)):
-            message = (
-                f"{owner} needs a collection of values, not {type(values).__name__!r}"
-            )
-            raise TypeError(message)
 
 
 @dataclass(frozen=True, kw_only=True)

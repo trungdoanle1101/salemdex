@@ -1,6 +1,6 @@
 """Filters choosing which chunks a search or a write applies to.
 
-Build them from a schema's fields (`One.eq`, `Many.any_of`), which check the values,
+Build them from a schema's fields (`One.eq`, `One.in_`, `Many.any_of`), which check the values,
 combine them with `and_`, `or_` and `not_`, or match every chunk with `Everything()`.
 """
 
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from salemdex_retrieval.schema import Many, One
 
 # Any filter, whatever its field's type: what searches, writes and backends accept.
-type Filter = Equals[Any] | AnyOf[Any] | And | Or | Not | Everything
+type Filter = Equals[Any] | In[Any] | AnyOf[Any] | And | Or | Not | Everything
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -29,6 +29,21 @@ class Equals[T]:
 
     field: One[T]
     value: T
+
+
+@dataclass(frozen=True, kw_only=True)
+class In[T]:
+    """A filter matching chunks whose value for a `One` field is one of `values`.
+
+    Build it with `One.in_`, which checks each value against the field.
+
+    Attributes:
+        field: The field to compare.
+        values: The values to match; none matches no chunk.
+    """
+
+    field: One[T]
+    values: frozenset[T]
 
 
 @dataclass(frozen=True, kw_only=True)

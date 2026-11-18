@@ -10,7 +10,16 @@ from typing import Protocol, assert_never
 
 from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
-from salemdex_retrieval.filters import And, AnyOf, Equals, Everything, Filter, Not, Or
+from salemdex_retrieval.filters import (
+    And,
+    AnyOf,
+    Equals,
+    Everything,
+    Filter,
+    In,
+    Not,
+    Or,
+)
 from salemdex_retrieval.schema import Schema
 from salemdex_retrieval.vectors import VectorQuery
 
@@ -171,7 +180,7 @@ def check_filter(where: Filter, *, schema: type[Schema]) -> None:
             schema's field with the same name. The message names the first one found.
     """
     match where:
-        case Equals(field=field) | AnyOf(field=field):
+        case Equals(field=field) | AnyOf(field=field) | In(field=field):
             schema.check_declares(field)
         case And(filters=filters) | Or(filters=filters):
             for f in filters:

@@ -19,7 +19,7 @@ from salemdex_retrieval.index.qdrant.payload import encode_payload
 from salemdex_retrieval.schema import Many, One, Schema
 from salemdex_retrieval.vectors import Dense
 
-from .conftest import QDRANT_URL
+from .conftest import QDRANT_TIMEOUT_SECONDS, QDRANT_URL
 
 
 class Docs(Schema):
@@ -51,7 +51,7 @@ def client(request: pytest.FixtureRequest) -> Iterator[QdrantClient]:
     opened = (
         QdrantClient(":memory:")
         if request.param == "local"
-        else QdrantClient(url=QDRANT_URL)
+        else QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
     )
     yield opened
     opened.close()
@@ -62,7 +62,7 @@ def server_client() -> Iterator[QdrantClient]:
     """Return a client of the Qdrant server; the test is skipped without one."""
     if QDRANT_URL is None:
         pytest.skip("KB_TEST_QDRANT_URL is not set")
-    opened = QdrantClient(url=QDRANT_URL)
+    opened = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
     yield opened
     opened.close()
 
