@@ -29,7 +29,7 @@ def test_ready_when_the_database_answers(client: TestClient) -> None:
 
 def test_not_ready_when_the_database_is_down(services: Services) -> None:
     down = create_engine(DOWN_DATABASE_URL)
-    with TestClient(create_app(replace(services, engine=down))) as client:
+    with TestClient(create_app(replace(services, sql_engine=down))) as client:
         response = client.get("/ready")
 
     assert response.status_code == 503
@@ -59,7 +59,7 @@ def test_the_database_is_reported_before_the_store(services: Services) -> None:
     denied = PermissionError(13, "Permission denied", "/srv/kb/write_checks")
     both_down = replace(
         services,
-        engine=create_engine(DOWN_DATABASE_URL),
+        sql_engine=create_engine(DOWN_DATABASE_URL),
         files=RefusingStore(services.files, on_put=denied),
     )
 

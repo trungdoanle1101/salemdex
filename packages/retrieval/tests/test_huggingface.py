@@ -59,6 +59,19 @@ def test_a_batch_size_that_is_not_a_positive_int_is_refused(
         adapter(tmp_path / "missing", device="cpu", batch_size=batch_size)
 
 
+@pytest.mark.parametrize("max_length", [0, -1, True, 2.0])
+def test_a_reranker_max_length_that_is_not_a_positive_int_is_refused(
+    max_length: object, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="max_length must be a positive integer"):
+        HuggingFaceReranker(
+            tmp_path / "missing",
+            max_length=max_length,  # type: ignore[arg-type]
+            device="cpu",
+            batch_size=8,
+        )
+
+
 @pytest.mark.parametrize("adapter", ADAPTERS)
 @pytest.mark.parametrize("device", ["cuda", "mps"])
 def test_a_gpu_pytorch_cannot_find_is_refused_naming_it(

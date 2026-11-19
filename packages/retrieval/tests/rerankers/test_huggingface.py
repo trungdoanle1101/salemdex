@@ -36,6 +36,9 @@ PASSAGES = [
 
 # A tiny model
 
+# How many tokens the tiny model can read
+TINY_MODEL_LIMIT = 64
+
 
 @pytest.fixture(scope="module")
 def tiny_reranker(tmp_path_factory: pytest.TempPathFactory) -> HuggingFaceReranker:
@@ -80,6 +83,42 @@ def test_its_scores_pass_the_checks_where_they_enter(
     scores = score_texts(QUESTION, PASSAGES, reranker=tiny_reranker)
 
     assert len(scores) == len(PASSAGES)
+
+
+def test_words_past_max_length_are_never_read_and_without_it_the_model_reads_them(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "tiny"
+    _build_cross_encoder(folder, labels=1)
+    short = HuggingFaceReranker(folder, device="cpu", batch_size=2, max_length=8)
+    full = HuggingFaceReranker(folder, device="cpu", batch_size=2)
+    # With the question, the pair passes 8 tokens before the texts differ
+    start = "annual leave days annual leave days"
+    texts = [f"{start} annual", f"{start} interest"]
+
+    cut = short.score("leave", texts)
+    read = full.score("leave", texts)
+
+    # Exact comparisons: cut to the same tokens, the scores are the same number; the
+    # one at the model's own limit tells them apart, so the model sees the difference
+    assert cut[0] == cut[1]
+    assert read[0] != read[1]
+
+
+def test_a_max_length_above_the_model_limit_is_refused_when_it_loads(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "tiny"
+    _build_cross_encoder(folder, labels=1)
+
+    message = (
+        f"max_length {TINY_MODEL_LIMIT + 1} is above the {TINY_MODEL_LIMIT} tokens "
+        f"model {str(folder)!r} can read"
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        HuggingFaceReranker(
+            folder, max_length=TINY_MODEL_LIMIT + 1, device="cpu", batch_size=2
+        )
 
 
 def test_a_model_with_more_than_one_label_is_refused_when_it_loads(
@@ -135,7 +174,7 @@ def _build_cross_encoder(folder: Path, *, labels: int) -> None:
         pad_token="[PAD]",
         cls_token="[CLS]",
         sep_token="[SEP]",
-        model_max_length=64,
+        model_max_length=TINY_MODEL_LIMIT,
     ).save_pretrained(folder)
     config = BertConfig(
         vocab_size=len(words),
@@ -143,7 +182,7 @@ def _build_cross_encoder(folder: Path, *, labels: int) -> None:
         num_hidden_layers=1,
         num_attention_heads=1,
         intermediate_size=16,
-        max_position_embeddings=64,
+        max_position_embeddings=TINY_MODEL_LIMIT,
     )
     config.num_labels = labels
     model = BertForSequenceClassification(config)  # type: ignore[no-untyped-call]

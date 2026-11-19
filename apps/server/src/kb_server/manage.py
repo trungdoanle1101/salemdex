@@ -103,7 +103,7 @@ def create_admin(
     except EmailTaken:
         sys.exit(f"A user with email {email} already exists.")
     except OperationalError:
-        url = services.engine.url.render_as_string(hide_password=True)
+        url = services.sql_engine.url.render_as_string(hide_password=True)
         sys.exit(f"Can't reach the database at {url}. Is it running?")
     print(f"Created admin {user.email}.")
 
@@ -128,7 +128,7 @@ def run_worker(services: Services) -> None:
     except WorkerSetupError as error:
         sys.exit(f"The worker can't start: {error}")
     except OperationalError:
-        url = services.engine.url.render_as_string(hide_password=True)
+        url = services.sql_engine.url.render_as_string(hide_password=True)
         sys.exit(f"Can't reach the database at {url}. Is it running?")
     finally:
         close_services(services)

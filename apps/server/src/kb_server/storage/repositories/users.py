@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from kb_server.domain.errors import EmailTaken
 from kb_server.domain.users import User, UserRole, normalize_email
-from kb_server.storage.models import UserRow
+from kb_server.storage.models import CollectionManagerRow, UserGroupRow, UserRow
 
 
 class UserRepository:
@@ -65,6 +65,20 @@ class UserRepository:
             ).first()
             is not None
         )
+
+    def list_group_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
+        group_ids = self._session.scalars(
+            select(UserGroupRow.group_id).where(UserGroupRow.user_id == user_id)
+        ).all()
+        return set(group_ids)
+
+    def list_managed_collection_ids(self, user_id: uuid.UUID) -> set[uuid.UUID]:
+        collection_ids = self._session.scalars(
+            select(CollectionManagerRow.collection_id).where(
+                CollectionManagerRow.user_id == user_id
+            )
+        ).all()
+        return set(collection_ids)
 
     def update(
         self,

@@ -2,7 +2,8 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 from argon2 import PasswordHasher
 from sqlalchemy import Engine, create_engine
@@ -17,11 +18,14 @@ from kb_server.indexing.handlers import (
     ProfileChooser,
 )
 from kb_server.indexing.worker import Worker
+from kb_server.search.statements import BuildStatement, DenseThenRerank
+from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
 from kb_server.services.documents import DocumentService
 from kb_server.services.groups import GroupService
 from kb_server.services.passwords import Passwords
+from kb_server.services.search import SearchService
 from kb_server.services.users import UserService
 from kb_server.settings import Settings
 from kb_server.storage.files import FileStore, LocalFileStore
@@ -32,13 +36,19 @@ from kb_server.storage.repositories.files import StoredFileRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
+from salemdex_retrieval import Engine as SalemdexEngine
+from salemdex_retrieval import Source
 from salemdex_retrieval.embedders import DenseBinding, DenseEmbedder
 from salemdex_retrieval.errors import ModelLoadError, SchemaMismatchError
 from salemdex_retrieval.index import Index
+from salemdex_retrieval.rerankers import Reranker
 
 if TYPE_CHECKING:
     # for annotations only: importing these for real is left to the worker
     from qdrant_client import QdrantClient
+
+    from document_processor.core.registry import Registry
+    from document_processor.integrations.huggingface.reference import ModelReference
 
 
 def utc_now() -> datetime:
@@ -48,7 +58,8 @@ def utc_now() -> datetime:
 @dataclass(frozen=True, kw_only=True)
 class Services:
     settings: Settings
-    engine: Engine
+    sql_engine: Engine
+    retrieval_engine: SalemdexEngine
     files: FileStore
     session_factory: sessionmaker[Session]
     passwords: Passwords
@@ -57,11 +68,13 @@ class Services:
 
 def build_services(settings: Settings) -> Services:
     engine = create_engine(url=settings.database_url, pool_pre_ping=True)
+    session_factory = sessionmaker(engine)
     return Services(
         settings=settings,
-        engine=engine,
+        sql_engine=engine,
+        retrieval_engine=SalemdexEngine(validity=ServedVersionsOnly(session_factory)),
         files=build_file_store(settings),
-        session_factory=sessionmaker(engine),
+        session_factory=session_factory,
         passwords=Passwords(hasher=PasswordHasher()),
     )
 
@@ -79,7 +92,7 @@ def build_worker(services: Services, *, job_tools: JobTools) -> Worker:
 
 
 def close_services(services: Services) -> None:
-    services.engine.dispose()
+    services.sql_engine.dispose()
 
 
 def build_user_service(session: Session, services: Services) -> UserService:
@@ -133,6 +146,16 @@ def build_file_store(settings: Settings) -> FileStore:
             return LocalFileStore(settings.storage_path)
         case "s3":
             raise NotImplementedError("s3 storage not yet implemented")
+
+
+def build_search_service(
+    session: Session, services: Services, *, build_statement: BuildStatement
+) -> SearchService:
+    return SearchService(
+        users=UserRepository(session),
+        retrieval_engine=services.retrieval_engine,
+        build_statement=build_statement,
+    )
 
 
 class WorkerSetupError(Exception):
@@ -192,6 +215,32 @@ def open_job_tools(services: Services) -> Generator[JobTools, None, None]:
         qdrant_client.close()
 
 
+@contextmanager
+def open_search_tools(services: Services) -> Generator[DenseThenRerank, None, None]:
+    from qdrant_client import QdrantClient
+
+    settings = services.settings
+    embedder, _ = _build_embedder(settings)
+    api_key = settings.qdrant_api_key
+    qdrant_client = QdrantClient(
+        url=settings.qdrant_url,
+        api_key=api_key.get_secret_value() if api_key is not None else None,
+    )
+    try:
+        index = _open_index(settings, client=qdrant_client)
+        yield DenseThenRerank(
+            source=Source(
+                name=KbChunks.dense.name,
+                index=index,
+                binding=DenseBinding(vector=KbChunks.dense, embedder=embedder),
+                depth=settings.rerank_depth,
+            ),
+            reranker=_build_reranker(settings),
+        )
+    finally:
+        qdrant_client.close()
+
+
 def _build_embedder(settings: Settings) -> tuple[DenseEmbedder, str]:
     """Return the embedder loaded from `KB_MODELS_FOLDER`, and its identity.
 
@@ -202,48 +251,95 @@ def _build_embedder(settings: Settings) -> tuple[DenseEmbedder, str]:
         WorkerSetupError: The folder isn't set, the spec is unknown, the model isn't
             in the folder, or it can't be loaded.
     """
-    from document_processor.integrations.huggingface.download import (
-        model_folder,
-    )
     from document_processor.integrations.huggingface.model_specs import (
         HUGGINGFACE_MODEL_SPECS,
     )
     from salemdex_retrieval.embedders.huggingface import HuggingFaceDenseEmbedder
 
-    if settings.models_folder is None:
-        raise WorkerSetupError(
-            "KB_MODELS_FOLDER is not set: "
-            "the worker needs the folder holding all models"
-        )
-    try:
-        spec = HUGGINGFACE_MODEL_SPECS.get(settings.embedder_spec)
-    except KeyError as error:
-        raise WorkerSetupError(
-            f"can't find the embedder spec: {error.args[0]}"
-        ) from error
-    resolved_folder = model_folder(spec.reference, models_folder=settings.models_folder)
-    # Checked here: given a path that isn't a folder, sentence-transformers would take
-    # it for a hub id and fail confusingly, or try to download it
-    if not resolved_folder.is_dir():
-        raise WorkerSetupError(
-            f"{settings.embedder_spec!r} isn't in KB_MODELS_FOLDER: "
-            f"{resolved_folder} is not a folder"
-        )
+    spec, folder = _find_model(
+        settings.embedder_spec,
+        specs=HUGGINGFACE_MODEL_SPECS,
+        models_folder=settings.models_folder,
+    )
     ref = spec.reference
     identity = f"huggingface:{ref.hub_model_id}@{ref.commit_hash}"
     try:
-        return (
-            HuggingFaceDenseEmbedder(
-                model=resolved_folder,
-                device=settings.embedder_device,
-                batch_size=settings.embedder_batch_size,
-            ),
-            identity,
+        embedder = HuggingFaceDenseEmbedder(
+            model=folder,
+            device=settings.embedder_device,
+            batch_size=settings.embedder_batch_size,
         )
     except (ModelLoadError, ValueError) as error:
         raise WorkerSetupError(
-            f"can't load {settings.embedder_spec} from {resolved_folder}: {error}"
+            f"can't load {settings.embedder_spec} from {folder}: {error}"
         ) from error
+    return embedder, identity
+
+
+def _build_reranker(settings: Settings) -> Reranker:
+    """Return the reranker loaded from `KB_MODELS_FOLDER`.
+
+    Raises:
+        WorkerSetupError: The folder isn't set, the spec is unknown, the model isn't
+            in the folder, or it can't be loaded.
+    """
+    from document_processor.integrations.huggingface.model_specs import (
+        HUGGINGFACE_RERANKER_SPECS,
+    )
+    from salemdex_retrieval.rerankers.huggingface import HuggingFaceReranker
+
+    spec, folder = _find_model(
+        settings.reranker_spec,
+        specs=HUGGINGFACE_RERANKER_SPECS,
+        models_folder=settings.models_folder,
+    )
+    try:
+        return HuggingFaceReranker(
+            model=folder,
+            max_length=spec.max_length,
+            device=settings.reranker_device,
+            batch_size=settings.reranker_batch_size,
+        )
+    except (ModelLoadError, ValueError) as error:
+        raise WorkerSetupError(
+            f"can't load {settings.reranker_spec} from {folder}: {error}"
+        ) from error
+
+
+class _ModelSpec(Protocol):
+    """A spec naming a model by its hub id and commit."""
+
+    @property
+    def reference(self) -> "ModelReference": ...
+
+
+def _find_model[S: _ModelSpec](
+    spec_name: str, *, specs: "Registry[S]", models_folder: Path | None
+) -> tuple[S, Path]:
+    """Return the spec named `spec_name`, and its model's folder in `models_folder`.
+
+    Raises:
+        WorkerSetupError: `models_folder` isn't set, the spec is unknown, or the model
+            isn't in the folder.
+    """
+    from document_processor.integrations.huggingface.download import model_folder
+
+    if models_folder is None:
+        raise WorkerSetupError(
+            "KB_MODELS_FOLDER is not set: it names the folder holding all models"
+        )
+    try:
+        spec = specs.get(spec_name)
+    except KeyError as error:
+        raise WorkerSetupError(f"can't find the model: {error.args[0]}") from error
+    folder = model_folder(spec.reference, models_folder=models_folder)
+    # Checked here: given a path that isn't a folder, sentence-transformers would take
+    # it for a hub id and fail confusingly, or try to download it
+    if not folder.is_dir():
+        raise WorkerSetupError(
+            f"{spec_name!r} isn't in KB_MODELS_FOLDER: {folder} is not a folder"
+        )
+    return spec, folder
 
 
 def _build_profile_chooser(settings: Settings) -> ProfileChooser:

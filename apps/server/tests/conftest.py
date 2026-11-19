@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from kb_server.app import create_app
 from kb_server.domain.users import User, UserRole
+from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
 from kb_server.services.documents import DocumentService
@@ -35,6 +36,7 @@ from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
 from kb_server.wiring import Services
+from salemdex_retrieval import Engine as SalemdexEngine
 from tests.support import MAX_UPLOAD_MB, PASSWORD, FakeClock
 
 SERVER_DIR = Path(__file__).parents[1]
@@ -239,7 +241,8 @@ def services(
             storage_path=file_store_root,
             max_upload_mb=MAX_UPLOAD_MB,
         ),
-        engine=engine,
+        sql_engine=engine,
+        retrieval_engine=SalemdexEngine(validity=ServedVersionsOnly(session_factory)),
         files=file_store,
         session_factory=session_factory,
         passwords=passwords,

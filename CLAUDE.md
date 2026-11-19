@@ -50,8 +50,11 @@ the worker gets torch, the model and the Qdrant client.
 
 ## Roles
 
-- I write the code. Claude designs, explains, reviews and writes tests when asked.
-  Claude may apply review fixes, docstrings and comments to my code when I ask;
+- I write the code. Claude designs, explains and reviews.
+- Tests are Claude's: writing new ones, fixing broken ones, and keeping fixtures and
+  test helpers (`conftest.py`, `support.py`) in step with my changes, without waiting
+  to be asked.
+- Claude may apply review fixes, docstrings and comments to my code when I ask;
   new code stays mine to sketch.
 - Show only the files that change. Answer briefly when I ask for brevity.
 - Never commit or push to this repository. Review from a separate checkout.

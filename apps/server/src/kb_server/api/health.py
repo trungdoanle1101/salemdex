@@ -23,7 +23,7 @@ def health() -> dict[str, str]:
 @router.get("/ready")
 def ready(services: ServicesDep) -> JSONResponse:
     try:
-        with services.engine.connect() as connection:
+        with services.sql_engine.connect() as connection:
             connection.execute(text("SELECT 1"))
     except OperationalError as error:
         logger.warning("not ready: %s", error)

@@ -1,12 +1,12 @@
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The same values as the framework's huggingface Device. Defined here because importing
 # that one loads torch, and every process reads Settings, not only the worker.
-type EmbedderDevice = Literal["auto", "cuda", "mps", "cpu"]
+type Device = Literal["auto", "cuda", "mps", "cpu"]
 type LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 
 type Positive = Annotated[int, Field(gt=0)]
@@ -20,7 +20,11 @@ class Settings(BaseSettings):
     the ones it needs when it builds its tools.
     """
 
-    model_config = SettingsConfigDict(env_prefix="KB_", env_file=".env", extra="ignore")
+    # hide_input_in_errors: a whole-model error would print every input, and
+    # KB_DATABASE_URL holds the password
+    model_config = SettingsConfigDict(
+        env_prefix="KB_", env_file=".env", extra="ignore", hide_input_in_errors=True
+    )
 
     # every process
     database_url: str  # holds the password: .env only, never committed
@@ -47,9 +51,16 @@ class Settings(BaseSettings):
 
     # worker, embedder: a name from the framework's HUGGINGFACE_MODEL_SPECS
     embedder_spec: str = "bge-m3"
-    embedder_device: EmbedderDevice = "auto"
+    embedder_device: Device = "auto"
     # memory and speed only; the vectors don't change
     embedder_batch_size: Positive = 32
+
+    reranker_spec: str = "bge-reranker-v2-m3"
+    reranker_device: Device = "auto"
+    reranker_batch_size: Positive = 32
+    rerank_depth: Positive = 10
+
+    search_max_limit: Positive = 5
 
     # worker, index
     qdrant_url: str = "http://localhost:6333"
@@ -60,3 +71,20 @@ class Settings(BaseSettings):
     worker_poll_seconds: Annotated[float, Field(gt=0)] = 2.0
     job_max_attempts: Annotated[int, Field(ge=1)] = 3
     job_timeout_minutes: Positive = 60  # longer than the longest real job
+
+    @model_validator(mode="after")
+    def _check_rerank_depth_covers_search_max_limit(self) -> Self:
+        """Refuse a search limit the reranker can't fill.
+
+        Raises:
+            ValueError: `search_max_limit` is above `rerank_depth`.
+        """
+        # Checked at load, not per request: a search would otherwise return fewer
+        # passages than asked for, and the caller couldn't tell why
+        if self.search_max_limit > self.rerank_depth:
+            raise ValueError(
+                f"KB_SEARCH_MAX_LIMIT ({self.search_max_limit}) is above "
+                f"KB_RERANK_DEPTH ({self.rerank_depth}): search can't return more "
+                "passages than it reranks. Lower the limit or raise the depth."
+            )
+        return self

@@ -176,7 +176,7 @@ class DocumentService:
 
     def _can_read(self, principal: Principal, document: Document) -> bool:
         role = principal.user.role
-        if role == "admin":
+        if principal.is_admin:
             return True
 
         if (
