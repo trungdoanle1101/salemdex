@@ -1,5 +1,6 @@
 import uuid
 from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, and_, delete, insert, select, update
@@ -163,6 +164,51 @@ class DocumentRepository:
 
         return cast(CursorResult[Any], result).rowcount == 1
 
+    def set_indexed_version(self, document_id: uuid.UUID, version: int) -> bool:
+        """Record `version` as the document's version that search shows.
+
+        Args:
+            document_id: The document.
+            version: The version now fully in the index.
+
+        Returns:
+            False if there is no such document, e.g. it was deleted meanwhile.
+        """
+        result = self._session.execute(
+            update(DocumentRow)
+            .where(DocumentRow.id == document_id)
+            .values(indexed_version=version)
+        )
+        return cast(CursorResult[Any], result).rowcount == 1
+
+    def served_versions(
+        self, document_ids: AbstractSet[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """Return the indexed version of each of these documents that search may show.
+
+        One query, whatever the number of ids: search's validity check calls it at
+        every gate.
+
+        Args:
+            document_ids: The documents of the chunks being checked.
+
+        Returns:
+            `indexed_version` by document id, for active documents that have one.
+            Drafts, documents being deleted, documents never indexed and unknown ids
+            are left out: a missing id means none of that document is shown.
+        """
+        if not document_ids:
+            return {}
+
+        rows = self._session.execute(
+            select(DocumentRow.id, DocumentRow.indexed_version).where(
+                DocumentRow.status == "active",
+                DocumentRow.indexed_version.is_not(None),
+                DocumentRow.id.in_(document_ids),
+            )
+        )
+        return {row.id: row.indexed_version for row in rows}
+
 
 def to_document(row: DocumentRow) -> Document:
     return Document(
@@ -171,6 +217,7 @@ def to_document(row: DocumentRow) -> Document:
         title=row.title,
         status=row.status,
         current_version=row.current_version,
+        indexed_version=row.indexed_version,
         created_by=row.created_by,
         created_at=row.created_at,
         updated_at=row.updated_at,

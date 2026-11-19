@@ -141,7 +141,7 @@ collection_groups     collection_id, group_id (restrict)             default rea
 collection_managers   collection_id, user_id
 stored_files          id, sha256 (unique), size, media_type, storage_key, created_at
 documents             id, collection_id (restrict), title, status (draft|active|deleting), current_version,
-                      created_by, created_at, updated_at
+                      indexed_version (nullable), created_by, created_at, updated_at
 document_versions     document_id, version, file_id (restrict), original_filename, provenance (json, nullable),
                       uploaded_by, created_at                        pk (document_id, version)
 document_groups       document_id, group_id (restrict)               who may read it
@@ -189,9 +189,8 @@ one, and the override is a decision with its own author and time.
 ## 5. Index (Qdrant): the chunk schema
 
 ```text
-built in run_index_job (framework)   access_group_ids   collection_id   document_version
-next, on salemdex_retrieval          the schema below
-later                                tags   retired_on   part
+built, on salemdex_retrieval   the schema below (domain/chunks.py)
+later                          tags   retired_on   part
 ```
 
 ```python
@@ -240,9 +239,12 @@ class KbChunks(Guarded):
   `indexed_version`), and `title` (read from the database when passages are shaped, so a
   rename doesn't touch the index). Why: a condition whose truth lives in the database would go
   stale on the chunks.
-- While a new version is being indexed, the index briefly holds two versions of a document;
-  validity shows only `indexed_version`, and the old chunks are deleted after the commit
-  (retrieval design, section 6, "Currency").
+- **`indexed_version` is the version search shows** (built). While a new version is being
+  indexed, the index holds two versions of a document; validity shows only `indexed_version`,
+  and the worker deletes the old chunks after the commit that moves it (section 8, "Index
+  job"). A document never indexed has `NULL`, and search shows none of it. Why not
+  `current_version`: it changes at upload, so a re-index would hide the document for minutes,
+  and a version that fails to index would hide it for good.
 
 ---
 
@@ -380,6 +382,8 @@ transaction 1   claim the oldest queued job (running, attempts + 1, started_at)
                 → commit
 no transaction  run the handler for its kind
 transaction 2   success → provenance, follow-up job (prepare of an active document → index), done
+                  an index job also sets indexed_version, and after the commit its document's
+                  other versions are removed from the index ("Index job" below)
                   a delete → its own steps instead ("Deleting" below)
                 PermanentJobError, or attempts ≥ KB_JOB_MAX_ATTEMPTS → failed
                 any other error → queued again, the error kept
@@ -446,17 +450,33 @@ document is `active`). The worker then, in one transaction: sets the version's p
 ### Index job
 
 ```text
-1. load_prepared; missing → PermanentJobError ("prepare it again")
-2. to KbChunks chunks: id uuid5(document_id, "<version>:<position>"), the Guarded fields
-   (access_group_ids sorted), position, headings; embedded text = headings path + text
-3. embed_chunks, then index.replace(where=document_id): replaces all of the document's
-   chunks; no chunks removes it
-4. log the chunk count; return IndexResult
+handler  1. load_prepared; missing → PermanentJobError ("prepare it again")
+         2. to KbChunks chunks: id uuid5(document_id, "<version>:<position>"), the Guarded
+            fields (access_group_ids sorted), position, headings; embedded text = headings
+            path + text
+         3. embed_chunks, then index.replace(where=document_id AND version N): this version's
+            chunks only; other versions are left for search to keep showing
+         4. log the chunk count; return IndexResult
+worker   5. one transaction: provenance["index"], indexed_version = N, job done   (the flip)
+         6. after the commit: index.delete(where=document_id AND version ≠ N)
 ```
 
-Groups are read when the job is claimed, so the newest groups are indexed. Errors from the
-index or the model pass through and are retried. The worker then writes `provenance["index"]`
-and marks the job done.
+This is the pointer-flip pattern: write the new copy, switch one pointer, remove the old copy.
+
+- **Each step's filter says which copy it owns.** The handler touches only version N, the
+  worker's cleanup only the other versions, the delete job every version. Nothing filters by
+  `indexed_version` before the flip, because that's the copy readers are looking at.
+- **Readers see all of the old version, then all of the new one:** never a mix of versions, never
+  nothing. Re-indexing the same version is the exception: its chunks are overwritten by id, so
+  for a moment old and new chunks of that version mix. Accepted: it's rare and brief.
+- **`replace`, not `put`, within the version,** so a version prepared again with fewer chunks
+  leaves none of its old ones behind; validity would show them, since their version matches.
+- **Step 6 never fails the job,** which is already recorded. Any `Exception` is logged (the
+  document, the version and the error type) and the worker moves on: the `Index` protocol names
+  no errors, and every failure has the same answer. The chunks left behind are hidden by
+  validity, and removed by the document's next index job or by `kb-server gc`.
+- Groups are read when the job is claimed, so the newest groups are indexed. Errors from the
+  index or the model pass through and are retried.
 
 ### Provenance
 
@@ -490,8 +510,8 @@ worker   3. one transaction: read every version's file id, delete the document r
 ```
 
 - Reads treat a `deleting` document as gone (a tombstone): `GET` is 404, and the duplicate-file
-  check skips it, so the same file can be uploaded again at once. Search will drop its hits too
-  (section 5).
+  check skips it, so the same file can be uploaded again at once. Search drops its hits too:
+  validity shows only `active` documents (section 5).
 - Every other job of a `deleting` document is skipped (W6); the delete job isn't.
 - The delete job has no version. Why: it applies to the whole document, so a new version can't
   supersede it and leave the tombstone behind.
@@ -588,7 +608,8 @@ kb-server serve [--reload]          uvicorn (built)
 kb-server worker                    run jobs until SIGTERM or SIGINT (built)
 kb-server migrate                   alembic upgrade head
 kb-server reprepare --stale|--all   queue prepare jobs for out-of-date versions
-kb-server gc                        remove originals no row needs
+kb-server gc                        remove originals no row needs, and chunks of versions
+                                    other than indexed_version
 ```
 
 ---
@@ -611,8 +632,9 @@ kb-server gc                        remove originals no row needs
         - `run_forever`: polling, graceful shutdown; the stuck-job sweep at startup **(built)**
      7. settings, `IndexTools`, the `kb-server[worker]` extra, `kb-server worker`, Qdrant in
         Docker Compose, logging setup **(built)**
-     8. a real end-to-end run with a real regulation and bge-m3 **(next)**
+     8. a real end-to-end run with a real regulation and bge-m3 **(built)**
      9. deleting documents **(built)**
+     10. `indexed_version` and the switch to a new version **(built)**
 5. Search: `POST /search` with the access filter. Moved ahead of the read side because it is
    the reason the system exists, and it tests the index decisions early.
 6. Read side: list with paging, versions, download, review page, `GET /jobs/{id}`.
@@ -644,6 +666,9 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | A job with no version is never superseded by a new version | It applies to the whole document, not to one version |
 | Every job but the delete job of a `deleting` document is skipped | Its work would be removed anyway; an index job would re-embed it |
 | Originals are deleted after the commit | A crash leaves an orphaned file, never a row pointing at nothing |
+| Validity shows `indexed_version`, not `current_version` | `current_version` changes at upload: a re-index would hide the document, a failed one for good |
+| The index handler touches only its own version; old versions go after the commit | Readers see all of the old version until the flip, then all of the new one |
+| The cleanup after an index job never fails the job | The job is recorded; validity hides leftovers, and the next index job removes them |
 | A delete job records nothing | Its row is deleted with the document; `mark_done` would fail |
 | `DocumentRepository.delete` needs status `deleting` | A bug can't hard-delete an active document |
 | Adding an enum value has a no-op downgrade | Narrowing it would fail or lose the rows that use the value |

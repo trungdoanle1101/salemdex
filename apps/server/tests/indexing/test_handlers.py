@@ -33,6 +33,7 @@ from kb_server.indexing.handlers import (
     IndexTools,
     PermanentJobError,
     ProfileChooser,
+    remove_other_versions,
     run_delete_job,
     run_index_job,
     run_prepare_job,
@@ -226,6 +227,7 @@ def stage(
             title="Quy định",
             status=status,
             current_version=version,
+            indexed_version=None,
             created_by=uploader,
             created_at=NOW,
             updated_at=NOW,
@@ -297,6 +299,14 @@ def indexed(index: InMemoryIndex, job: ClaimedJob) -> list[IndexChunk]:
     """The job's document's chunks in the index, in document order."""
     chunks = index.find(where=KbChunks.document_id.eq(job.document.id))
     return sorted(chunks, key=lambda chunk: chunk[KbChunks.position])
+
+
+def versions_of(index: InMemoryIndex, job: ClaimedJob) -> dict[int, list[str]]:
+    """The texts of the job's document's chunks in the index, by version."""
+    texts: dict[int, list[str]] = {}
+    for chunk in indexed(index, job):
+        texts.setdefault(chunk[KbChunks.document_version], []).append(chunk.text)
+    return texts
 
 
 class FailingPuts:
@@ -840,14 +850,16 @@ def test_a_private_document_is_indexed_without_groups(
     assert all(chunk[KbChunks.access_group_ids] == () for chunk in chunks)
 
 
-def test_indexing_a_new_version_replaces_the_old_chunks(
+def test_indexing_a_new_version_leaves_the_old_one_in_place(
     store: FileStore,
     chooser: ProfileChooser,
     tools: IndexTools,
     index: InMemoryIndex,
 ) -> None:
+    # search keeps showing v1 until the worker records v2 as indexed
     first = stage_prepared(store, text_bytes(PLAIN_TEXT), chooser=chooser)
     run_index_job(first, tools=tools, store=store)
+    before = versions_of(index, first)
     second = stage_prepared(
         store,
         text_bytes(REGULATION),
@@ -859,8 +871,95 @@ def test_indexing_a_new_version_replaces_the_old_chunks(
     run_index_job(second, tools=tools, store=store)
 
     chunks = indexed(index, second)
-    assert {chunk[KbChunks.document_version] for chunk in chunks} == {2}
-    assert "kế hoạch sao lưu" not in "".join(chunk.text for chunk in chunks)
+    assert {chunk[KbChunks.document_version] for chunk in chunks} == {1, 2}
+    assert versions_of(index, first)[1] == before[1]
+
+
+def test_indexing_a_version_again_with_fewer_chunks_leaves_none_of_the_old_ones(
+    store: FileStore,
+    chooser: ProfileChooser,
+    tools: IndexTools,
+    index: InMemoryIndex,
+) -> None:
+    # e.g. prepared again with another profile: validity would serve a leftover,
+    # since its version is still the indexed one
+    job = stage_prepared(store, text_bytes(REGULATION), chooser=chooser)
+    run_index_job(job, tools=tools, store=store)
+    logical, chunks = load(store, job)
+    assert len(chunks) > 2
+    save_prepared(
+        store,
+        job.document.id,
+        job.version.version,
+        PreparedParts(logical=logical, chunks=chunks[:2]),
+    )
+
+    run_index_job(job, tools=tools, store=store)
+
+    assert [chunk.text for chunk in indexed(index, job)] == [
+        chunk.text for chunk in chunks[:2]
+    ]
+
+
+# removing the other versions, after the worker records the new one
+
+
+def test_removing_other_versions_keeps_only_the_jobs_version(
+    store: FileStore,
+    chooser: ProfileChooser,
+    tools: IndexTools,
+    index: InMemoryIndex,
+) -> None:
+    document_id = uuid.uuid4()
+    first, second, third = (
+        stage_prepared(
+            store,
+            text_bytes(REGULATION),
+            chooser=chooser,
+            document_id=document_id,
+            version=version,
+        )
+        for version in (1, 2, 3)
+    )
+    for job in (first, second, third):
+        run_index_job(job, tools=tools, store=store)
+
+    remove_other_versions(second, index=index)
+
+    assert set(versions_of(index, second)) == {2}
+
+
+def test_removing_other_versions_leaves_other_documents_alone(
+    store: FileStore,
+    chooser: ProfileChooser,
+    tools: IndexTools,
+    index: InMemoryIndex,
+) -> None:
+    other = stage_prepared(store, text_bytes(PLAIN_TEXT), chooser=chooser)
+    run_index_job(other, tools=tools, store=store)
+    before = indexed(index, other)
+    job = stage_prepared(store, text_bytes(REGULATION), chooser=chooser, version=2)
+    run_index_job(job, tools=tools, store=store)
+
+    remove_other_versions(job, index=index)
+
+    assert indexed(index, other) == before
+
+
+def test_removing_other_versions_again_is_harmless(
+    store: FileStore,
+    chooser: ProfileChooser,
+    tools: IndexTools,
+    index: InMemoryIndex,
+) -> None:
+    job = stage_prepared(store, text_bytes(REGULATION), chooser=chooser)
+    run_index_job(job, tools=tools, store=store)
+    before = indexed(index, job)
+
+    remove_other_versions(job, index=index)
+    remove_other_versions(job, index=index)
+
+    assert indexed(index, job) == before
 
 
 def test_indexing_again_leaves_the_same_chunks(

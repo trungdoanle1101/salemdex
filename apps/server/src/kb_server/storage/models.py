@@ -180,6 +180,7 @@ class DocumentRow(Base):
         )
     )
     current_version: Mapped[int] = mapped_column(Integer)
+    indexed_version: Mapped[int | None] = mapped_column(Integer)
     created_by: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete=_RESTRICT)
     )

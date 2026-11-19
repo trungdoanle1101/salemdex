@@ -11,7 +11,7 @@ import io
 import logging
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -38,7 +38,12 @@ from kb_server.storage.repositories.files import StoredFileRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from salemdex_retrieval import Chunk as IndexChunk
-from salemdex_retrieval.index import InMemoryIndex
+from salemdex_retrieval import EmbeddedChunk, Everything
+from salemdex_retrieval.chunks import Hit
+from salemdex_retrieval.filters import Filter
+from salemdex_retrieval.index import Index, InMemoryIndex
+from salemdex_retrieval.schema import Schema
+from salemdex_retrieval.vectors import VectorQuery
 from tests.indexing.test_handlers import (
     EMBEDDER,
     INDEX_LABEL,
@@ -123,17 +128,18 @@ def make_worker(
     embedder: RecordingEmbedder,
     clock: FakeClock,
 ) -> MakeWorker:
-    """make_worker(embedder=…, max_attempts=…, store=…): a worker over the test's rows and index."""
+    """make_worker(embedder=…, max_attempts=…, store=…, index=…): a worker over the test's rows and index."""
 
     def make(
         *,
         embedder_: RecordingEmbedder | None = None,
         max_attempts: int = 3,
         store: FileStore | None = None,
+        index_: Index | None = None,
     ) -> Worker:
         tools = JobTools(
             profile_chooser=make_chooser(),
-            index_tools=make_index_tools(embedder_ or embedder, index),
+            index_tools=make_index_tools(embedder_ or embedder, index_ or index),
             file_store=store or file_store,
         )
         return Worker(
@@ -162,6 +168,46 @@ class UnreachableEmbedder(RecordingEmbedder):
 
     def embed_passages(self, texts: Sequence[str]) -> list[list[float]]:
         raise ConnectionError(self._message)
+
+
+class WatchedIndex:
+    """An index over another, recording which versions it holds after each replace.
+
+    Its deletes fail while `deletes_fail` is set, like an index that's down. Only
+    `replace` and `delete` matter to the index job and its cleanup; the rest passes
+    through.
+    """
+
+    def __init__(self, inner: InMemoryIndex) -> None:
+        self._inner = inner
+        self.deletes_fail = False
+        self.versions_after_replace: list[set[int]] = []
+
+    @property
+    def schema(self) -> type[Schema]:
+        return self._inner.schema
+
+    def put(self, embedded_chunks: Iterable[EmbeddedChunk]) -> None:
+        self._inner.put(embedded_chunks)
+
+    def find(self, *, where: Filter) -> list[IndexChunk]:
+        return self._inner.find(where=where)
+
+    def delete(self, *, where: Filter) -> None:
+        if self.deletes_fail:
+            # a message quoting the document, as a backend error might
+            raise ConnectionError("Điều 1 couldn't be deleted")
+        self._inner.delete(where=where)
+
+    def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
+        self._inner.replace(where=where, with_=with_)
+        held = self._inner.find(where=Everything())
+        self.versions_after_replace.append(
+            {chunk[KbChunks.document_version] for chunk in held}
+        )
+
+    def search(self, query: VectorQuery, *, where: Filter, limit: int) -> list[Hit]:
+        return self._inner.search(query, where=where, limit=limit)
 
 
 class StopOnFirstWait(threading.Event):
@@ -284,6 +330,104 @@ def test_the_index_gets_the_documents_groups_and_version(
     assert chunk[KbChunks.access_group_ids] == (hr.id,)
     assert chunk[KbChunks.collection_id] == details.document.collection_id
     assert chunk[KbChunks.document_version] == 1
+
+
+def test_an_index_job_makes_its_version_the_one_search_shows(
+    worker: Worker, upload: Upload, session: Session
+) -> None:
+    details = upload()
+
+    run_until_idle(worker)
+
+    assert indexed_version(session, details) == 1
+    assert DocumentRepository(session).served_versions({details.document.id}) == {
+        details.document.id: 1
+    }
+
+
+def test_a_prepared_but_not_yet_indexed_document_is_shown_nowhere(
+    worker: Worker, upload: Upload, session: Session
+) -> None:
+    details = upload()
+
+    worker.run_once()  # the prepare job only
+
+    assert indexed_version(session, details) is None
+
+
+def test_a_new_version_keeps_the_old_one_shown_until_it_is_recorded(
+    make_worker: MakeWorker, upload: Upload, session: Session, index: InMemoryIndex
+) -> None:
+    watched = WatchedIndex(index)
+    worker = make_worker(index_=watched)
+    details = upload()
+    run_until_idle(worker)
+    add_current_version(session, details, version=2)
+    queue(session, details, kind="prepare", version=2)
+
+    run_until_idle(worker)
+
+    # while v2 was written, v1 was still there for search to show
+    assert watched.versions_after_replace == [{1}, {1, 2}]
+    assert indexed_version(session, details) == 2
+    assert {chunk[KbChunks.document_version] for chunk in indexed(index, details)} == {
+        2
+    }
+
+
+def test_a_failed_cleanup_leaves_the_job_done_and_logs_only_the_error_type(
+    make_worker: MakeWorker,
+    upload: Upload,
+    session: Session,
+    index: InMemoryIndex,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    watched = WatchedIndex(index)
+    worker = make_worker(index_=watched)
+    details = upload()
+    run_until_idle(worker)
+    add_current_version(session, details, version=2)
+    queue(session, details, kind="prepare", version=2)
+    watched.deletes_fail = True
+    caplog.set_level(logging.WARNING, logger="kb_server.indexing.worker")
+
+    run_until_idle(worker)
+
+    index_jobs = [j for j in jobs_of(session, details) if j.kind == "index"]
+    assert [(j.version, j.status, j.attempts) for j in index_jobs] == [
+        (1, "done", 1),
+        (2, "done", 1),
+    ]
+    assert indexed_version(session, details) == 2
+    # left behind, but hidden: validity shows only the indexed version
+    assert {chunk[KbChunks.document_version] for chunk in indexed(index, details)} == {
+        1,
+        2,
+    }
+    assert "ConnectionError" in caplog.text
+    assert str(details.document.id) in caplog.text
+    assert "Điều" not in caplog.text
+
+
+def test_the_next_index_job_removes_what_a_failed_cleanup_left(
+    make_worker: MakeWorker, upload: Upload, session: Session, index: InMemoryIndex
+) -> None:
+    watched = WatchedIndex(index)
+    worker = make_worker(index_=watched)
+    details = upload()
+    run_until_idle(worker)
+    add_current_version(session, details, version=2)
+    queue(session, details, kind="prepare", version=2)
+    watched.deletes_fail = True
+    run_until_idle(worker)
+    watched.deletes_fail = False
+
+    queue(session, details, kind="index", version=2)
+    run_until_idle(worker)
+
+    assert {chunk[KbChunks.document_version] for chunk in indexed(index, details)} == {
+        2
+    }
 
 
 def test_preparing_a_version_again_drops_its_index_provenance_and_queues_indexing(
@@ -839,6 +983,14 @@ def add_current_version(
     found = DocumentRepository(session).get_version(details.document.id, version)
     assert found is not None
     return found
+
+
+def indexed_version(session: Session, details: DocumentDetails) -> int | None:
+    """The version search shows, as the worker left it."""
+    session.expire_all()
+    found = DocumentRepository(session).get(details.document.id)
+    assert found is not None
+    return found.indexed_version
 
 
 def indexed(index: InMemoryIndex, details: DocumentDetails) -> list[IndexChunk]:

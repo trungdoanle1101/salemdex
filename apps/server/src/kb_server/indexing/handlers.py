@@ -29,6 +29,7 @@ from kb_server.indexing.prepared import (
 from kb_server.storage.files import FileStore
 from salemdex_retrieval import Chunk as IndexChunk
 from salemdex_retrieval.embedders import DenseBinding, embed_chunks
+from salemdex_retrieval.filters import and_, not_
 from salemdex_retrieval.index import Index
 
 logger = logging.getLogger(__name__)
@@ -217,7 +218,13 @@ def run_index_job(
     parts = _load_parts(job, store=store)
     chunks = _to_index_chunks(parts.chunks, job=job)
     embedded = embed_chunks(chunks, bindings=[tools.binding])
-    tools.index.replace(where=KbChunks.document_id.eq(job.document.id), with_=embedded)
+    tools.index.replace(
+        where=and_(
+            KbChunks.document_id.eq(job.document.id),
+            KbChunks.document_version.eq(job.version.version),
+        ),
+        with_=embedded,
+    )
     logger.info(
         "document %s v%d indexed: %d chunks",
         job.document.id,
@@ -225,6 +232,25 @@ def run_index_job(
         len(chunks),
     )
     return IndexResult(embedder=tools.embedder_identity, index=tools.index_label)
+
+
+def remove_other_versions(job: ClaimedJob, *, index: Index) -> None:
+    """Remove the document's chunks of every version but the job's.
+
+    The worker calls it after the commit that makes the job's version the one search
+    shows, never before: until then the old version is what readers see. Safe to
+    repeat, and it also removes what an earlier cleanup left behind.
+
+    Args:
+        job: The index job just recorded; its version is the one to keep.
+        index: The index of `KbChunks` holding the document's chunks.
+    """
+    index.delete(
+        where=and_(
+            KbChunks.document_id.eq(job.document.id),
+            not_(KbChunks.document_version.eq(job.version.version)),
+        )
+    )
 
 
 def run_delete_job(job: ClaimedJob, *, index: Index, store: FileStore) -> DeleteResult:

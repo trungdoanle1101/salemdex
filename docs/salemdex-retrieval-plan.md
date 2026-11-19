@@ -80,7 +80,8 @@ part of replacing the old retrieval ("Pick up here" below). Branch:
        turning one version's prepared chunks into salemdex `Chunk`s: ids
        `uuid5(document_id, f"{version}:{position}")`, `embedded_text` with the headings
        path. It replaces `to_indexed_chunks` and `index_document`;
-     - `run_index_job` on `embed_chunks` and `index.put`, with the version switch:
+     - `run_index_job` on `embed_chunks` and `index.replace` within its version, with the
+       version switch (built):
        `documents.indexed_version` (one migration), set in the transaction that marks the
        index job done, then `delete` of the document's other versions after the commit
        (section 6, "Currency");
@@ -1129,15 +1130,19 @@ re-index (minutes on CPU), and for good if the new version fails to index.
    copy, switch one pointer, remove the old copy.
 
    ```text
-   handler   index.put(v2 chunks)                     v1 still served: indexed_version = 1
+   handler   index.replace(where=document is x AND version is 2, with_=v2 chunks)
+                                                      v1 still served: indexed_version = 1
    worker    commit indexed_version = 2                the switch: one row, atomic
    after     index.delete(where=document is x AND version isn't 2)
    ```
 
+   - `replace` within the version, not `put`: a version prepared again with fewer chunks
+     leaves none of its old ones, which validity would otherwise show.
+
    - From a reader's view the switch is atomic: all of v1, then all of v2, never a mix and never
      nothing.
    - A crash after the commit leaves v1's chunks behind. The validity check already hides them,
-     and `gc` removes them. It's the same idea as "originals are deleted after the commit".
+     and the document's next index job or `gc` removes them. It's the same idea as "originals are deleted after the commit".
 
 Consequences:
 

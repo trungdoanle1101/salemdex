@@ -21,6 +21,7 @@ class Document:
     title: str
     status: DocumentStatus
     current_version: int
+    indexed_version: int | None
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime

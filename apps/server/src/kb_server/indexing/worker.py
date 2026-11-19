@@ -17,6 +17,7 @@ from kb_server.indexing.handlers import (
     JobTools,
     PermanentJobError,
     PrepareResult,
+    remove_other_versions,
     run_delete_job,
     run_index_job,
     run_prepare_job,
@@ -78,8 +79,13 @@ class Worker:
             match result:
                 case DeleteResult():
                     self._finish_deletion(claimed)
-                case _:
+                case IndexResult():
                     self._record_success(claimed, result)
+                    self._remove_other_versions(claimed)
+                case PrepareResult():
+                    self._record_success(claimed, result)
+                case _:
+                    assert_never(result)
         except Exception as error:  # noqa: BLE001
             self._record_failure(claimed.job, error)
 
@@ -179,15 +185,15 @@ class Worker:
                         )
                     jobs.mark_done(claimed.job.id, now=self._now())
                 case IndexResult():
-                    # run_index_job already refuses a version without provenance
-                    assert claimed.version.provenance is not None
-
                     provenance = {
-                        **claimed.version.provenance,
+                        **(claimed.version.provenance or {}),
                         "index": result.provenance(),
                     }
                     documents.set_provenance(
                         claimed.version.document_id, claimed.version.version, provenance
+                    )
+                    documents.set_indexed_version(
+                        claimed.version.document_id, claimed.version.version
                     )
                     jobs.mark_done(claimed.job.id, now=self._now())
                 case _:
@@ -221,6 +227,24 @@ class Worker:
                     type(error).__name__,
                 )
                 jobs.requeue(job.id, error=message)
+
+    def _remove_other_versions(self, claimed: ClaimedJob) -> None:
+        """Remove other versions' chunks; a failure is logged, never raised.
+
+        The job is already recorded, and validity hides those chunks anyway.
+        """
+        try:
+            remove_other_versions(claimed, index=self._tools.index_tools.index)
+        # the Index protocol names no errors, and Qdrant's are the backend's own; whatever
+        # it raises, the job is done and must stay done
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "document %s v%d: other versions' chunks not removed (%s); "
+                "the next index of this document or kb-server gc removes them",
+                claimed.document.id,
+                claimed.version.version,
+                type(error).__name__,
+            )
 
     def _finish_deletion(self, claimed: ClaimedJob) -> None:
         """Delete the document's row, then the originals nothing else uses.

@@ -1,10 +1,11 @@
 import hashlib
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -529,3 +530,108 @@ def test_delete_an_unknown_document_reports_false(
     documents: DocumentRepository,
 ) -> None:
     assert documents.delete(uuid.uuid4()) is False
+
+
+# the version search shows
+
+
+def test_a_new_document_has_no_indexed_version(
+    add_document: Callable[..., Document],
+) -> None:
+    assert add_document().indexed_version is None
+
+
+def test_set_indexed_version_records_the_version_search_shows(
+    documents: DocumentRepository, add_document: Callable[..., Document]
+) -> None:
+    document = add_document()
+
+    assert documents.set_indexed_version(document.id, 1) is True
+
+    found = documents.get(document.id)
+    assert found is not None and found.indexed_version == 1
+
+
+def test_set_indexed_version_of_an_unknown_document_reports_false(
+    documents: DocumentRepository,
+) -> None:
+    assert documents.set_indexed_version(uuid.uuid4(), 1) is False
+
+
+def test_served_versions_gives_each_active_documents_indexed_version(
+    documents: DocumentRepository, add_document: Callable[..., Document]
+) -> None:
+    first = add_document(content=b"Dieu 1")
+    second = add_document(content=b"Dieu 2")
+    documents.set_indexed_version(first.id, 1)
+    documents.set_indexed_version(second.id, 3)
+
+    assert documents.served_versions({first.id, second.id}) == {
+        first.id: 1,
+        second.id: 3,
+    }
+
+
+@pytest.mark.parametrize("status", ["draft", "deleting"])
+def test_served_versions_leaves_out_documents_that_arent_active(
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+    status: DocumentStatus,
+) -> None:
+    # a deleting document is a tombstone: search drops it before its delete job runs
+    document = add_document(status=status)
+    documents.set_indexed_version(document.id, 1)
+
+    assert documents.served_versions({document.id}) == {}
+
+
+def test_served_versions_leaves_out_documents_never_indexed_and_unknown_ids(
+    documents: DocumentRepository, add_document: Callable[..., Document]
+) -> None:
+    never_indexed = add_document()
+
+    assert documents.served_versions({never_indexed.id, uuid.uuid4()}) == {}
+
+
+def test_served_versions_asks_once_however_many_documents(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    # validity calls it at every gate of every search
+    added = [add_document(content=f"Dieu {n}".encode()) for n in range(5)]
+    for document in added:
+        documents.set_indexed_version(document.id, 1)
+    session.flush()
+
+    with recorded_statements(session) as statements:
+        served = documents.served_versions({document.id for document in added})
+
+    assert len(served) == 5
+    assert len(statements) == 1
+
+
+def test_served_versions_of_no_documents_asks_nothing(
+    session: Session, documents: DocumentRepository
+) -> None:
+    with recorded_statements(session) as statements:
+        assert documents.served_versions(set()) == {}
+
+    assert statements == []
+
+
+@contextmanager
+def recorded_statements(session: Session) -> Iterator[list[str]]:
+    """The SQL statements the session sends while the block runs."""
+    statements: list[str] = []
+    connection = session.connection()
+
+    def record(*args: Any) -> None:
+        # before_cursor_execute(conn, cursor, statement, parameters, context, executemany)
+        statements.append(args[2])
+
+    event.listen(connection, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(connection, "before_cursor_execute", record)
