@@ -39,8 +39,12 @@ Nơi nhận:
 SETTINGS = PreparationSettings(
     profiles=("vn_regulation@4",),
     fallback_profile="plain@1",
-    chunker={"kind": "OutlineChunker", "max_tokens": 512, "table_layout": "grid"},
-    embedder="huggingface:BAAI/bge-m3",
+    chunker={
+        "kind": "OutlineChunker",
+        "max_tokens": 512,
+        "table_layout": "grid",
+        "tokenizer": "words",
+    },
 )
 
 DOCUMENT_ID = uuid.UUID("0b5e4c1a-6f1d-4a43-9c55-3d2b8e0f7a19")
@@ -112,8 +116,8 @@ def test_describe_gives_the_settings_in_full() -> None:
             "kind": "OutlineChunker",
             "max_tokens": 512,
             "table_layout": "grid",
+            "tokenizer": "words",
         },
-        "embedder": "huggingface:BAAI/bge-m3",
     }
     json.dumps(SETTINGS.describe())  # plain JSON, ready for provenance
 
@@ -132,18 +136,27 @@ def test_settings_can_be_compared() -> None:
     same = PreparationSettings(
         profiles=("vn_regulation@4",),
         fallback_profile="plain@1",
-        chunker={"table_layout": "grid", "max_tokens": 512, "kind": "OutlineChunker"},
-        embedder="huggingface:BAAI/bge-m3",
+        chunker={
+            "tokenizer": "words",
+            "table_layout": "grid",
+            "max_tokens": 512,
+            "kind": "OutlineChunker",
+        },
     )
     newer = PreparationSettings(
         profiles=("vn_regulation@5",),
         fallback_profile="plain@1",
         chunker=dict(SETTINGS.chunker),
-        embedder="huggingface:BAAI/bge-m3",
+    )
+    in_tokens = PreparationSettings(
+        profiles=("vn_regulation@4",),
+        fallback_profile="plain@1",
+        chunker={**SETTINGS.chunker, "tokenizer": "bge-m3"},
     )
 
     assert same.describe() == SETTINGS.describe()
     assert newer.describe() != SETTINGS.describe()
+    assert in_tokens.describe() != SETTINGS.describe()
 
 
 # saving and loading

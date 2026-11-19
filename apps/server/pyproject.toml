@@ -18,6 +18,7 @@ dependencies = [
     "pydantic[email]>=2.14.2",
     "python-multipart>=0.0.33",
     "sqlalchemy>=2.0",
+    "salemdex-retrieval",
     "uvicorn[standard]>=0.32",
 ]
 
@@ -25,6 +26,7 @@ dependencies = [
 # what kb-server worker needs: the embedding model and Qdrant (W5: serve doesn't)
 worker = [
     "document-processor[embedding,huggingface,qdrant]",
+    "salemdex-retrieval[huggingface,qdrant]",
 ]
 
 [project.scripts]
@@ -36,6 +38,7 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 document-processor = { workspace = true }
+salemdex-retrieval = { workspace = true }
 
 [dependency-groups]
 dev = [

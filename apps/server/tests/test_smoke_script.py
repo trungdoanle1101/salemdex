@@ -1,7 +1,7 @@
 """scripts/smoke_test.py, run against the app and a worker with a fake embedder.
 
-The index is the real QdrantChunkIndex on Qdrant's in-memory mode, so the script's Qdrant
-queries meet the payload the worker really writes. Instead of waiting, the script's polls run
+The index is the real QdrantIndex on Qdrant's in-memory mode, so the script reads the
+payload the worker really writes. Instead of waiting, the script's polls run
 the worker until it's idle.
 """
 
@@ -19,18 +19,19 @@ from qdrant_client import QdrantClient
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from document_processor.integrations.qdrant.index import QdrantChunkIndex
+from kb_server.domain.chunks import KbChunks
 from kb_server.domain.users import User
-from kb_server.indexing.handlers import IndexTools, JobTools
+from kb_server.indexing.handlers import JobTools
 from kb_server.indexing.worker import Worker
 from kb_server.storage.files import FileStore
 from kb_server.storage.models import IndexingJobRow
-from kb_server.wiring import QDRANT_INDEXED_ATTRIBUTES, Services
+from kb_server.wiring import Services
+from salemdex_retrieval.index.qdrant import QdrantIndex
 from tests.indexing.test_handlers import (
-    INDEX_LABEL,
     REGULATION,
-    CountingEmbedder,
+    RecordingEmbedder,
     make_chooser,
+    make_index_tools,
 )
 from tests.indexing.test_worker import UnreachableEmbedder
 from tests.support import PASSWORD
@@ -75,23 +76,16 @@ def make_worker(
     """make_worker(embedder=…, max_attempts=…): a worker over the test's rows and Qdrant."""
 
     def make(
-        *, embedder: CountingEmbedder | None = None, max_attempts: int = 3
+        *, embedder: RecordingEmbedder | None = None, max_attempts: int = 3
     ) -> Worker:
-        embedder = embedder or CountingEmbedder()
-        index = QdrantChunkIndex(
-            qdrant,
-            collection=QDRANT_COLLECTION,
-            embedder_identity=embedder.identity,
-            vector_specs=embedder.vector_specs,
-            indexed_attributes=QDRANT_INDEXED_ATTRIBUTES,
+        index = QdrantIndex.open(
+            schema=KbChunks, client=qdrant, collection=QDRANT_COLLECTION
         )
         return Worker(
             session_factory=services.session_factory,
             tools=JobTools(
                 profile_chooser=make_chooser(),
-                index_tools=IndexTools(
-                    embedder=embedder, index=index, index_label=INDEX_LABEL
-                ),
+                index_tools=make_index_tools(embedder or RecordingEmbedder(), index),
                 file_store=file_store,
             ),
             max_attempts=max_attempts,
@@ -136,8 +130,9 @@ def run_smoke_test(
             keep=keep,
             http=http,
             probes=smoke.Probes(
-                qdrant=qdrant,
-                qdrant_collection=QDRANT_COLLECTION,
+                index=QdrantIndex.open(
+                    schema=KbChunks, client=qdrant, collection=QDRANT_COLLECTION
+                ),
                 store_root=file_store_root,
             ),
         )

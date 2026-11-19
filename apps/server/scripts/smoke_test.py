@@ -25,19 +25,18 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient
 
-from document_processor.integrations.qdrant._payload import (
-    ATTRIBUTES,
-    DOCUMENT_ID,
-    decode_attributes,
-)
+from kb_server.domain.chunks import KbChunks
 from kb_server.settings import Settings
 from kb_server.storage.files import (
     original_key,
     prepared_folder,
     prepared_version_folder,
 )
+from salemdex_retrieval import Chunk
+from salemdex_retrieval.index import Index
+from salemdex_retrieval.index.qdrant import QdrantIndex
 
 API = "/api/v1"
 POLL_SECONDS = 2.0
@@ -54,8 +53,7 @@ class SmokeTestFailed(Exception):
 class Probes:
     """What the script looks at besides the API: the index, and the store when it's local."""
 
-    qdrant: QdrantClient
-    qdrant_collection: str
+    index: Index
     store_root: Path | None  # None: an S3 store, not checked
 
 
@@ -71,8 +69,9 @@ def main() -> int:
 
     with closing(qdrant), httpx.Client(base_url=args.url + API, timeout=120) as http:
         probes = Probes(
-            qdrant=qdrant,
-            qdrant_collection=settings.qdrant_collection,
+            index=QdrantIndex.open(
+                schema=KbChunks, client=qdrant, collection=settings.qdrant_collection
+            ),
             store_root=settings.storage_path
             if settings.storage_kind == "local"
             else None,
@@ -207,26 +206,28 @@ def check_index(
     probes: Probes, document_id: uuid.UUID, *, collection_id: uuid.UUID
 ) -> None:
     """The document has points, and its chunks carry its collection, version and no groups."""
-    count = _count_points(probes, document_id)
-    if count == 0:
+    chunks = _chunks_of(probes, document_id)
+    if not chunks:
         raise SmokeTestFailed(
             f"the index job finished, but Qdrant has no points for {document_id}"
         )
 
-    attributes = _attributes_of_one_point(probes, document_id)
     expected = {
         "access_group_ids": (),
-        "collection_id": str(collection_id),
+        "collection_id": collection_id,
+        "document_id": document_id,
         "document_version": 1,
     }
+    # field values only: the chunks' text never reaches the output
+    found = {field.name: value for field, value in chunks[0].field_values.items()}
     wrong = {
-        name: attributes.get(name)
+        name: found.get(name)
         for name, value in expected.items()
-        if attributes.get(name) != value
+        if found.get(name) != value
     }
     if wrong:
-        raise SmokeTestFailed(f"index attributes differ from {expected}: {wrong}")
-    _report(f"{count} points in Qdrant, attributes {sorted(attributes)}")
+        raise SmokeTestFailed(f"index fields differ from {expected}: {wrong}")
+    _report(f"{len(chunks)} points in Qdrant, fields {sorted(found)}")
 
 
 def check_prepared_output(
@@ -263,7 +264,7 @@ def delete_and_check(
     _report("delete accepted; the document reads as gone at once")
 
     def is_removed() -> bool:
-        return _count_points(probes, document_id) == 0 and not _prepared_exists(
+        return not _chunks_of(probes, document_id) and not _prepared_exists(
             probes, document_id
         )
 
@@ -329,37 +330,9 @@ def _request_deletion(http: httpx.Client, document_id: uuid.UUID) -> httpx.Respo
     return http.delete(f"/documents/{document_id}")
 
 
-def _document_filter(document_id: uuid.UUID) -> models.Filter:
-    return models.Filter(
-        must=[
-            models.FieldCondition(
-                key=DOCUMENT_ID, match=models.MatchValue(value=str(document_id))
-            )
-        ]
-    )
-
-
-def _count_points(probes: Probes, document_id: uuid.UUID) -> int:
-    result = probes.qdrant.count(
-        probes.qdrant_collection,
-        count_filter=_document_filter(document_id),
-        exact=True,
-    )
-    return result.count
-
-
-def _attributes_of_one_point(probes: Probes, document_id: uuid.UUID) -> dict[str, Any]:
-    """One point's attributes. Only that part of the payload is fetched: the rest is text."""
-    points, _ = probes.qdrant.scroll(
-        probes.qdrant_collection,
-        scroll_filter=_document_filter(document_id),
-        limit=1,
-        with_payload=[ATTRIBUTES],
-        with_vectors=False,
-    )
-    if not points or points[0].payload is None:
-        raise SmokeTestFailed(f"no point of {document_id} carries attributes")
-    return dict(decode_attributes(points[0].payload[ATTRIBUTES]))
+def _chunks_of(probes: Probes, document_id: uuid.UUID) -> list[Chunk]:
+    """The document's chunks in the index, text included: never print them whole."""
+    return probes.index.find(where=KbChunks.document_id.eq(document_id))
 
 
 def _prepared_exists(probes: Probes, document_id: uuid.UUID) -> bool:

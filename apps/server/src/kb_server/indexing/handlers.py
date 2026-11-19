@@ -3,19 +3,18 @@ import shutil
 import tempfile
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Self
 
+from document_processor.chunking import Chunk as DocChunk
 from document_processor.chunking.chunker import Chunker
+from document_processor.chunking.tokenizer import WordTokenizer
 from document_processor.logical.profile import Profile
 from document_processor.logical.profiles import PROFILES
 from document_processor.preparation.preparer import PreparedDocument, Preparer
-from document_processor.retrieval.attributes import Attributes
-from document_processor.retrieval.embedding import Embedder
-from document_processor.retrieval.index import ChunkIndex
-from document_processor.retrieval.ingest import index_document
+from kb_server.domain.chunks import KbChunks
 from kb_server.domain.documents import Document, DocumentVersion
 from kb_server.domain.files import DOCX, TEXT, StoredFile
 from kb_server.domain.jobs import IndexingJob
@@ -28,6 +27,9 @@ from kb_server.indexing.prepared import (
     save_review_page,
 )
 from kb_server.storage.files import FileStore
+from salemdex_retrieval import Chunk as IndexChunk
+from salemdex_retrieval.embedders import DenseBinding, embed_chunks
+from salemdex_retrieval.index import Index
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,6 @@ class ProfileChooser:
         profiles: Sequence[str],
         fallback_profile: str,
         chunker: Chunker,
-        embedder_identity: str,
     ) -> Self:
         resolved = [PROFILES.get(name) for name in profiles]
         fallback = PROFILES.get(fallback_profile)
@@ -80,7 +81,6 @@ class ProfileChooser:
             profiles=tuple(_profile_label(p) for p in resolved),
             fallback_profile=_profile_label(fallback),
             chunker=_describe_chunker(chunker),
-            embedder=embedder_identity,
         )
 
         return cls(
@@ -126,20 +126,32 @@ class PrepareResult:
 
 @dataclass(frozen=True, kw_only=True)
 class IndexTools:
-    embedder: Embedder
-    index: ChunkIndex
-    index_label: str
+    """What an index job writes with: the model, the index, and the names to record.
 
-    def __post_init__(self) -> None:
-        if self.embedder.identity != self.index.embedder_identity:
-            raise ValueError(
-                f"the index holds vectors from {self.index.embedder_identity!r}, "
-                f"but the embedder is {self.embedder.identity!r}"
-            )
+    Attributes:
+        binding: `KbChunks.dense`, paired with the model that fills it.
+        embedder_identity: Which model that is, recorded in each version's index
+            provenance; the embedder itself doesn't say.
+        index: The index of `KbChunks` the chunks go into.
+        index_label: Where that index lives, e.g. "qdrant:kb_chunks", for provenance;
+            only the wiring knows it.
+    """
+
+    binding: DenseBinding
+    embedder_identity: str
+    index: Index
+    index_label: str
 
 
 @dataclass(frozen=True, kw_only=True)
 class IndexResult:
+    """What filled a version's vectors and where they went, for its provenance.
+
+    Attributes:
+        embedder: The model's identity.
+        index: The index's label.
+    """
+
     embedder: str
     index: str
 
@@ -186,30 +198,49 @@ def run_prepare_job(
 def run_index_job(
     job: ClaimedJob, *, tools: IndexTools, store: FileStore
 ) -> IndexResult:
-    """Make this version's prepared chunks the document's only chunks in the index."""
-    _check_chunks_sized_for(job, embedder=tools.embedder)
+    """Make this version's prepared chunks the document's only chunks in the index.
+
+    Safe to repeat: chunk ids come from the document, version and position, and
+    `replace` removes every chunk the document had before writing these.
+
+    Args:
+        job: The claimed index job.
+        tools: The model and index to write with.
+        store: Where the version's prepared parts are.
+
+    Returns:
+        The model and index, for the version's provenance.
+
+    Raises:
+        PermanentJobError: The version has no prepared parts.
+    """
     parts = _load_parts(job, store=store)
-    index_document(
-        parts.chunks,
-        document_id=str(job.document.id),
-        embedder=tools.embedder,
-        index=tools.index,
-        attributes=_index_attributes(job),
-    )
+    chunks = _to_index_chunks(parts.chunks, job=job)
+    embedded = embed_chunks(chunks, bindings=[tools.binding])
+    tools.index.replace(where=KbChunks.document_id.eq(job.document.id), with_=embedded)
     logger.info(
         "document %s v%d indexed: %d chunks",
         job.document.id,
         job.version.version,
-        len(parts.chunks),
+        len(chunks),
     )
-    return IndexResult(embedder=tools.embedder.identity, index=tools.index_label)
+    return IndexResult(embedder=tools.embedder_identity, index=tools.index_label)
 
 
-def run_delete_job(
-    job: ClaimedJob, *, index: ChunkIndex, store: FileStore
-) -> DeleteResult:
-    """Remove the document's chunks from the index and its prepared output; return how many prepared files went."""
-    index.replace_document(str(job.document.id), [], [])
+def run_delete_job(job: ClaimedJob, *, index: Index, store: FileStore) -> DeleteResult:
+    """Remove the document's chunks from the index, then its prepared output.
+
+    Safe to repeat: deleting what's already gone does nothing.
+
+    Args:
+        job: The claimed delete job.
+        index: The index of `KbChunks` holding the document's chunks.
+        store: Where the document's prepared output is.
+
+    Returns:
+        How many prepared files were deleted.
+    """
+    index.delete(where=KbChunks.document_id.eq(job.document.id))
     files_deleted = delete_prepared(store, job.document.id)
     logger.info(
         "document %s removed from the index, %d prepared files deleted",
@@ -220,7 +251,12 @@ def run_delete_job(
 
 
 def _describe_chunker(chunker: Chunker) -> dict[str, Any]:
-    """The chunker's type and options, without the tokenizer."""
+    """Return the chunker's type, its options and the name of its tokenizer.
+
+    Raises:
+        TypeError: The chunker isn't a dataclass instance, or its tokenizer has no
+            name in `_TOKENIZER_NAMES`.
+    """
     if not is_dataclass(chunker) or isinstance(chunker, type):
         raise TypeError(
             f"{type(chunker).__name__} must be a dataclass instance to be described"
@@ -231,7 +267,31 @@ def _describe_chunker(chunker: Chunker) -> dict[str, Any]:
         for f in fields(chunker)
         if f.name != "tokenizer"
     }
-    return {"kind": type(chunker).__name__, **options}
+    described = {"kind": type(chunker).__name__, **options}
+    tokenizer = getattr(chunker, "tokenizer", None)
+    if tokenizer is not None:
+        described["tokenizer"] = _tokenizer_name(tokenizer)
+    return described
+
+
+# What the chunk sizes are counted in, by tokenizer. A fixed name rather than the class
+# name, so renaming a class doesn't make every prepared version look stale.
+_TOKENIZER_NAMES: Mapping[type, str] = {WordTokenizer: "words"}
+
+
+def _tokenizer_name(tokenizer: object) -> str:
+    """Return the name provenance records for `tokenizer`.
+
+    Raises:
+        TypeError: The tokenizer's type has no name in `_TOKENIZER_NAMES`.
+    """
+    try:
+        return _TOKENIZER_NAMES[type(tokenizer)]
+    except KeyError:
+        raise TypeError(
+            f"{type(tokenizer).__name__} has no name to record in provenance; "
+            "add it to _TOKENIZER_NAMES"
+        ) from None
 
 
 def _profile_label(profile: Profile) -> str:
@@ -297,28 +357,6 @@ def _profile_label_of(prepared: PreparedDocument) -> str:
     return f"{prepared.logical.profile_name}@{prepared.logical.profile_version}"
 
 
-def _check_chunks_sized_for(job: ClaimedJob, *, embedder: Embedder) -> None:
-    """Raise PermanentJobError unless the version's chunks were sized with this embedder."""
-    document = f"document {job.document.id} v{job.version.version}"
-    if job.version.provenance is None:
-        raise PermanentJobError(f"{document} has no provenance; prepare it again")
-
-    try:
-        prepared_for = job.version.provenance["preparation"]["settings"]["embedder"]
-    # TypeError: a part of the path that isn't a mapping, e.g. "preparation": null
-    except (KeyError, TypeError):
-        raise PermanentJobError(
-            f"provenance for {document} doesn't say which embedder sized its chunks; "
-            "prepare it again"
-        ) from None
-
-    if prepared_for != embedder.identity:
-        raise PermanentJobError(
-            f"chunks of {document} were sized for {prepared_for!r}, "
-            f"but the worker embeds with {embedder.identity!r}; prepare it again"
-        )
-
-
 def _load_parts(job: ClaimedJob, *, store: FileStore) -> PreparedParts:
     parts = load_prepared(store, job.document.id, job.version.version)
     if parts is None:
@@ -329,9 +367,34 @@ def _load_parts(job: ClaimedJob, *, store: FileStore) -> PreparedParts:
     return parts
 
 
-def _index_attributes(job: ClaimedJob) -> Attributes:
-    return {
-        "access_group_ids": tuple(str(group_id) for group_id in sorted(job.group_ids)),
-        "collection_id": str(job.document.collection_id),
-        "document_version": job.version.version,
-    }
+def _to_index_chunks(
+    chunks: Sequence[DocChunk], *, job: ClaimedJob
+) -> list[IndexChunk]:
+    """Return the prepared chunks as `KbChunks` chunks, numbered in document order."""
+    return [
+        _to_index_chunk(chunk, position=position, job=job)
+        for position, chunk in enumerate(chunks)
+    ]
+
+
+def _to_index_chunk(chunk: DocChunk, *, position: int, job: ClaimedJob) -> IndexChunk:
+    """Return one prepared chunk as the index stores it.
+
+    Its id is `uuid5(document_id, "<version>:<position>")`: writing the same version
+    again overwrites it, and a new version's chunks never overwrite the old one's
+    while both are in the index. Group ids are sorted, so a repeat writes the same
+    payload.
+    """
+    return IndexChunk(
+        id=uuid.uuid5(job.document.id, f"{job.version.version}:{position}"),
+        text=chunk.text,
+        embedded_text=chunk.contextualize(),
+        field_values=[
+            KbChunks.access_group_ids.value(sorted(job.group_ids)),
+            KbChunks.collection_id.value(job.document.collection_id),
+            KbChunks.document_id.value(job.document.id),
+            KbChunks.document_version.value(job.version.version),
+            KbChunks.position.value(position),
+            KbChunks.headings.value(chunk.headings),
+        ],
+    )

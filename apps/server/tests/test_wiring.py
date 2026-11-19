@@ -4,19 +4,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from kb_server.indexing.handlers import _index_attributes
-from kb_server.storage.files import LocalFileStore
-from kb_server.wiring import QDRANT_INDEXED_ATTRIBUTES
-from tests.indexing.test_handlers import stage
+from kb_server.domain.chunks import KbChunks
 
 
-def test_qdrant_indexes_exactly_the_attributes_the_index_job_writes(
-    tmp_path: Path,
-) -> None:
-    # a renamed attribute would otherwise leave search filtering on a field with no index
-    job = stage(LocalFileStore(tmp_path), b"text")
+def test_the_fields_every_search_and_delete_filter_by_are_indexed() -> None:
+    # Qdrant builds a payload index only for these. Without one, a reader's narrow access
+    # filter makes a large collection's search approximate, and deleting a document
+    # scans every point.
+    indexed = {name for name, field in KbChunks.fields().items() if field.indexed}
 
-    assert set(QDRANT_INDEXED_ATTRIBUTES) == set(_index_attributes(job))
+    assert indexed == {"access_group_ids", "collection_id", "document_id"}
 
 
 WORKER_ONLY_MODULES = (

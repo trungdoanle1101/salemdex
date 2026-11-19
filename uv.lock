@@ -1105,6 +1105,7 @@ dependencies = [
     { name = "pydantic", extra = ["email"] },
     { name = "pydantic-settings" },
     { name = "python-multipart" },
+    { name = "salemdex-retrieval" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1112,6 +1113,7 @@ dependencies = [
 [package.optional-dependencies]
 worker = [
     { name = "document-processor", extra = ["embedding", "huggingface", "qdrant"] },
+    { name = "salemdex-retrieval", extra = ["huggingface", "qdrant"] },
 ]
 
 [package.dev-dependencies]
@@ -1133,6 +1135,8 @@ requires-dist = [
     { name = "pydantic", extras = ["email"], specifier = ">=2.14.2" },
     { name = "pydantic-settings", specifier = ">=2.16.2" },
     { name = "python-multipart", specifier = ">=0.0.33" },
+    { name = "salemdex-retrieval", editable = "packages/retrieval" },
+    { name = "salemdex-retrieval", extras = ["huggingface", "qdrant"], marker = "extra == 'worker'", editable = "packages/retrieval" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]

@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     # worker, preparation: candidate profiles, most specific first
     profiles: tuple[str, ...] = ("vn_regulation",)
     fallback_profile: str = "plain"
-    chunk_tokens: Positive = 512  # counted with the embedder's tokenizer
+    # counted in words, so no model's tokenizer is needed; 450 words is about 512
+    # bge-m3 tokens for Vietnamese (1.10 tokens per word)
+    chunk_words: Positive = 450
 
     # worker, models
     models_folder: Path | None = None  # required by the worker

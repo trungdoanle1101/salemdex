@@ -2,7 +2,7 @@
 stuck jobs and running until stopped.
 
 Real Postgres rows (uploaded through DocumentService, so each document comes with its
-prepare job), the real ProfileChooser, and the handler tests' word-counting embedder and
+prepare job), the real ProfileChooser, and the handler tests' recording fake embedder and
 in-memory index. The worker's sessions join the test's transaction, so its commits are
 savepoints; the test session reads them after expire_all().
 """
@@ -20,15 +20,14 @@ import pytest
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from document_processor.retrieval.in_memory_index import InMemoryChunkIndex
-from document_processor.retrieval.index import ChunkFilter, IndexedChunk
+from kb_server.domain.chunks import KbChunks
 from kb_server.domain.collections import Collection
 from kb_server.domain.credentials import Principal
 from kb_server.domain.documents import DocumentDetails, DocumentVersion
 from kb_server.domain.groups import Group
 from kb_server.domain.jobs import IndexingJob, JobKind
 from kb_server.domain.users import User
-from kb_server.indexing.handlers import IndexTools, JobTools
+from kb_server.indexing.handlers import JobTools
 from kb_server.indexing.worker import Worker
 from kb_server.services.documents import DocumentService
 from kb_server.storage.files import FileStore, prepared_folder
@@ -38,12 +37,16 @@ from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.files import StoredFileRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
+from salemdex_retrieval import Chunk as IndexChunk
+from salemdex_retrieval.index import InMemoryIndex
 from tests.indexing.test_handlers import (
+    EMBEDDER,
     INDEX_LABEL,
     REGULATION,
     VN_REGULATION,
-    CountingEmbedder,
+    RecordingEmbedder,
     make_chooser,
+    make_index_tools,
 )
 from tests.support import FakeClock
 
@@ -103,38 +106,34 @@ def upload(
 
 
 @pytest.fixture
-def embedder() -> CountingEmbedder:
-    return CountingEmbedder()
+def embedder() -> RecordingEmbedder:
+    return RecordingEmbedder()
 
 
 @pytest.fixture
-def index(embedder: CountingEmbedder) -> InMemoryChunkIndex:
-    return InMemoryChunkIndex(
-        embedder_identity=embedder.identity, vector_specs=embedder.vector_specs
-    )
+def index() -> InMemoryIndex:
+    return InMemoryIndex(schema=KbChunks)
 
 
 @pytest.fixture
 def make_worker(
     session_factory: sessionmaker[Session],
     file_store: FileStore,
-    index: InMemoryChunkIndex,
-    embedder: CountingEmbedder,
+    index: InMemoryIndex,
+    embedder: RecordingEmbedder,
     clock: FakeClock,
 ) -> MakeWorker:
     """make_worker(embedder=…, max_attempts=…, store=…): a worker over the test's rows and index."""
 
     def make(
         *,
-        embedder_: CountingEmbedder | None = None,
+        embedder_: RecordingEmbedder | None = None,
         max_attempts: int = 3,
         store: FileStore | None = None,
     ) -> Worker:
         tools = JobTools(
             profile_chooser=make_chooser(),
-            index_tools=IndexTools(
-                embedder=embedder_ or embedder, index=index, index_label=INDEX_LABEL
-            ),
+            index_tools=make_index_tools(embedder_ or embedder, index),
             file_store=store or file_store,
         )
         return Worker(
@@ -154,14 +153,14 @@ def worker(make_worker: MakeWorker) -> Worker:
     return make_worker()
 
 
-class UnreachableEmbedder(CountingEmbedder):
+class UnreachableEmbedder(RecordingEmbedder):
     """Fails every embedding with the error's message given, like a model server that's down."""
 
     def __init__(self, message: str = "model server unreachable") -> None:
         super().__init__()
         self._message = message
 
-    def encode_passages(self, texts: Sequence[str]) -> list[Any]:
+    def embed_passages(self, texts: Sequence[str]) -> list[list[float]]:
         raise ConnectionError(self._message)
 
 
@@ -218,7 +217,7 @@ def test_a_prepare_job_records_its_preparation_and_queues_the_index_job(
     preparation = provenance(session, details)["preparation"]
     assert preparation["profile"] == VN_REGULATION
     assert preparation["profiles_without_structure"] == []
-    assert preparation["settings"]["embedder"] == CountingEmbedder().identity
+    assert "embedder" not in preparation["settings"]
 
 
 def test_the_index_job_is_queued_by_whoever_queued_the_prepare_job(
@@ -253,7 +252,7 @@ def test_a_draft_document_is_prepared_but_not_indexed(
 
 
 def test_an_index_job_indexes_the_chunks_and_adds_its_provenance(
-    worker: Worker, upload: Upload, session: Session, index: InMemoryChunkIndex
+    worker: Worker, upload: Upload, session: Session, index: InMemoryIndex
 ) -> None:
     details = upload()
 
@@ -266,7 +265,7 @@ def test_an_index_job_indexes_the_chunks_and_adds_its_provenance(
     ]
     recorded = provenance(session, details)
     assert recorded["index"] == {
-        "embedder": CountingEmbedder().identity,
+        "embedder": EMBEDDER,
         "index": INDEX_LABEL,
     }
     assert recorded["preparation"]["profile"] == VN_REGULATION
@@ -274,7 +273,7 @@ def test_an_index_job_indexes_the_chunks_and_adds_its_provenance(
 
 
 def test_the_index_gets_the_documents_groups_and_version(
-    worker: Worker, upload: Upload, index: InMemoryChunkIndex, hr: Group
+    worker: Worker, upload: Upload, index: InMemoryIndex, hr: Group
 ) -> None:
     details = upload()
 
@@ -282,9 +281,9 @@ def test_the_index_gets_the_documents_groups_and_version(
     worker.run_once()
 
     chunk = indexed(index, details)[0]
-    assert chunk.attributes["access_group_ids"] == (str(hr.id),)
-    assert chunk.attributes["collection_id"] == str(details.document.collection_id)
-    assert chunk.attributes["document_version"] == 1
+    assert chunk[KbChunks.access_group_ids] == (hr.id,)
+    assert chunk[KbChunks.collection_id] == details.document.collection_id
+    assert chunk[KbChunks.document_version] == 1
 
 
 def test_preparing_a_version_again_drops_its_index_provenance_and_queues_indexing(
@@ -414,7 +413,7 @@ def test_a_superseded_job_is_skipped_and_the_next_job_runs_in_the_same_call(
 
 
 def test_a_superseded_index_job_embeds_nothing(
-    worker: Worker, upload: Upload, session: Session, embedder: CountingEmbedder
+    worker: Worker, upload: Upload, session: Session, embedder: RecordingEmbedder
 ) -> None:
     details = upload()
     worker.run_once()
@@ -443,7 +442,7 @@ def test_a_job_for_the_whole_document_is_never_superseded(
 
 
 def test_every_job_of_a_document_being_deleted_is_skipped(
-    worker: Worker, upload: Upload, session: Session, embedder: CountingEmbedder
+    worker: Worker, upload: Upload, session: Session, embedder: RecordingEmbedder
 ) -> None:
     details = upload()
     queue(session, details, kind="index", version=1)
@@ -483,7 +482,7 @@ def test_a_delete_job_removes_the_document_everywhere(
     worker: Worker,
     upload: Upload,
     session: Session,
-    index: InMemoryChunkIndex,
+    index: InMemoryIndex,
     file_store: FileStore,
     file_store_root: Path,
 ) -> None:
@@ -842,10 +841,10 @@ def add_current_version(
     return found
 
 
-def indexed(index: InMemoryChunkIndex, details: DocumentDetails) -> list[IndexedChunk]:
-    return index.list_chunks(
-        ChunkFilter(document_ids=(str(details.document.id),)), limit=1000
-    )
+def indexed(index: InMemoryIndex, details: DocumentDetails) -> list[IndexChunk]:
+    """The document's chunks in the index, in document order."""
+    chunks = index.find(where=KbChunks.document_id.eq(details.document.id))
+    return sorted(chunks, key=lambda chunk: chunk[KbChunks.position])
 
 
 def _first_job_id(details: DocumentDetails) -> uuid.UUID:

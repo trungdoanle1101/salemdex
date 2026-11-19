@@ -38,7 +38,8 @@ apps/server/
     manage.py               kb-server create-admin | serve | worker (built); migrate | reprepare | gc
     api/                    routers + request/response schemas; HTTP only
     services/               use cases and permission checks; no HTTP, no SQL
-    domain/                 frozen dataclasses and errors: User, Principal, Document, StoredFile, …
+    domain/                 frozen dataclasses and errors: User, Principal, Document, StoredFile, …;
+                            chunks.py: the index schema (Guarded, KbChunks), read by the worker and search
     storage/                SQL and files only
       database.py  models.py  repositories/  files.py
     indexing/               the worker's side (models load only here)
@@ -87,7 +88,7 @@ store)`: this job, prepared this way, with this store.
 built      KB_DATABASE_URL  KB_LOG_LEVEL  KB_SESSION_TTL_HOURS  KB_ACT_FOR_HEADERS
            KB_MAX_UPLOAD_MB  KB_STORAGE_KIND (local | s3)  KB_STORAGE_PATH
 built,     KB_PROFILES (candidates, most specific first)  KB_FALLBACK_PROFILE (plain)
-worker     KB_CHUNK_TOKENS  KB_MODELS_FOLDER  KB_EMBEDDER_SPEC  KB_EMBEDDER_DEVICE
+worker     KB_CHUNK_WORDS  KB_MODELS_FOLDER  KB_EMBEDDER_SPEC  KB_EMBEDDER_DEVICE
            KB_EMBEDDER_BATCH_SIZE  KB_QDRANT_URL  KB_QDRANT_COLLECTION  KB_QDRANT_API_KEY
            KB_WORKER_POLL_SECONDS  KB_JOB_MAX_ATTEMPTS  KB_JOB_TIMEOUT_MINUTES
 later      KB_S3_ENDPOINT  KB_S3_BUCKET  KB_S3_ACCESS_KEY  KB_S3_SECRET_KEY
@@ -316,10 +317,11 @@ a document without its job (the outbox idea).
 
 - Profiles describe how a kind of document is structured. Built in: `vn_regulation`
   (Chương, Điều, khoản…) and `plain` (no levels: chunked by size only).
-- Chunks are sized in the embedder's tokens (`KB_CHUNK_TOKENS`) for now, which assumes one
-  dense embedder. The rework sizes them in words, and checks fit against each model only by
-  that model's own tokenization (retrieval design, section 6, "Chunk length and the
-  models").
+- Chunks are sized in words (`KB_CHUNK_WORDS`, 450 by default: about 512 bge-m3 tokens for
+  Vietnamese), so preparation needs no model's tokenizer. Nothing yet checks that a chunk
+  fits a model: sentence-transformers truncates a longer text without warning. Checking fit
+  against each model by its own tokenization comes later (retrieval design, section 6,
+  "Chunk length and the models").
 - **Automatic choice:** `KB_PROFILES` lists candidates; each is tried in order, and the first
   whose outline has a section wins. If none does, `KB_FALLBACK_PROFILE` (`plain`) is used.
   List candidates from most specific to most general.
@@ -328,9 +330,11 @@ a document without its job (the outbox idea).
   against a small labelled set of documents. List order then only breaks ties.
 - `ProfileChooser.from_profiles(...)` is the only way to build the chooser, so its preparers and
   its `PreparationSettings` always agree. Unknown profile names fail at worker startup.
-- `PreparationSettings`: candidate profiles and fallback (`name@version`), the chunker (its type
-  and options, without the tokenizer), and the embedder's identity (whose tokenizer sized the
-  chunks).
+- `PreparationSettings`: candidate profiles and fallback (`name@version`), and the chunker: its
+  type, options and tokenizer (`"tokenizer": "words"`). The tokenizer is recorded by a fixed
+  name per class, so versions sized in tokens and in words differ for `reprepare --stale`,
+  and renaming a class doesn't make every version look stale. No embedder: words need no
+  model's tokenizer.
 - Each preparation saves a review page (`review.html`) next to its parts, for a person to check
   the outline and chunks.
 
@@ -401,9 +405,10 @@ kb-server worker   logging (KB_LOG_LEVEL) → open_job_tools → recover_stuck_j
                    → run_forever until SIGTERM or SIGINT → close the Qdrant client and the engine
 ```
 
-- `open_job_tools` builds the worker's tools in a fixed order: the embedder, then the chunker
-  from its tokenizer (chunks are counted in the tokens the model receives), then the profile
-  chooser, then the Qdrant index under the same embedder identity. It's a context manager, so
+- `open_job_tools` builds the worker's tools in a fixed order: the embedder and its identity
+  (`huggingface:<hub id>@<commit>`, built from the spec, since the embedder doesn't name
+  itself), then the profile chooser (chunks in words), then the
+  index of `KbChunks` (`QdrantIndex.open`). It's a context manager, so
   the Qdrant client is closed however the worker stops, and callers never see Qdrant.
 - `run_forever` runs jobs back to back, waits `KB_WORKER_POLL_SECONDS` only when none is
   waiting, and checks the stop event between jobs; an idle worker stops at once. A signal
@@ -417,8 +422,11 @@ kb-server worker   logging (KB_LOG_LEVEL) → open_job_tools → recover_stuck_j
 - Startup errors exit with one line, not a traceback (`WorkerSetupError`): the step that
   failed, then the underlying reason. A message names a `KB_*` variable only where the wiring
   checks that variable itself, so it can't go stale when a library fails for another reason.
-- The Qdrant payload indexes (`QDRANT_INDEXED_ATTRIBUTES`) live in the wiring, because they're
-  Qdrant's configuration; a test keeps their names equal to what `run_index_job` writes.
+- The Qdrant payload indexes come from the schema: `QdrantIndex.open` creates one for each
+  `indexed=True` field of `KbChunks`. A test pins which fields those are.
+- Known gap: nothing checks that the collection's vectors came from the configured model.
+  `Dense(size=1024)` catches a model of another size, not another model of the same size or
+  a new revision.
 
 ### Prepare job
 
@@ -438,12 +446,12 @@ document is `active`). The worker then, in one transaction: sets the version's p
 ### Index job
 
 ```text
-1. the chunks were sized for this embedder (provenance settings.embedder == embedder.identity),
-   else PermanentJobError; checked first, so a refused job loads nothing
-2. load_prepared; missing → PermanentJobError ("prepare it again")
-3. attributes: access_group_ids (sorted), collection_id, document_version
-4. index_document: replaces all of the document's chunks; no chunks removes it
-5. log the chunk count; return IndexResult
+1. load_prepared; missing → PermanentJobError ("prepare it again")
+2. to KbChunks chunks: id uuid5(document_id, "<version>:<position>"), the Guarded fields
+   (access_group_ids sorted), position, headings; embedded text = headings path + text
+3. embed_chunks, then index.replace(where=document_id): replaces all of the document's
+   chunks; no chunks removes it
+4. log the chunk count; return IndexResult
 ```
 
 Groups are read when the job is claimed, so the newest groups are indexed. Errors from the

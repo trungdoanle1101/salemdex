@@ -26,8 +26,6 @@ class PreparationSettings:
     fallback_profile: str
     # kind and parameters for chunker: e.g., {"kind": "outline", "max_tokens": 512}
     chunker: Mapping[str, Any]
-    # the identity of the embedder whose tokenizer sized the chunks
-    embedder: str
 
     def describe(self) -> dict[str, Any]:
         """The settings in full, for provenance."""
@@ -35,7 +33,6 @@ class PreparationSettings:
             "profiles": list(self.profiles),
             "fallback_profile": self.fallback_profile,
             "chunker": dict(self.chunker),
-            "embedder": self.embedder,
         }
 
 
