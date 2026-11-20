@@ -13,6 +13,7 @@ from kb_server.domain.groups import Group
 from kb_server.domain.users import User, UserRole
 from kb_server.services.auth import AuthService
 from kb_server.storage.repositories.collections import CollectionRepository
+from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.users import UserRepository
 from tests.support import MAX_UPLOAD_MB, bearer, sign_in
@@ -25,6 +26,7 @@ DOCUMENT_FIELDS = {
     "title",
     "status",
     "current_version",
+    "indexed_version",
     "created_at",
     "updated_at",
     "groups",
@@ -413,3 +415,153 @@ def test_deleting_needs_a_token(
     uploaded = upload(client, admin_headers, hr_docs)
 
     assert client.delete(f"{DOCUMENTS}/{uploaded['id']}").status_code == 401
+
+
+# listing
+
+LIST_ITEM_FIELDS = {
+    "id",
+    "title",
+    "collection_id",
+    "current_version",
+    "indexed_version",
+}
+
+
+def list_documents(client: TestClient, headers: dict[str, str], **params: Any) -> Any:
+    return client.get(DOCUMENTS, headers=headers, params=params)
+
+
+def test_the_list_shows_each_documents_id_title_and_versions(
+    client: TestClient, admin_headers: dict[str, str], hr_docs: Collection
+) -> None:
+    uploaded = upload(client, admin_headers, hr_docs, title="Quy chế")
+
+    response = list_documents(client, admin_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["next_cursor"] is None
+    [item] = body["items"]
+    assert set(item) == LIST_ITEM_FIELDS
+    assert item == {
+        "id": uploaded["id"],
+        "title": "Quy chế",
+        "collection_id": str(hr_docs.id),
+        "current_version": 1,
+        "indexed_version": None,
+    }
+
+
+def test_the_document_and_the_list_show_the_version_search_serves(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    hr_docs: Collection,
+    documents: DocumentRepository,
+) -> None:
+    uploaded = upload(client, admin_headers, hr_docs)
+    # what the worker records once the index job is done
+    documents.set_indexed_version(uuid.UUID(uploaded["id"]), 1)
+
+    document = client.get(f"{DOCUMENTS}/{uploaded['id']}", headers=admin_headers)
+    [item] = list_documents(client, admin_headers).json()["items"]
+
+    assert document.json()["indexed_version"] == 1
+    assert item["indexed_version"] == 1
+
+
+def test_following_next_cursor_reaches_every_document_once(
+    client: TestClient, admin_headers: dict[str, str], hr_docs: Collection
+) -> None:
+    uploaded = {
+        upload(client, admin_headers, hr_docs, content=f"Điều {n}".encode())["id"]
+        for n in range(3)
+    }
+
+    first = list_documents(client, admin_headers, limit=2).json()
+    second = list_documents(
+        client, admin_headers, limit=2, cursor=first["next_cursor"]
+    ).json()
+
+    assert len(first["items"]) == 2 and first["next_cursor"] is not None
+    assert len(second["items"]) == 1 and second["next_cursor"] is None
+    listed = [item["id"] for item in first["items"] + second["items"]]
+    assert sorted(listed) == sorted(uploaded)
+
+
+def test_a_reader_lists_only_what_they_may_read(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    headers_for: Callable[[str, UserRole], dict[str, str]],
+    users: UserRepository,
+    groups: GroupRepository,
+    hr: Group,
+    hr_docs: Collection,
+) -> None:
+    shared = upload(client, admin_headers, hr_docs, content=b"shared")
+    upload(client, admin_headers, hr_docs, content=b"private", private="true")
+    reader_headers = headers_for("an@example.com", "reader")
+    reader = users.get_by_email("an@example.com")
+    assert reader is not None
+    groups.add_member(user_id=reader.id, group_id=hr.id)
+
+    items = list_documents(client, reader_headers).json()["items"]
+
+    assert [item["id"] for item in items] == [shared["id"]]
+
+
+def test_a_hidden_collection_is_404(
+    client: TestClient,
+    headers_for: Callable[[str, UserRole], dict[str, str]],
+    hr_docs: Collection,
+) -> None:
+    outsider_headers = headers_for("binh@example.com", "reader")
+
+    response = list_documents(client, outsider_headers, collection_id=str(hr_docs.id))
+
+    assert response.status_code == 404
+    assert error_code(response) == "collection_not_found"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param({"limit": 0}, id="limit 0"),
+        pytest.param({"limit": -1}, id="negative limit"),
+        pytest.param({"limit": 101}, id="limit above 100"),
+        pytest.param({"limit": "many"}, id="limit not a number"),
+        pytest.param({"collection_id": "hr-docs"}, id="collection not a uuid"),
+    ],
+)
+def test_bad_list_parameters_are_422(
+    client: TestClient, admin_headers: dict[str, str], params: dict[str, Any]
+) -> None:
+    response = list_documents(client, admin_headers, **params)
+
+    assert response.status_code == 422
+    assert error_code(response) == "invalid_request"
+
+
+def test_a_cursor_not_made_by_the_server_is_422(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    response = list_documents(client, admin_headers, cursor="not a cursor")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["message"] == "cursor is not valid"
+
+
+def test_an_overlong_cursor_is_refused_before_it_is_decoded(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    response = list_documents(client, admin_headers, cursor="a" * 201)
+
+    assert response.status_code == 422
+    assert [d["field"] for d in response.json()["error"]["details"]] == ["cursor"]
+
+
+def test_listing_needs_a_token(client: TestClient) -> None:
+    response = client.get(DOCUMENTS)
+
+    assert response.status_code == 401
+    assert error_code(response) == "not_authenticated"

@@ -51,6 +51,20 @@ class Principal:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ReadAccess:
+    """What an asker may read, short of everything.
+
+    Attributes:
+        group_ids: The asker's groups; they read documents sharing one.
+        managed_collection_ids: The collections whose every document they read,
+            private ones included. Empty unless the asker is a manager.
+    """
+
+    group_ids: frozenset[uuid.UUID]
+    managed_collection_ids: frozenset[uuid.UUID]
+
+
+@dataclass(frozen=True, kw_only=True)
 class IssuedToken:
     """A new credential and its secret; the secret only exists here, once."""
 

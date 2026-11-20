@@ -522,6 +522,160 @@ def test_an_unknown_document_is_not_found(
         document_service.get_document(admin, uuid.uuid4())
 
 
+# listing
+
+
+@pytest.fixture
+def library(
+    upload: Callable[..., DocumentDetails], admin: Principal, it_docs: Collection
+) -> dict[str, uuid.UUID]:
+    """Three documents: one for hr, one private in hr-docs, one in it-docs."""
+    return {
+        "hr": upload(content=b"hr").document.id,
+        "hr private": upload(content=b"private", private=True).document.id,
+        "it": upload(content=b"it", as_=admin, collection_id=it_docs.id).document.id,
+    }
+
+
+def listed(
+    document_service: DocumentService,
+    principal: Principal,
+    *,
+    collection_id: uuid.UUID | None = None,
+) -> set[uuid.UUID]:
+    page = document_service.list_documents(
+        principal, collection_id=collection_id, start_after=None, limit=100
+    )
+    return {document.id for document in page.items}
+
+
+def can_get(
+    document_service: DocumentService, principal: Principal, document_id: uuid.UUID
+) -> bool:
+    try:
+        document_service.get_document(principal, document_id)
+    except DocumentNotFound:
+        return False
+    return True
+
+
+def test_who_sees_what_in_the_list(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    admin: Principal,
+    manager: Principal,
+    other_manager: Principal,
+    hr_reader: Principal,
+    outsider: Principal,
+) -> None:
+    expected = {
+        "admin": (admin, {"hr", "hr private", "it"}),
+        "manager of hr-docs": (manager, {"hr", "hr private"}),
+        "manager of nothing": (other_manager, set()),
+        "hr reader": (hr_reader, {"hr"}),
+        "outsider": (outsider, set()),
+    }
+
+    for who, (principal, names) in expected.items():
+        assert listed(document_service, principal) == {
+            library[name] for name in names
+        }, who
+
+
+def test_the_list_and_get_agree_for_every_asker(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    auth: AuthService,
+    make_user: Callable[..., User],
+    admin: Principal,
+    manager: Principal,
+    other_manager: Principal,
+    hr_reader: Principal,
+    outsider: Principal,
+) -> None:
+    service_user = make_user("openwebui@example.com")
+    key = auth.create_front_end_key(admin, service_user_id=service_user.id, name="owui")
+    front_ends = [
+        auth.resolve(key.token, acting_for=email)
+        for email in ("admin@example.com", "manager@example.com", "an@example.com")
+    ]
+    askers = [admin, manager, other_manager, hr_reader, outsider]
+    askers += [front_end for front_end in front_ends if front_end is not None]
+    assert len(askers) == 8
+
+    for principal in askers:
+        shown = listed(document_service, principal)
+        for document_id in library.values():
+            assert can_get(document_service, principal, document_id) == (
+                document_id in shown
+            ), (principal.user.email, document_id)
+
+
+def test_a_reader_who_still_has_a_manager_row_doesnt_see_private_documents(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    login: Callable[[str, UserRole], Principal],
+    collections: CollectionRepository,
+    hr_docs: Collection,
+) -> None:
+    # e.g. a manager demoted to reader: the role decides, not the row left behind
+    demoted = login("demoted@example.com", "reader")
+    collections.add_manager(collection_id=hr_docs.id, user_id=demoted.user.id)
+
+    assert listed(document_service, demoted) == set()
+    assert not can_get(document_service, demoted, library["hr private"])
+
+
+def test_leaving_a_group_hides_its_documents(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    groups: GroupRepository,
+    hr_reader: Principal,
+    hr: Group,
+) -> None:
+    groups.remove_member(user_id=hr_reader.user.id, group_id=hr.id)
+
+    assert listed(document_service, hr_reader) == set()
+    assert not can_get(document_service, hr_reader, library["hr"])
+
+
+def test_the_list_can_be_narrowed_to_one_collection(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    admin: Principal,
+    it_docs: Collection,
+) -> None:
+    assert listed(document_service, admin, collection_id=it_docs.id) == {library["it"]}
+
+
+def test_listing_a_hidden_collection_is_told_it_doesnt_exist(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    outsider: Principal,
+    hr_docs: Collection,
+) -> None:
+    with pytest.raises(CollectionNotFound):
+        listed(document_service, outsider, collection_id=hr_docs.id)
+
+
+def test_listing_an_unknown_collection_is_not_found_even_by_an_admin(
+    document_service: DocumentService, admin: Principal
+) -> None:
+    with pytest.raises(CollectionNotFound):
+        listed(document_service, admin, collection_id=uuid.uuid4())
+
+
+def test_a_document_being_deleted_is_not_listed(
+    library: dict[str, uuid.UUID],
+    document_service: DocumentService,
+    session: Session,
+    admin: Principal,
+) -> None:
+    mark_deleting(session, library["hr"])
+
+    assert listed(document_service, admin) == {library["hr private"], library["it"]}
+
+
 # a document being deleted
 
 

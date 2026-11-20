@@ -9,6 +9,7 @@ from kb_server.domain.credentials import Principal
 from kb_server.domain.errors import InvalidRequest
 from kb_server.domain.search import DocumentSearched, Passage
 from kb_server.search.statements import BuildStatement
+from kb_server.services.access import read_access
 from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.users import UserRepository
 from salemdex_retrieval import Engine, Everything, or_
@@ -82,18 +83,15 @@ class SearchService:
 
     def _read_access_filter(self, principal: Principal) -> Filter:
         """Return the filter of what `principal` may see, read in a short transaction."""
-        if principal.is_admin:
-            return Everything()
-
         with self._session_factory.begin() as session:
-            users = UserRepository(session)
-            reader = Guarded.access_group_ids.any_of(
-                users.list_group_ids(principal.user.id)
-            )
-            if principal.user.role != "manager":
-                return reader
-            managed = users.list_managed_collection_ids(principal.user.id)
-            return or_(reader, Guarded.collection_id.in_(managed))
+            access = read_access(principal, users=UserRepository(session))
+        if access is None:
+            return Everything()
+        # An empty `in_` matches nothing, so a reader needs no case of their own
+        return or_(
+            Guarded.access_group_ids.any_of(access.group_ids),
+            Guarded.collection_id.in_(access.managed_collection_ids),
+        )
 
     def _read_titles(
         self, document_ids: AbstractSet[uuid.UUID]

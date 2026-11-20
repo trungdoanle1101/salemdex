@@ -131,6 +131,7 @@ def build_document_service(session: Session, services: Services) -> DocumentServ
     return DocumentService(
         documents=DocumentRepository(session),
         collections=CollectionRepository(session),
+        users=UserRepository(session),
         groups=GroupRepository(session),
         stored_files=StoredFileRepository(session),
         jobs=JobRepository(session),

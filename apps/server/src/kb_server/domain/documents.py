@@ -45,3 +45,30 @@ class DocumentDetails:
     file: StoredFile  # size, type, and hash
     groups: list[Group]
     job: IndexingJob | None  # latest job for the current version
+
+
+@dataclass(frozen=True, kw_only=True)
+class DocumentPosition:
+    """A document's place in the newest-first list; the next page starts after it.
+
+    Attributes:
+        created_at: When the document was created; the list's order.
+        id: The document's id, which breaks ties: one transaction's documents share
+            `created_at`.
+    """
+
+    created_at: datetime
+    id: uuid.UUID
+
+
+@dataclass(frozen=True, kw_only=True)
+class DocumentPage:
+    """One page of a list of documents, newest first.
+
+    Attributes:
+        items: The documents on this page.
+        next_position: Where the next page starts after; None on the last page.
+    """
+
+    items: list[Document]
+    next_position: DocumentPosition | None

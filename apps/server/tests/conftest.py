@@ -225,6 +225,7 @@ def file_store(file_store_root: Path) -> FileStore:
 def document_service(
     documents: DocumentRepository,
     collections: CollectionRepository,
+    users: UserRepository,
     groups: GroupRepository,
     stored_files: StoredFileRepository,
     jobs: JobRepository,
@@ -233,6 +234,7 @@ def document_service(
     return DocumentService(
         documents=documents,
         collections=collections,
+        users=users,
         groups=groups,
         stored_files=stored_files,
         jobs=jobs,

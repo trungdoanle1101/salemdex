@@ -4,7 +4,12 @@ from pathlib import PureWindowsPath
 from typing import BinaryIO
 
 from kb_server.domain.credentials import Principal, can_manage
-from kb_server.domain.documents import Document, DocumentDetails
+from kb_server.domain.documents import (
+    Document,
+    DocumentDetails,
+    DocumentPage,
+    DocumentPosition,
+)
 from kb_server.domain.errors import (
     CollectionNotFound,
     DocumentNotFound,
@@ -13,6 +18,7 @@ from kb_server.domain.errors import (
     NotAllowed,
 )
 from kb_server.domain.groups import Group
+from kb_server.services.access import read_access
 from kb_server.services.collections import can_see_collection
 from kb_server.services.groups import get_groups
 from kb_server.services.uploads import stage_upload
@@ -22,6 +28,7 @@ from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.files import StoredFileRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
+from kb_server.storage.repositories.users import UserRepository
 
 
 class DocumentService:
@@ -30,6 +37,7 @@ class DocumentService:
         *,
         documents: DocumentRepository,
         collections: CollectionRepository,
+        users: UserRepository,
         groups: GroupRepository,
         stored_files: StoredFileRepository,
         jobs: JobRepository,
@@ -38,6 +46,7 @@ class DocumentService:
     ) -> None:
         self._documents = documents
         self._collections = collections
+        self._users = users
         self._groups = groups
         self._stored_files = stored_files
         self._jobs = jobs
@@ -155,6 +164,40 @@ class DocumentService:
             document=document, version=version, file=file, groups=groups, job=job
         )
 
+    def list_documents(
+        self,
+        principal: Principal,
+        *,
+        collection_id: uuid.UUID | None,
+        start_after: DocumentPosition | None,
+        limit: int,
+    ) -> DocumentPage:
+        """Return a page of the documents `principal` may read, newest first.
+
+        Args:
+            principal: Who asks; they see only documents they may read.
+            collection_id: Only this collection's documents; None for every one.
+            start_after: Where the previous page ended; None for the first page.
+            limit: The most documents on the page.
+
+        Returns:
+            The page, and where the next one starts if more documents follow.
+
+        Raises:
+            CollectionNotFound: `collection_id` is unknown or hidden from them.
+        """
+        if collection_id is not None and (
+            self._collections.get(collection_id) is None
+            or not can_see_collection(self._collections, principal, collection_id)
+        ):
+            raise CollectionNotFound()
+        return self._documents.list_page(
+            collection_id=collection_id,
+            start_after=start_after,
+            access=read_access(principal, users=self._users),
+            limit=limit,
+        )
+
     def delete_document(self, principal: Principal, document_id: uuid.UUID) -> None:
         """Hide the document at once and queue its deletion; the worker removes the files."""
         document = self._documents.get(document_id)
@@ -175,14 +218,13 @@ class DocumentService:
             )
 
     def _can_read(self, principal: Principal, document: Document) -> bool:
-        if principal.is_admin:
+        """Return whether `principal` may read `document`, by the rule `list_page` applies."""
+        access = read_access(principal, users=self._users)
+        if access is None:
+            return True
+        if document.collection_id in access.managed_collection_ids:
             return True
 
-        if (
-            principal.user.role == "manager"
-            and principal.user.id
-            in self._collections.list_manager_ids(document.collection_id)
-        ):
-            return True
-
-        return self._documents.is_visible_to(document.id, principal.user.id)
+        return not access.group_ids.isdisjoint(
+            self._documents.list_group_ids(document.id)
+        )

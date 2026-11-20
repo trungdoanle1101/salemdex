@@ -2,6 +2,7 @@ import hashlib
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -10,7 +11,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from kb_server.domain.collections import Collection
-from kb_server.domain.documents import DOCUMENT_STATUSES, Document, DocumentStatus
+from kb_server.domain.credentials import ReadAccess
+from kb_server.domain.documents import (
+    DOCUMENT_STATUSES,
+    Document,
+    DocumentPosition,
+    DocumentStatus,
+)
 from kb_server.domain.groups import Group
 from kb_server.domain.users import User
 from kb_server.storage.models import (
@@ -323,54 +330,204 @@ def test_find_current_with_file_ignores_older_versions(
     assert found.id == document.id
 
 
-# who can read
+# listing
 
 
-def test_a_document_is_visible_to_users_sharing_a_group(
-    documents: DocumentRepository,
-    groups: GroupRepository,
+def add_documents(
+    session: Session,
     add_document: Callable[..., Document],
-    make_user: Callable[..., User],
+    created_at: list[datetime],
+    **fields: Any,
+) -> list[Document]:
+    """One document per time, created then: the list's order comes from these."""
+    added = []
+    for when in created_at:
+        document = add_document(content=uuid.uuid4().bytes, **fields)
+        session.execute(
+            update(DocumentRow)
+            .where(DocumentRow.id == document.id)
+            .values(created_at=when)
+        )
+        added.append(document)
+    return added
+
+
+def list_ids(
+    documents: DocumentRepository,
+    *,
+    access: ReadAccess | None = None,
+    collection_id: uuid.UUID | None = None,
+) -> list[uuid.UUID]:
+    """The ids of every document on one large page."""
+    page = documents.list_page(
+        collection_id=collection_id, start_after=None, access=access, limit=100
+    )
+    return [document.id for document in page.items]
+
+
+def walk_pages(documents: DocumentRepository, *, limit: int) -> list[list[uuid.UUID]]:
+    """The ids on every page, following each page's next position."""
+    pages: list[list[uuid.UUID]] = []
+    start_after: DocumentPosition | None = None
+    while True:
+        page = documents.list_page(
+            collection_id=None, start_after=start_after, access=None, limit=limit
+        )
+        pages.append([document.id for document in page.items])
+        if page.next_position is None:
+            return pages
+        start_after = page.next_position
+
+
+T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def days(n: int) -> datetime:
+    return T0 + timedelta(days=n)
+
+
+def test_the_list_is_newest_first(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    old, new, middle = add_documents(session, add_document, [days(0), days(2), days(1)])
+
+    assert list_ids(documents) == [new.id, middle.id, old.id]
+
+
+def test_documents_created_at_the_same_time_are_ordered_by_id(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    added = add_documents(session, add_document, [T0, T0, T0])
+
+    assert list_ids(documents) == sorted((d.id for d in added), reverse=True)
+
+
+def test_paging_shows_every_document_once_in_order(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    # ties on created_at land on page boundaries
+    add_documents(session, add_document, [days(0), days(0), days(1), days(1), days(2)])
+
+    pages = walk_pages(documents, limit=2)
+
+    assert [len(page) for page in pages] == [2, 2, 1]
+    assert [id_ for page in pages for id_ in page] == list_ids(documents)
+
+
+def test_a_full_last_page_has_no_next_position(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    add_documents(session, add_document, [days(0), days(1), days(2), days(3)])
+
+    assert [len(page) for page in walk_pages(documents, limit=2)] == [2, 2]
+
+
+def test_a_document_added_between_pages_doesnt_shift_the_next_page(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    d0, d1, d2, d3 = add_documents(
+        session, add_document, [days(0), days(1), days(2), days(3)]
+    )
+    first = documents.list_page(
+        collection_id=None, start_after=None, access=None, limit=2
+    )
+    add_documents(session, add_document, [days(4)])
+
+    second = documents.list_page(
+        collection_id=None, start_after=first.next_position, access=None, limit=2
+    )
+
+    assert [d.id for d in first.items] == [d3.id, d2.id]
+    assert [d.id for d in second.items] == [d1.id, d0.id]
+
+
+def test_the_list_can_be_narrowed_to_one_collection(
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+    hr_docs: Collection,
+    it_docs: Collection,
+) -> None:
+    in_hr = add_document(content=b"hr")
+    add_document(content=b"it", collection=it_docs)
+
+    assert list_ids(documents, collection_id=hr_docs.id) == [in_hr.id]
+
+
+def test_documents_being_deleted_are_left_out(
+    session: Session,
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+) -> None:
+    kept = add_document(content=b"kept")
+    deleting = add_document(content=b"deleting")
+    documents.mark_deleting(deleting.id)
+
+    assert list_ids(documents) == [kept.id]
+
+
+# who the list shows
+
+
+def test_the_list_shows_documents_sharing_one_of_the_askers_groups(
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
     hr: Group,
     it: Group,
 ) -> None:
-    an = make_user("an@example.com")
-    binh = make_user("binh@example.com")
-    groups.add_member(user_id=an.id, group_id=hr.id)
-    groups.add_member(user_id=binh.id, group_id=it.id)
-    document = add_document(group_ids=(hr.id,))
+    for_hr = add_document(content=b"hr", group_ids=(hr.id,))
+    for_both = add_document(content=b"both", group_ids=(hr.id, it.id))
+    add_document(content=b"it", group_ids=(it.id,))
+    add_document(content=b"private")
+    access = ReadAccess(
+        group_ids=frozenset({hr.id}), managed_collection_ids=frozenset()
+    )
 
-    assert documents.is_visible_to(document.id, an.id)
-    assert not documents.is_visible_to(document.id, binh.id)
+    assert set(list_ids(documents, access=access)) == {for_hr.id, for_both.id}
 
 
-def test_a_document_without_groups_is_visible_to_no_one_by_groups(
+def test_the_list_shows_every_document_of_a_managed_collection_private_ones_included(
     documents: DocumentRepository,
-    groups: GroupRepository,
     add_document: Callable[..., Document],
-    make_user: Callable[..., User],
-    hr: Group,
+    hr_docs: Collection,
+    it_docs: Collection,
+    it: Group,
 ) -> None:
-    an = make_user("an@example.com")
-    groups.add_member(user_id=an.id, group_id=hr.id)
+    private = add_document(content=b"private")
+    shared = add_document(content=b"shared", group_ids=(it.id,))
+    add_document(content=b"elsewhere", group_ids=(it.id,), collection=it_docs)
+    access = ReadAccess(
+        group_ids=frozenset(), managed_collection_ids=frozenset({hr_docs.id})
+    )
 
-    assert not documents.is_visible_to(add_document().id, an.id)
+    assert set(list_ids(documents, access=access)) == {private.id, shared.id}
 
 
-def test_leaving_the_group_hides_the_document(
-    documents: DocumentRepository,
-    groups: GroupRepository,
-    add_document: Callable[..., Document],
-    make_user: Callable[..., User],
-    hr: Group,
+def test_an_asker_with_no_groups_and_no_collections_sees_nothing(
+    documents: DocumentRepository, add_document: Callable[..., Document], hr: Group
 ) -> None:
-    an = make_user("an@example.com")
-    groups.add_member(user_id=an.id, group_id=hr.id)
-    document = add_document(group_ids=(hr.id,))
+    add_document(content=b"hr", group_ids=(hr.id,))
+    access = ReadAccess(group_ids=frozenset(), managed_collection_ids=frozenset())
 
-    groups.remove_member(user_id=an.id, group_id=hr.id)
+    assert list_ids(documents, access=access) == []
 
-    assert not documents.is_visible_to(document.id, an.id)
+
+def test_no_access_limit_shows_everything_private_documents_included(
+    documents: DocumentRepository, add_document: Callable[..., Document], hr: Group
+) -> None:
+    shared = add_document(content=b"hr", group_ids=(hr.id,))
+    private = add_document(content=b"private")
+
+    assert set(list_ids(documents, access=None)) == {shared.id, private.id}
 
 
 # what the database refuses (the services check these first; this is the backstop)

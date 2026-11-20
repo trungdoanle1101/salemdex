@@ -9,18 +9,25 @@ from sqlalchemy import (
     and_,
     delete,
     insert,
+    or_,
     select,
     update,
 )
 from sqlalchemy.orm import Session
 
-from kb_server.domain.documents import Document, DocumentStatus, DocumentVersion
+from kb_server.domain.credentials import ReadAccess
+from kb_server.domain.documents import (
+    Document,
+    DocumentPage,
+    DocumentPosition,
+    DocumentStatus,
+    DocumentVersion,
+)
 from kb_server.storage.models import (
     DocumentGroupRow,
     DocumentRow,
     DocumentVersionRow,
     StoredFileRow,
-    UserGroupRow,
 )
 
 
@@ -73,6 +80,70 @@ class DocumentRepository:
     def get(self, document_id: uuid.UUID) -> Document | None:
         row = self._session.get(DocumentRow, document_id)
         return to_document(row) if row is not None else None
+
+    def list_page(
+        self,
+        *,
+        collection_id: uuid.UUID | None,
+        start_after: DocumentPosition | None,
+        access: ReadAccess | None,
+        limit: int,
+    ) -> DocumentPage:
+        """Return a page of documents, newest first, leaving out those being deleted.
+
+        Args:
+            collection_id: Only this collection's documents; None for every one.
+            start_after: Where the previous page ended; None for the first page.
+            access: What the asker may read; None for everything.
+            limit: The most documents on the page.
+
+        Returns:
+            The page, and where the next one starts if more documents follow.
+        """
+        statement = (
+            select(DocumentRow)
+            .where(DocumentRow.status != "deleting")
+            .order_by(DocumentRow.created_at.desc(), DocumentRow.id.desc())
+        )
+
+        if collection_id is not None:
+            statement = statement.where(DocumentRow.collection_id == collection_id)
+
+        if start_after is not None:
+            statement = statement.where(
+                or_(
+                    DocumentRow.created_at < start_after.created_at,
+                    and_(
+                        DocumentRow.created_at == start_after.created_at,
+                        DocumentRow.id < start_after.id,
+                    ),
+                )
+            )
+
+        if access is not None:
+            shares_group = select(DocumentGroupRow.document_id).where(
+                DocumentGroupRow.group_id.in_(access.group_ids)
+            )
+            statement = statement.where(
+                or_(
+                    DocumentRow.id.in_(shares_group),
+                    DocumentRow.collection_id.in_(access.managed_collection_ids),
+                )
+            )
+
+        rows = self._session.scalars(statement.limit(limit + 1)).all()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        next_position = (
+            DocumentPosition(created_at=rows[-1].created_at, id=rows[-1].id)
+            if has_more
+            else None
+        )
+
+        return DocumentPage(
+            items=[to_document(row) for row in rows], next_position=next_position
+        )
 
     def mark_deleting(self, document_id: uuid.UUID) -> bool:
         """Mark the document to be deleted.
@@ -144,18 +215,6 @@ class DocumentRepository:
             )
         )
         return to_document(row) if row is not None else None
-
-    def is_visible_to(self, document_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-        """Whether the user shares a read group with the document."""
-        shared_groups = (
-            select(DocumentGroupRow.group_id)
-            .join(UserGroupRow, DocumentGroupRow.group_id == UserGroupRow.group_id)
-            .where(
-                DocumentGroupRow.document_id == document_id,
-                UserGroupRow.user_id == user_id,
-            )
-        )
-        return bool(self._session.scalar(select(shared_groups.exists())))
 
     def set_provenance(
         self, document_id: uuid.UUID, version: int, provenance: Mapping[str, Any]

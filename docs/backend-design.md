@@ -576,6 +576,8 @@ text, tokens or emails.
 ```text
 errors       {"error": {"code": "document_not_found", "message": "…", "details": …}} + HTTP status
 lists        ?limit=50&cursor=…  →  {"items": [...], "next_cursor": "…" | null}
+             keyset paging (built): newest first by (created_at, id); the cursor is base64url of
+             the last row's created_at and id, opaque to clients; limit 1–100
 long work    202 Accepted + job body + Location: /api/v1/jobs/{id}
 ```
 
@@ -587,9 +589,9 @@ long work    202 Accepted + job body + Location: /api/v1/jobs/{id}
 | users (built) | `POST /users`  `GET /users`  `GET /users/{id}`  `PATCH /users/{id}`  … |
 | groups (built) | `POST /groups`  `GET /groups`  `DELETE /groups/{id}`  members |
 | collections (built) | CRUD, `PUT /collections/{id}/groups`, managers |
-| documents | `POST /documents` (built)  `GET /documents/{id}` (built)  `GET /documents`  `PATCH /documents/{id}`  `PUT /documents/{id}/file`  `DELETE /documents/{id}` (built)  `GET /documents/{id}/versions`  `GET /documents/{id}/file`  `GET /documents/{id}/review` |
+| documents | `POST /documents` (built)  `GET /documents/{id}` (built)  `GET /documents` (built)  `PATCH /documents/{id}`  `PUT /documents/{id}/file`  `DELETE /documents/{id}` (built)  `GET /documents/{id}/versions`  `GET /documents/{id}/file`  `GET /documents/{id}/review` |
 | jobs | `GET /jobs`  `GET /jobs/{id}` |
-| search | `POST /search`  `POST /answer` |
+| search | `POST /search` (built)  `POST /answer` |
 | later | batches, relations, retirements, feedback, `/admin/*`, `/openai/v1` |
 
 Error codes so far: 401 `login_failed`, `not_authenticated`; 403 `not_allowed`; 404
@@ -649,9 +651,9 @@ kb-server gc                        remove originals no row needs, and chunks of
      8. a real end-to-end run with a real regulation and bge-m3 **(built)**
      9. deleting documents **(built)**
      10. `indexed_version` and the switch to a new version **(built)**
-5. Search: `POST /search` with the access filter. Moved ahead of the read side because it is
+5. Search: `POST /search` with the access filter. **(built)** Moved ahead of the read side because it is
    the reason the system exists, and it tests the index decisions early.
-6. Read side: list with paging, versions, download, review page, `GET /jobs/{id}`.
+6. Read side: list with paging **(built)**, versions, download, review page, `GET /jobs/{id}`.
 7. Editing: title (database only) and groups (`sync_attributes`), new versions, outline
    preview, profile override.
 8. Operations: `reprepare`, re-index after an embedder change, `gc`, backups.
@@ -689,6 +691,8 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | Adding an enum value has a no-op downgrade | Narrowing it would fail or lose the rows that use the value |
 | `vn_regulation` isn't the default | Most documents aren't regulations; `plain` is the safe fallback |
 | Fields the access filter and validity read live in one preset (`Guarded`) | One filter and one validity check apply to every index a statement searches |
+| `read_access` alone decides who reads what; list, get and search only translate it | Copies of the rule drift; a test checks list and get agree for every kind of asker |
+| Lists page by keyset `(created_at, id)`, not offset | An offset skips or repeats rows when one is added or deleted between pages |
 
 ## 16. Later
 
