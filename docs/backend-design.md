@@ -330,7 +330,10 @@ a document without its job (the outbox idea).
 ## 7. Preparation and profiles
 
 - Profiles describe how a kind of document is structured. Built in: `vn_regulation`
-  (Chương, Điều, khoản…) and `plain` (no levels: chunked by size only).
+  (Chương, Điều, khoản…) and `plain` (no levels: chunked by size only). `vn_regulation`
+  moves into the app with the `salemdex-ingest` rename: domain profiles are the app's, the
+  framework keeps `plain` and lets the app register its own (retrieval plan, sections 10
+  and 12).
 - Chunks are sized in words (`KB_CHUNK_WORDS`, 450 by default: about 512 bge-m3 tokens for
   Vietnamese), so preparation needs no model's tokenizer. Nothing yet checks that a chunk
   fits a model: sentence-transformers truncates a longer text without warning. Checking fit

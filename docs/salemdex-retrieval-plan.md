@@ -1248,6 +1248,8 @@ stage kinds afterwards is cheap.
   doesn't enforce it fully, though: a `Source` holds its `Index`, whose `find` and `search`
   apply no access filter of their own (section 11).
 
+- **Nothing domain-specific.** Every technique in the packages works for any knowledge
+  base; regulations, Vietnamese and other domains are the app's (section 12).
 - It never imports `document_processor`. An import-boundary check in CI enforces it. Why: the
   engine is generic; turning `chunking.Chunk` into an index chunk (today's `ingest` and
   `address_keys`) is app code, in the server, which declares the schema anyway.
@@ -1256,6 +1258,12 @@ stage kinds afterwards is cheap.
 - The family follows later, one rename per commit: `salemdex-ingest` (today's
   `document_processor`, moving to `packages/ingest/`) and `salemdex-server` (today's
   `kb_server`). The GitHub repo is already `salemdex`.
+- **The `vn_regulation` profile moves to the app** with the `salemdex-ingest` rename, for
+  the rule in section 12. It began as an example profile that's easy to use. The framework
+  keeps `plain`, the profile machinery and its counter styles (`lower_vn` beside
+  `lower_latin`: a numbering style, like CSS's, not a domain rule), and lets the app register
+  its own profiles beside the built-in ones. The framework's tests that use `vn_regulation`
+  today switch to a neutral example profile of their own.
 
 **Folder layout.** The core modules stay at the top level. Each new kind of part gets a
 subfolder when it first arrives.
@@ -1454,3 +1462,60 @@ the session's trace.
   engine resolves the names from sources the app registered with it, so an agent gets a
   session and source names, never an index. Until then, the rule rests on code review
   and on agents being given sessions only.
+
+## 12. Techniques to come, and where they belong
+
+**The rule: the salemdex packages hold only techniques that work for any knowledge base.
+Anything about regulations, Vietnamese or another domain belongs to the app.** Why: the
+packages are meant to be reused, and a domain rule built into one would be wrong for the
+next corpus and couldn't be taken out without breaking the first.
+
+**The framework gives the mechanism, the app the knowledge**, as with the guarantee slots
+(section 6). The framework fixes the stage, its contract and where it runs; the app supplies
+what it means: a parser, a glossary, which field holds the parent section. When a technique
+can't be stated without the domain, its general shape may still be a framework piece.
+
+A test for each new piece: could its docstring and tests use a corpus of recipes or product
+manuals instead? If not, it's the app's.
+
+### Retrieval (`salemdex_retrieval`)
+
+| Technique | Framework piece | The app supplies |
+|---|---|---|
+| Hybrid dense + sparse | a `Sparse` vector on the schema, a sparse embedder protocol, Qdrant sparse vectors (`vector_config.py` already expects them), RRF merge (built) | the model, e.g. bge-m3's lexical weights |
+| Lookup by field | a source that turns the question into a filter on declared fields and fetches with `find` | the parser, e.g. "Điều 12 Nghị định 145" → headings |
+| Normalizing and expanding the question | a query transform taking a function or a glossary | diacritics restoration, abbreviations (NLĐ → người lao động), the domain's terms |
+| Rewrite, multi-query, HyDE, decomposition | query transforms over an LLM protocol | prompts in the domain's language |
+| Generated entries | the resolving source (section 6), an entries schema, a generator protocol | what to generate, the prompts |
+| Small-to-big | expand to the chunks sharing a parent field, or to neighbours by position | which field is the parent (Điều, a recipe's step list) |
+| Following links | expand over a field of ids, with the kinds of link as data | extracting references from text; the kinds (amends, replaces) |
+| Coarse to fine | a step on `Question` producing a scope from a coarse index (section 6, "Several indexes") | what the coarse entries are |
+| Prune | dedupe near-identical text, MMR diversity, cut at a score gap or threshold | the thresholds, set from evaluation |
+| Time scope | nothing new: a filter on date fields, and the validity slot | effective dates, what "in force" means |
+| LLM rerank | a reranker adapter over the LLM protocol | the model |
+| Evaluation | a question-set format; hit@k, MRR, nDCG; statements run side by side; the trail of each passage | the question sets, under `data/` |
+
+### Agents and workflows (the later agents package, section 10)
+
+| Technique | Framework piece | The app supplies |
+|---|---|---|
+| LLM providers | a protocol with local adapters (Ollama), like the embedders | the model |
+| The controller | loops over acyclic statements, budgets (rounds, time), re-checking the final output (section 8) | the budgets |
+| Corrective retrieval (CRAG) | grade → rewrite → retry, or abstain | the grading prompt, thresholds |
+| Checking claims | each claim tied to a passage handle; unsupported claims revised or abstained from | — |
+| Routing | classify the question, pick a statement | the categories and their statements |
+| Conversation | condensing a follow-up question with the history | how many turns |
+| Tools for an agent | tools bound to a session: search, expand, get by field, a document's outline; handles (`p2`) instead of ids (section 11) | which tools, the field names |
+| Browsing structure | an outline as a tree over a path field on chunks; opening a node | the levels (Chương, Điều) |
+| Extraction at ingestion | an LLM step filling a declared schema from a document, checked by the schema | the schema (issuer, number, effective date) |
+| Workflow patterns | prompt chaining, routing, parallel calls, orchestrator-workers, evaluator-optimizer, as small composable pieces | the workflows |
+| Evaluating agents | supported claims, correct citations, abstention, rounds, latency | the labelled cases |
+
+### The app only
+
+- What a domain's documents look like: profiles such as `vn_regulation` (moving, section
+  10), reference syntax, effective dates, what amending means.
+- Language: diacritics restoration, glossaries, abbreviations, prompts.
+- Domain workflows: compliance checks against regulations, the impact of an amendment,
+  comparing regulations.
+- Every threshold and budget, and every question set.
