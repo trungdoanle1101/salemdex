@@ -1,27 +1,57 @@
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+import logging
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI
 
-from kb_server.api import auth, collections, documents, groups, health, keys, users
+from kb_server.api import (
+    auth,
+    collections,
+    documents,
+    groups,
+    health,
+    keys,
+    search,
+    users,
+)
 from kb_server.api.errors import register_error_handlers
+from kb_server.search.statements import BuildStatement
+from kb_server.services.search import SearchService
 from kb_server.settings import Settings
-from kb_server.wiring import Services, build_services, close_services
+from kb_server.wiring import (
+    Services,
+    ToolSetupError,
+    build_search_service,
+    build_services,
+    close_services,
+    open_search_tools,
+)
 
 API_V1 = "/api/v1"
 
+logger = logging.getLogger(__name__)
 
-def create_app(services: Services | None = None) -> FastAPI:
+
+def create_app(
+    services: Services | None = None, *, search_service: SearchService | None = None
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        # Given services (tests): no models are loaded; search works only when a
+        # search service is given too
         if services is not None:
             app.state.services = services
+            app.state.search_service = search_service
             yield
             return
         built = build_services(Settings())
-        app.state.services = built
         try:
-            yield
+            with _open_search_tools_or_log(built) as build_statement:
+                app.state.services = built
+                app.state.search_service = build_search_service(
+                    built, build_statement=build_statement
+                )
+                yield
         finally:
             close_services(built)
 
@@ -36,7 +66,24 @@ def create_app(services: Services | None = None) -> FastAPI:
     app.include_router(groups.router, prefix=API_V1)
     app.include_router(collections.router, prefix=API_V1)
     app.include_router(documents.router, prefix=API_V1)
+    app.include_router(search.router, prefix=API_V1)
     return app
+
+
+@contextmanager
+def _open_search_tools_or_log(services: Services) -> Iterator[BuildStatement]:
+    """Yield `open_search_tools`, logging in one line why it can't be built.
+
+    Raises:
+        ToolSetupError: The search tools can't be built; uvicorn then stops.
+    """
+    try:
+        with open_search_tools(services) as build_statement:
+            yield build_statement
+    except ToolSetupError as error:
+        # Uvicorn prints the traceback after this; the line says what to fix
+        logger.error("The API can't start: %s", error)
+        raise
 
 
 app = create_app()

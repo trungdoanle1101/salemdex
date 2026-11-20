@@ -45,8 +45,9 @@ uv run kb-server serve --reload
 uv run kb-server worker                       # needs KB_MODELS_FOLDER and Qdrant
 ```
 
-A deployment installs `kb-server` for the API and `kb-server[worker]` for the worker: only
-the worker gets torch, the model and the Qdrant client.
+A deployment installs `kb-server[models]` for the API (search embeds questions and reranks)
+and `kb-server[worker]` for the worker. Only `serve` and `worker` load torch, the models and
+the Qdrant client; the other commands never do.
 
 ## Roles
 

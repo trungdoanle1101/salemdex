@@ -1111,6 +1111,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+models = [
+    { name = "salemdex-retrieval", extra = ["huggingface", "qdrant"] },
+]
 worker = [
     { name = "document-processor", extra = ["embedding", "huggingface", "qdrant"] },
     { name = "salemdex-retrieval", extra = ["huggingface", "qdrant"] },
@@ -1119,7 +1122,7 @@ worker = [
 [package.dev-dependencies]
 dev = [
     { name = "boto3-stubs", extra = ["s3"] },
-    { name = "kb-server", extra = ["worker"] },
+    { name = "kb-server", extra = ["models", "worker"] },
     { name = "testcontainers" },
 ]
 
@@ -1131,20 +1134,22 @@ requires-dist = [
     { name = "document-processor", editable = "." },
     { name = "document-processor", extras = ["embedding", "huggingface", "qdrant"], marker = "extra == 'worker'", editable = "." },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "kb-server", extras = ["models"], marker = "extra == 'worker'" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.14.2" },
     { name = "pydantic-settings", specifier = ">=2.16.2" },
     { name = "python-multipart", specifier = ">=0.0.33" },
     { name = "salemdex-retrieval", editable = "packages/retrieval" },
-    { name = "salemdex-retrieval", extras = ["huggingface", "qdrant"], marker = "extra == 'worker'", editable = "packages/retrieval" },
+    { name = "salemdex-retrieval", extras = ["huggingface", "qdrant"], marker = "extra == 'models'", editable = "packages/retrieval" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
-provides-extras = ["worker"]
+provides-extras = ["models", "worker"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.123" },
+    { name = "kb-server", extras = ["models"] },
     { name = "kb-server", extras = ["worker"] },
     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.15.0" },
 ]

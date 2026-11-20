@@ -149,19 +149,32 @@ def build_file_store(settings: Settings) -> FileStore:
 
 
 def build_search_service(
-    session: Session, services: Services, *, build_statement: BuildStatement
+    services: Services, *, build_statement: BuildStatement
 ) -> SearchService:
+    """Return the search service the API holds for its whole life.
+
+    Args:
+        services: What every process builds; its settings, session factory and
+            retrieval engine are used.
+        build_statement: Turns a question into the statement to run, with the models
+            from `open_search_tools`.
+
+    Returns:
+        The service, built once, not per request.
+    """
     return SearchService(
-        users=UserRepository(session),
+        max_limit=services.settings.search_max_limit,
+        session_factory=services.session_factory,
         retrieval_engine=services.retrieval_engine,
         build_statement=build_statement,
     )
 
 
-class WorkerSetupError(Exception):
-    """The worker can't start: a setting is missing or wrong, or Qdrant can't be reached.
+class ToolSetupError(Exception):
+    """The worker's or the API's tools can't be built.
 
-    The message says which step failed, followed by the underlying reason. It names a
+    A setting is missing or wrong, a model can't be loaded, or Qdrant can't be reached
+    or holds a collection that doesn't fit the schema. The message says which step failed, followed by the underlying reason. It names a
     KB_* variable only where this module checks that variable itself, so the name can't
     go stale when a library starts failing for another reason.
     """
@@ -182,20 +195,13 @@ def open_job_tools(services: Services) -> Generator[JobTools, None, None]:
         The profile chooser, the index tools and the file store.
 
     Raises:
-        WorkerSetupError: A setting is missing or wrong, the model can't be loaded, or
+        ToolSetupError: A setting is missing or wrong, the model can't be loaded, or
             Qdrant can't be reached or holds a collection that doesn't fit the schema.
     """
-    # the worker's dependencies are imported here, so other processes never load them
-    from qdrant_client import QdrantClient
-
     settings = services.settings
-    embedder, embedder_identity = _build_embedder(settings)
     profile_chooser = _build_profile_chooser(settings)
-    api_key = settings.qdrant_api_key
-    qdrant_client = QdrantClient(
-        url=settings.qdrant_url,
-        api_key=api_key.get_secret_value() if api_key is not None else None,
-    )
+    embedder, embedder_identity = _build_embedder(settings)
+    qdrant_client = _open_qdrant_client(settings)
     try:
         index = _open_index(settings, client=qdrant_client)
         yield JobTools(
@@ -217,15 +223,24 @@ def open_job_tools(services: Services) -> Generator[JobTools, None, None]:
 
 @contextmanager
 def open_search_tools(services: Services) -> Generator[DenseThenRerank, None, None]:
-    from qdrant_client import QdrantClient
+    """Yield the API's search statement, closing the Qdrant client however it stops.
 
+    Built in this order: the embedder, the index of `KbChunks`, then the reranker. The
+    source returns `KB_RERANK_DEPTH` candidates, all of which the reranker reads.
+
+    Args:
+        services: What every process builds; only its settings are used.
+
+    Yields:
+        The statement builder: dense retrieval, then reranking.
+
+    Raises:
+        ToolSetupError: A setting is missing or wrong, a model can't be loaded, or
+            Qdrant can't be reached or holds a collection that doesn't fit the schema.
+    """
     settings = services.settings
     embedder, _ = _build_embedder(settings)
-    api_key = settings.qdrant_api_key
-    qdrant_client = QdrantClient(
-        url=settings.qdrant_url,
-        api_key=api_key.get_secret_value() if api_key is not None else None,
-    )
+    qdrant_client = _open_qdrant_client(settings)
     try:
         index = _open_index(settings, client=qdrant_client)
         yield DenseThenRerank(
@@ -241,6 +256,19 @@ def open_search_tools(services: Services) -> Generator[DenseThenRerank, None, No
         qdrant_client.close()
 
 
+def _open_qdrant_client(settings: Settings) -> "QdrantClient":
+    """Return a client for `KB_QDRANT_URL`; it connects only when first used."""
+    # Imported here, like the models: the commands that never search or index don't
+    # install it, and importing it at the top would load it in every process
+    from qdrant_client import QdrantClient
+
+    api_key = settings.qdrant_api_key
+    return QdrantClient(
+        url=settings.qdrant_url,
+        api_key=api_key.get_secret_value() if api_key is not None else None,
+    )
+
+
 def _build_embedder(settings: Settings) -> tuple[DenseEmbedder, str]:
     """Return the embedder loaded from `KB_MODELS_FOLDER`, and its identity.
 
@@ -248,7 +276,7 @@ def _build_embedder(settings: Settings) -> tuple[DenseEmbedder, str]:
     name itself; the index job records it in each version's provenance.
 
     Raises:
-        WorkerSetupError: The folder isn't set, the spec is unknown, the model isn't
+        ToolSetupError: The folder isn't set, the spec is unknown, the model isn't
             in the folder, or it can't be loaded.
     """
     from document_processor.integrations.huggingface.model_specs import (
@@ -270,7 +298,7 @@ def _build_embedder(settings: Settings) -> tuple[DenseEmbedder, str]:
             batch_size=settings.embedder_batch_size,
         )
     except (ModelLoadError, ValueError) as error:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"can't load {settings.embedder_spec} from {folder}: {error}"
         ) from error
     return embedder, identity
@@ -280,7 +308,7 @@ def _build_reranker(settings: Settings) -> Reranker:
     """Return the reranker loaded from `KB_MODELS_FOLDER`.
 
     Raises:
-        WorkerSetupError: The folder isn't set, the spec is unknown, the model isn't
+        ToolSetupError: The folder isn't set, the spec is unknown, the model isn't
             in the folder, or it can't be loaded.
     """
     from document_processor.integrations.huggingface.model_specs import (
@@ -301,7 +329,7 @@ def _build_reranker(settings: Settings) -> Reranker:
             batch_size=settings.reranker_batch_size,
         )
     except (ModelLoadError, ValueError) as error:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"can't load {settings.reranker_spec} from {folder}: {error}"
         ) from error
 
@@ -319,24 +347,24 @@ def _find_model[S: _ModelSpec](
     """Return the spec named `spec_name`, and its model's folder in `models_folder`.
 
     Raises:
-        WorkerSetupError: `models_folder` isn't set, the spec is unknown, or the model
+        ToolSetupError: `models_folder` isn't set, the spec is unknown, or the model
             isn't in the folder.
     """
     from document_processor.integrations.huggingface.download import model_folder
 
     if models_folder is None:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             "KB_MODELS_FOLDER is not set: it names the folder holding all models"
         )
     try:
         spec = specs.get(spec_name)
     except KeyError as error:
-        raise WorkerSetupError(f"can't find the model: {error.args[0]}") from error
+        raise ToolSetupError(f"can't find the model: {error.args[0]}") from error
     folder = model_folder(spec.reference, models_folder=models_folder)
     # Checked here: given a path that isn't a folder, sentence-transformers would take
     # it for a hub id and fail confusingly, or try to download it
     if not folder.is_dir():
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"{spec_name!r} isn't in KB_MODELS_FOLDER: {folder} is not a folder"
         )
     return spec, folder
@@ -346,14 +374,14 @@ def _build_profile_chooser(settings: Settings) -> ProfileChooser:
     """Return the chooser, its chunks sized in words (`KB_CHUNK_WORDS`).
 
     Raises:
-        WorkerSetupError: The chunk size is refused, or a profile is unknown.
+        ToolSetupError: The chunk size is refused, or a profile is unknown.
     """
     try:
         chunker = OutlineChunker(
             tokenizer=WordTokenizer(), max_tokens=settings.chunk_words
         )
     except ValueError as error:
-        raise WorkerSetupError(f"can't build the chunker: {error}") from error
+        raise ToolSetupError(f"can't build the chunker: {error}") from error
     try:
         return ProfileChooser.from_profiles(
             profiles=settings.profiles,
@@ -361,7 +389,7 @@ def _build_profile_chooser(settings: Settings) -> ProfileChooser:
             chunker=chunker,
         )
     except KeyError as error:
-        raise WorkerSetupError(f"can't set up the profiles: {error.args[0]}") from error
+        raise ToolSetupError(f"can't set up the profiles: {error.args[0]}") from error
 
 
 def _open_index(settings: Settings, *, client: "QdrantClient") -> Index:
@@ -371,7 +399,7 @@ def _open_index(settings: Settings, *, client: "QdrantClient") -> Index:
     and the fields its points were written with.
 
     Raises:
-        WorkerSetupError: Qdrant can't be reached or refuses the request, or the
+        ToolSetupError: Qdrant can't be reached or refuses the request, or the
             collection doesn't fit the schema (e.g. written by the old index code).
     """
     from qdrant_client.http.exceptions import (
@@ -389,14 +417,14 @@ def _open_index(settings: Settings, *, client: "QdrantClient") -> Index:
         )
     # a connection failure: the URL is the only input to connecting
     except ResponseHandlingException as error:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"can't reach Qdrant at {settings.qdrant_url} (KB_QDRANT_URL). Is it running?"
         ) from error
     except UnexpectedResponse as error:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"Qdrant at {settings.qdrant_url} refused the request: {error}"
         ) from error
     except SchemaMismatchError as error:
-        raise WorkerSetupError(
+        raise ToolSetupError(
             f"can't open the Qdrant collection {settings.qdrant_collection}: {error}"
         ) from error

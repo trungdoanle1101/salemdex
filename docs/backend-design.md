@@ -17,7 +17,8 @@ tests/                      the framework's tests
 apps/
   server/                   package kb-server → document_processor (workspace), FastAPI, SQLAlchemy,
                             Alembic, psycopg, pydantic-settings, argon2-cffi, boto3;
-                            extra [worker] → torch, sentence-transformers, qdrant-client
+                            extra [models] → torch, sentence-transformers, qdrant-client (search);
+                            extra [worker] → [models] + the framework's preparation
   cli/                      package kb-cli → httpx, Typer only (no server or framework imports)
 docker/docker-compose.yml   postgres, qdrant (built); minio later
 data/                       git-ignored: restricted documents and question sets, never committed
@@ -32,12 +33,15 @@ apps/server/
   migrations/               env.py (URL from Settings, target_metadata = Base.metadata), versions/
   src/kb_server/
     settings.py             Settings (pydantic-settings, env prefix KB_, .env next to where it runs)
-    wiring.py               Services: builds everything the API needs; open_job_tools, the worker's
-                            tools (built)
-    app.py                  create_app(services) → FastAPI
+    wiring.py               Services: builds what every process needs; open_job_tools, the worker's
+                            tools; open_search_tools and build_search_service, the API's (built)
+    app.py                  create_app(services, search_service) → FastAPI; the lifespan loads the
+                            search models once (built)
     manage.py               kb-server create-admin | serve | worker (built); migrate | reprepare | gc
     api/                    routers + request/response schemas; HTTP only
     services/               use cases and permission checks; no HTTP, no SQL
+    search/                 the search statement (DenseThenRerank) and the validity adapter
+                            (ServedVersionsOnly), plugged into salemdex_retrieval (built)
     domain/                 frozen dataclasses and errors: User, Principal, Document, StoredFile, …;
                             chunks.py: the index schema (Guarded, KbChunks), read by the worker and search
     storage/                SQL and files only
@@ -52,13 +56,18 @@ apps/server/
 
 ### Layering
 
-- `api` → `services` → `domain` and `storage`; `indexing` → `storage` and the framework. Nothing
-  imports upward. Why: each layer can be tested without the ones above it.
+- `api` → `services` → `domain` and `storage`; `services` → `search` → `storage` and
+  salemdex_retrieval; `indexing` → `storage` and the framework. Nothing imports upward. Why: each layer can be tested without the ones above it.
 - Routers convert `XIn` → arguments, call one service method, convert the result → `XOut`.
 - Services check permissions and raise domain errors. Repositories only report (`None`, `bool`,
   counts); they never raise for "not found". Why: one place decides what's an error and which one.
 - Repositories take a `Session` and return domain dataclasses, never rows.
-- One transaction per request: commit on return, roll back on raise.
+- One transaction per request: commit on return, roll back on raise. Two exceptions, so that no
+  connection is held while a model runs: authentication (`get_principal`) commits in its own
+  short transaction before the route runs, and `SearchService` lives for the whole app and
+  opens a short transaction for each read (the asker's groups, validity at each gate, the
+  titles). Why: a request holding one connection while waiting for another can exhaust the
+  pool (hold-and-wait), and a search spends seconds in the models.
 - Job handlers never touch the database: they return a result, and the worker records it. Why:
   handlers can be tested with only a file store.
 
@@ -91,16 +100,19 @@ built,     KB_PROFILES (candidates, most specific first)  KB_FALLBACK_PROFILE (p
 worker     KB_CHUNK_WORDS  KB_MODELS_FOLDER  KB_EMBEDDER_SPEC  KB_EMBEDDER_DEVICE
            KB_EMBEDDER_BATCH_SIZE  KB_QDRANT_URL  KB_QDRANT_COLLECTION  KB_QDRANT_API_KEY
            KB_WORKER_POLL_SECONDS  KB_JOB_MAX_ATTEMPTS  KB_JOB_TIMEOUT_MINUTES
+built,     KB_MODELS_FOLDER  KB_EMBEDDER_*  KB_QDRANT_* (as above)  KB_RERANKER_SPEC
+search     KB_RERANKER_DEVICE  KB_RERANKER_BATCH_SIZE  KB_RERANK_DEPTH  KB_SEARCH_MAX_LIMIT
+           (≤ KB_RERANK_DEPTH, checked when Settings load)
 later      KB_S3_ENDPOINT  KB_S3_BUCKET  KB_S3_ACCESS_KEY  KB_S3_SECRET_KEY
            KB_OLLAMA_URL  KB_CHAT_MODEL  KB_CHAT_CONTEXT_SIZE  KB_CHAT_TIMEOUT
-           KB_RERANKER_SPEC  KB_RERANKER_DEVICE  KB_RERANK_DEPTH
            KB_ANSWER_PASSAGES  KB_MIN_SCORE  KB_MIN_PASSAGE_SCORE  KB_SECTION_CHARS  KB_HISTORY_TURNS
 ```
 
 `.env` holds the database password: it is git-ignored and never committed.
 
-- Worker-only settings have defaults or are unset, so the API and `create-admin` start
-  without them; the worker checks the ones it needs when it builds its tools.
+- Model and Qdrant settings have defaults or are unset, so `create-admin` and the other
+  commands start without them; `serve` and the worker check the ones they need when they
+  build their tools.
 - Tuple settings are JSON in the environment: `KB_PROFILES=["vn_regulation"]`.
 - `KB_MODELS_FOLDER` holds every model, each at `<hub id>/<commit hash>` (e.g.
   `BAAI/bge-m3/5617a9f…`), found from its spec by the framework's `model_folder`. Why: one
@@ -365,9 +377,11 @@ index. These rules make a crash at any point harmless:
 - W3: retries up to `KB_JOB_MAX_ATTEMPTS`; `PermanentJobError` fails a job at once.
 - W4: one worker; a job `running` longer than `KB_JOB_TIMEOUT_MINUTES` is requeued at startup
   (a lease that expired).
-- W5: models and the Qdrant client load only in the worker. They're installed by the
-  `kb-server[worker]` extra and imported inside `open_job_tools`, so `serve` and the other
-  commands never load them; a test checks it in a fresh interpreter.
+- W5: models and the Qdrant client load only in the processes that use them: the worker
+  (`open_job_tools`) and `serve` (`open_search_tools`, in the app's lifespan, for search).
+  They're installed by the `kb-server[models]` extra (`[worker]` includes it) and imported
+  inside those functions, so importing the app and the other commands never load them; a test
+  checks it in a fresh interpreter.
 - W6: a superseded job (its version isn't current, or the document is `deleting`) is marked done
   without doing anything. A job with no version (`sync_attributes`) applies to the whole
   document and is never superseded by a new version.
@@ -423,7 +437,7 @@ kb-server worker   logging (KB_LOG_LEVEL) → open_job_tools → recover_stuck_j
   worker would otherwise be retried forever (a poison message).
 - A database error ends `run_forever`, and the process exits. Restarting it (Compose or
   systemd) runs the sweep, which recovers the job it was running.
-- Startup errors exit with one line, not a traceback (`WorkerSetupError`): the step that
+- Startup errors exit with one line, not a traceback (`ToolSetupError`): the step that
   failed, then the underlying reason. A message names a `KB_*` variable only where the wiring
   checks that variable itself, so it can't go stale when a library fails for another reason.
 - The Qdrant payload indexes come from the schema: `QdrantIndex.open` creates one for each
@@ -660,7 +674,8 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | Search filters inside the index | Post-filtering loses results and leaks hidden hits |
 | Provenance holds inputs and decisions, not results | Results can be rebuilt; settings can't |
 | One worker | No races between jobs; follow-up jobs run in order |
-| Worker dependencies imported inside `open_job_tools` | A top-level import loads torch in `serve` |
+| Model dependencies imported inside `open_job_tools` and `open_search_tools` | A top-level import loads torch in every command |
+| `SearchService` lives for the app and reads in short transactions | A request holding a connection through the models can exhaust the pool |
 | Models found by reference under one `KB_MODELS_FOLDER` | A folder setting per model drifts from its spec |
 | The claim commits before the handler runs | A rolled-back claim is retried forever and never counts its attempts |
 | A job with no version is never superseded by a new version | It applies to the whole document, not to one version |

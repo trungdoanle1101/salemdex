@@ -9,7 +9,7 @@ import pytest
 
 from kb_server.domain.chunks import KbChunks
 from kb_server.settings import Settings
-from kb_server.wiring import WorkerSetupError, _build_embedder, _build_reranker
+from kb_server.wiring import ToolSetupError, _build_embedder, _build_reranker
 
 
 def test_the_fields_every_search_and_delete_filter_by_are_indexed() -> None:
@@ -73,7 +73,7 @@ BUILDERS = pytest.mark.parametrize(
 def test_a_model_without_a_models_folder_is_refused(
     build: Callable[[Settings], object], spec_setting: str
 ) -> None:
-    with pytest.raises(WorkerSetupError, match="KB_MODELS_FOLDER is not set"):
+    with pytest.raises(ToolSetupError, match="KB_MODELS_FOLDER is not set"):
         build(model_settings(models_folder=None))
 
 
@@ -83,7 +83,7 @@ def test_an_unknown_model_spec_is_refused_listing_the_known_ones(
 ) -> None:
     settings = model_settings(models_folder=tmp_path, **{spec_setting: "no-such-model"})
 
-    with pytest.raises(WorkerSetupError, match="'no-such-model'; known: "):
+    with pytest.raises(ToolSetupError, match="'no-such-model'; known: "):
         build(settings)
 
 
@@ -94,7 +94,7 @@ def test_a_model_missing_from_the_models_folder_is_refused_naming_its_folder(
     settings = model_settings(models_folder=tmp_path)
     spec_name = getattr(settings, spec_setting)
 
-    with pytest.raises(WorkerSetupError) as refused:
+    with pytest.raises(ToolSetupError) as refused:
         build(settings)
 
     message = str(refused.value)

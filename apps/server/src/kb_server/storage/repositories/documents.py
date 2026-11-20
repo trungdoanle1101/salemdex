@@ -3,7 +3,15 @@ from collections.abc import Iterable, Mapping
 from collections.abc import Set as AbstractSet
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, and_, delete, insert, select, update
+from sqlalchemy import (
+    ColumnElement,
+    CursorResult,
+    and_,
+    delete,
+    insert,
+    select,
+    update,
+)
 from sqlalchemy.orm import Session
 
 from kb_server.domain.documents import Document, DocumentStatus, DocumentVersion
@@ -202,12 +210,33 @@ class DocumentRepository:
 
         rows = self._session.execute(
             select(DocumentRow.id, DocumentRow.indexed_version).where(
-                DocumentRow.status == "active",
-                DocumentRow.indexed_version.is_not(None),
-                DocumentRow.id.in_(document_ids),
+                *_served(document_ids)
             )
         )
         return {row.id: row.indexed_version for row in rows}
+
+    def served_titles(
+        self, document_ids: AbstractSet[uuid.UUID]
+    ) -> dict[uuid.UUID, str]:
+        """Return the title of each of these documents that search may show.
+
+        One query, whatever the number of ids: search reads every passage's title at
+        once, from the database, so a rename never touches the index.
+
+        Args:
+            document_ids: The documents of the passages being shown.
+
+        Returns:
+            The title by document id, for the same documents as `served_versions`:
+            active ones that have an indexed version.
+        """
+        if not document_ids:
+            return {}
+
+        rows = self._session.execute(
+            select(DocumentRow.id, DocumentRow.title).where(*_served(document_ids))
+        )
+        return {row.id: row.title for row in rows}
 
 
 def to_document(row: DocumentRow) -> Document:
@@ -233,4 +262,16 @@ def to_document_version(row: DocumentVersionRow) -> DocumentVersion:
         provenance=row.provenance,
         uploaded_by=row.uploaded_by,
         created_at=row.created_at,
+    )
+
+
+def _served(
+    document_ids: AbstractSet[uuid.UUID],
+) -> tuple[ColumnElement[bool], ...]:
+    """Return the conditions for the documents among these that search may show."""
+    # One definition for every query of what search serves, so they can't drift apart
+    return (
+        DocumentRow.status == "active",
+        DocumentRow.indexed_version.is_not(None),
+        DocumentRow.id.in_(document_ids),
     )

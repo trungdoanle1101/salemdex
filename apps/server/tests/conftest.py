@@ -5,6 +5,7 @@ rolled back afterwards, so tests never see each other's rows.
 """
 
 import os
+import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,13 +19,18 @@ from sqlalchemy import Connection, Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from kb_server.app import create_app
+from kb_server.domain.chunks import KbChunks
+from kb_server.domain.collections import Collection
+from kb_server.domain.documents import Document
 from kb_server.domain.users import User, UserRole
+from kb_server.search.statements import DenseThenRerank
 from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
 from kb_server.services.documents import DocumentService
 from kb_server.services.groups import GroupService
 from kb_server.services.passwords import Passwords
+from kb_server.services.search import SearchService
 from kb_server.services.users import UserService
 from kb_server.settings import Settings
 from kb_server.storage.files import FileStore, LocalFileStore
@@ -35,9 +41,20 @@ from kb_server.storage.repositories.files import StoredFileRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
-from kb_server.wiring import Services
+from kb_server.wiring import Services, build_search_service
 from salemdex_retrieval import Engine as SalemdexEngine
-from tests.support import MAX_UPLOAD_MB, PASSWORD, FakeClock
+from salemdex_retrieval import Source
+from salemdex_retrieval.embedders import embed_chunks
+from salemdex_retrieval.index.in_memory import InMemoryIndex
+from salemdex_retrieval.rerankers.fake import FakeReranker
+from tests.support import (
+    MAX_UPLOAD_MB,
+    PASSWORD,
+    SEARCH_BINDING,
+    FakeClock,
+    add_stored_file,
+    answering_chunk,
+)
 
 SERVER_DIR = Path(__file__).parents[1]
 
@@ -254,3 +271,62 @@ def services(
 def client(services: Services) -> Iterator[TestClient]:
     with TestClient(create_app(services)) as client:
         yield client
+
+
+@pytest.fixture
+def search_index() -> InMemoryIndex:
+    return InMemoryIndex(schema=KbChunks)
+
+
+@pytest.fixture
+def search_service(services: Services, search_index: InMemoryIndex) -> SearchService:
+    """The search service, on the in-memory index with the fake models."""
+    source = Source(name="dense", index=search_index, binding=SEARCH_BINDING, depth=10)
+    return build_search_service(
+        services,
+        build_statement=DenseThenRerank(source=source, reranker=FakeReranker()),
+    )
+
+
+@pytest.fixture
+def publish(
+    session: Session,
+    documents: DocumentRepository,
+    search_index: InMemoryIndex,
+    make_user: Callable[..., User],
+) -> Callable[..., Document]:
+    """publish(collection, group_ids=[…], versions=(1,), …) -> an active, indexed document.
+
+    Each version gets one chunk answering QUESTION; version 1 is the one served.
+    """
+    publisher = make_user("publisher@example.com")
+
+    def run(
+        collection: Collection,
+        *,
+        group_ids: tuple[uuid.UUID, ...] = (),
+        versions: tuple[int, ...] = (1,),
+        title: str = "Quy chế nhân sự",
+        headings: tuple[str, ...] = (),
+    ) -> Document:
+        document, _ = documents.add(
+            collection_id=collection.id,
+            title=title,
+            status="active",
+            group_ids=group_ids,
+            file_id=add_stored_file(session),
+            original_filename="quy-che.txt",
+            created_by=publisher.id,
+        )
+        chunks = [
+            answering_chunk(
+                document, version=version, group_ids=group_ids, headings=headings
+            )
+            for version in versions
+        ]
+        search_index.put(embed_chunks(chunks, bindings=[SEARCH_BINDING]))
+        documents.set_indexed_version(document.id, 1)
+        session.flush()
+        return document
+
+    return run

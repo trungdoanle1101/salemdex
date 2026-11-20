@@ -23,10 +23,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# what kb-server worker needs: the embedding model and Qdrant (W5: serve doesn't)
-worker = [
-    "document-processor[embedding,huggingface,qdrant]",
+# what serve needs to search: the embedder, the reranker and Qdrant
+models = [
     "salemdex-retrieval[huggingface,qdrant]",
+]
+# what the worker adds: preparing documents and pinning models with the framework
+worker = [
+    "kb-server[models]",
+    "document-processor[embedding,huggingface,qdrant]",
 ]
 
 [project.scripts]
@@ -45,5 +49,6 @@ dev = [
     "boto3-stubs[s3]>=1.43.123",
     # a dev setup runs and type-checks the worker too
     "kb-server[worker]",
+    "kb-server[models]",
     "testcontainers[postgres]>=4.15.0",
 ]

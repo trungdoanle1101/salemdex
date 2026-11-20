@@ -501,6 +501,20 @@ def test_a_front_end_reads_as_the_user_it_acts_for(
         document_service.get_document(as_outsider, document_id)
 
 
+def test_a_front_end_acting_for_an_admin_reads_only_what_the_admins_groups_allow(
+    upload: Callable[..., DocumentDetails],
+    document_service: DocumentService,
+    auth: AuthService,
+    make_user: Callable[..., User],
+    admin: Principal,
+) -> None:
+    document_id = upload(private=True).document.id
+    acting = front_end_acting_for(auth, make_user, admin, "admin@example.com")
+
+    with pytest.raises(DocumentNotFound):
+        document_service.get_document(acting, document_id)
+
+
 def test_an_unknown_document_is_not_found(
     document_service: DocumentService, admin: Principal
 ) -> None:

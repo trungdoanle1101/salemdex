@@ -3,6 +3,8 @@ import uuid
 import pytest
 
 from kb_server.domain.errors import EmailTaken
+from kb_server.storage.repositories.collections import CollectionRepository
+from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.users import UserRepository
 
 
@@ -64,3 +66,39 @@ def test_get_credentials_by_email_returns_the_password_hash(
     assert user.email == "an@example.com"
     assert password_hash == "hash"
     assert users.get_credentials_by_email("binh@example.com") is None
+
+
+def test_list_group_ids_gives_only_the_users_own_groups(
+    users: UserRepository, groups: GroupRepository
+) -> None:
+    an = users.add(
+        email="an@example.com", display_name="An", role="reader", password_hash="h"
+    )
+    binh = users.add(
+        email="binh@example.com", display_name="Binh", role="reader", password_hash="h"
+    )
+    hr, it = groups.add("hr"), groups.add("it")
+    groups.add_member(user_id=an.id, group_id=hr.id)
+    groups.add_member(user_id=an.id, group_id=it.id)
+    groups.add_member(user_id=binh.id, group_id=it.id)
+
+    assert users.list_group_ids(an.id) == {hr.id, it.id}
+    assert users.list_group_ids(uuid.uuid4()) == set()
+
+
+def test_list_managed_collection_ids_gives_only_the_users_own_collections(
+    users: UserRepository, collections: CollectionRepository
+) -> None:
+    an = users.add(
+        email="an@example.com", display_name="An", role="manager", password_hash="h"
+    )
+    binh = users.add(
+        email="binh@example.com", display_name="Binh", role="manager", password_hash="h"
+    )
+    hr_docs = collections.add(slug="hr-docs", title="HR", description="")
+    it_docs = collections.add(slug="it-docs", title="IT", description="")
+    collections.add_manager(collection_id=hr_docs.id, user_id=an.id)
+    collections.add_manager(collection_id=it_docs.id, user_id=binh.id)
+
+    assert users.list_managed_collection_ids(an.id) == {hr_docs.id}
+    assert users.list_managed_collection_ids(uuid.uuid4()) == set()

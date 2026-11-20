@@ -18,7 +18,7 @@ from kb_server.settings import Settings
 from kb_server.storage.files import check_store_writable
 from kb_server.wiring import (
     Services,
-    WorkerSetupError,
+    ToolSetupError,
     build_services,
     build_user_service,
     build_worker,
@@ -125,7 +125,7 @@ def run_worker(services: Services) -> None:
             worker = build_worker(services, job_tools=job_tools)
             worker.recover_stuck_jobs()
             worker.run_forever(stop=stop_on_signals())
-    except WorkerSetupError as error:
+    except ToolSetupError as error:
         sys.exit(f"The worker can't start: {error}")
     except OperationalError:
         url = services.sql_engine.url.render_as_string(hide_password=True)

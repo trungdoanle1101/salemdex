@@ -12,6 +12,7 @@ from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
 from kb_server.services.documents import DocumentService
 from kb_server.services.groups import GroupService
+from kb_server.services.search import SearchService
 from kb_server.services.users import UserService
 from kb_server.wiring import (
     Services,
@@ -28,6 +29,13 @@ def get_services(request: Request) -> Services:
 
 
 ServicesDep = Annotated[Services, Depends(get_services)]
+
+
+def get_search_service(request: Request) -> SearchService:
+    return cast(SearchService, request.app.state.search_service)
+
+
+SearchServiceDep = Annotated[SearchService, Depends(get_search_service)]
 
 
 def get_session(services: ServicesDep) -> Iterator[Session]:
@@ -77,18 +85,19 @@ bearer = HTTPBearer(auto_error=False)
 
 def get_principal(
     request: Request,
-    auth: AuthServiceDep,
     services: ServicesDep,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
 ) -> Principal:
     if credentials is None:
         raise NotAuthenticated()
-    principal = auth.resolve(
-        credentials.credentials,
-        acting_for=_acting_for(request, services.settings.act_for_headers),
-    )
-    if principal is None:
-        raise NotAuthenticated()
+    with services.session_factory.begin() as session:
+        auth = build_auth_service(session, services)
+        principal = auth.resolve(
+            credentials.credentials,
+            acting_for=_acting_for(request, services.settings.act_for_headers),
+        )
+        if principal is None:
+            raise NotAuthenticated()
     return principal
 
 

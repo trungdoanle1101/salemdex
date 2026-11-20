@@ -620,6 +620,44 @@ def test_served_versions_of_no_documents_asks_nothing(
     assert statements == []
 
 
+def test_served_titles_gives_each_active_indexed_documents_title(
+    documents: DocumentRepository, add_document: Callable[..., Document]
+) -> None:
+    first = add_document(content=b"Dieu 1", title="Quy chế nhân sự")
+    second = add_document(content=b"Dieu 2", title="Quy chế tài chính")
+    documents.set_indexed_version(first.id, 1)
+    documents.set_indexed_version(second.id, 2)
+
+    assert documents.served_titles({first.id, second.id}) == {
+        first.id: "Quy chế nhân sự",
+        second.id: "Quy chế tài chính",
+    }
+
+
+@pytest.mark.parametrize("status", ["draft", "deleting"])
+def test_served_titles_leaves_out_the_documents_served_versions_leaves_out(
+    documents: DocumentRepository,
+    add_document: Callable[..., Document],
+    status: DocumentStatus,
+) -> None:
+    not_active = add_document(content=b"Dieu 1", status=status)
+    documents.set_indexed_version(not_active.id, 1)
+    never_indexed = add_document(content=b"Dieu 2")
+    ids = {not_active.id, never_indexed.id, uuid.uuid4()}
+
+    assert documents.served_titles(ids) == {}
+    assert documents.served_versions(ids) == {}
+
+
+def test_served_titles_of_no_documents_asks_nothing(
+    session: Session, documents: DocumentRepository
+) -> None:
+    with recorded_statements(session) as statements:
+        assert documents.served_titles(set()) == {}
+
+    assert statements == []
+
+
 @contextmanager
 def recorded_statements(session: Session) -> Iterator[list[str]]:
     """The SQL statements the session sends while the block runs."""

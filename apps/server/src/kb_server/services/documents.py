@@ -175,12 +175,11 @@ class DocumentService:
             )
 
     def _can_read(self, principal: Principal, document: Document) -> bool:
-        role = principal.user.role
         if principal.is_admin:
             return True
 
         if (
-            role == "manager"
+            principal.user.role == "manager"
             and principal.user.id
             in self._collections.list_manager_ids(document.collection_id)
         ):
