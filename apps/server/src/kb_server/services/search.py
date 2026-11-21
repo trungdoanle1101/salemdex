@@ -8,12 +8,12 @@ from kb_server.domain.chunks import Guarded, KbChunks
 from kb_server.domain.credentials import Principal
 from kb_server.domain.errors import InvalidRequest
 from kb_server.domain.search import DocumentSearched, Passage
-from kb_server.search.statements import BuildStatement
 from kb_server.services.access import read_access
 from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.users import UserRepository
-from salemdex_retrieval import Engine, Everything, or_
+from salemdex_retrieval import Everything, or_
 from salemdex_retrieval.engine import Passage as FoundPassage
+from salemdex_retrieval.engine import PreparedStatement
 from salemdex_retrieval.filters import Filter
 
 
@@ -30,8 +30,7 @@ class SearchService:
         *,
         max_limit: int,
         session_factory: sessionmaker[Session],
-        retrieval_engine: Engine,
-        build_statement: BuildStatement,
+        prepared_statement: PreparedStatement,
     ) -> None:
         """Build the service.
 
@@ -39,13 +38,13 @@ class SearchService:
             max_limit: The most passages one search may ask for (`KB_SEARCH_MAX_LIMIT`).
             session_factory: Opens the short transactions for the asker's groups and
                 the titles.
-            retrieval_engine: Runs statements, with the validity check at every gate.
-            build_statement: Turns a question into the statement to run.
+            prepared_statement: The statement every search runs, given the question,
+                the limit and the asker's access filter; it checks validity at
+                every gate.
         """
         self._max_limit = max_limit
         self._session_factory = session_factory
-        self._retrieval_engine = retrieval_engine
-        self._build_statement = build_statement
+        self._prepared_statement = prepared_statement
 
     def search(
         self, principal: Principal, question: str, *, limit: int | None = None
@@ -69,10 +68,10 @@ class SearchService:
         if limit > self._max_limit:
             raise InvalidRequest(f"limit can be at most {self._max_limit}")
 
-        retrieval = self._retrieval_engine.session(
-            access=self._read_access_filter(principal)
+        access_filter = self._read_access_filter(principal)
+        found = self._prepared_statement.execute(
+            question=question, limit=limit, where=access_filter
         )
-        found = retrieval.execute(self._build_statement(question, limit=limit))
         titles = self._read_titles({_document_id(passage) for passage in found})
         # A document deleted or deactivated since the last gate has no title: dropped
         return [

@@ -173,7 +173,7 @@ the whole product.
 | Lever | Fixed: the guarantees | Configurable: quality and cost | Default |
 |---|---|---|---|
 | facts | structural facts derived by rules, always; only the source's words shown as evidence | model-extracted facts through a port, stored as generated entries | rules only |
-| retrieval | the access filter on every source; the validity gates | the statement: sources, fusion, rerank, one pass or several; what enters the context: passages, sections or whole documents | dense and rerank, passages |
+| retrieval | a filter on every run, inside every source (the app's access); the validity gates; statements checked once, when prepared | the statement: sources, fusion, rerank, one pass or several; what enters the context: passages, sections or whole documents | dense and rerank, passages |
 | reasoning | the answer cites only passages it received; abstaining is always possible; claims checked against the evidence | the model, context size, tools, the agent loop | one model, one pass |
 
 What it asks of each package:

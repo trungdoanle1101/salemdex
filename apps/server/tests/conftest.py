@@ -23,7 +23,6 @@ from kb_server.domain.chunks import KbChunks
 from kb_server.domain.collections import Collection
 from kb_server.domain.documents import Document
 from kb_server.domain.users import User, UserRole
-from kb_server.search.statements import DenseThenRerank
 from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
@@ -42,11 +41,8 @@ from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
 from kb_server.wiring import Services, build_search_service
-from salemdex_retrieval import Engine as SalemdexEngine
-from salemdex_retrieval import Source
 from salemdex_retrieval.embedders import embed_chunks
 from salemdex_retrieval.index.in_memory import InMemoryIndex
-from salemdex_retrieval.rerankers.fake import FakeReranker
 from tests.support import (
     MAX_UPLOAD_MB,
     PASSWORD,
@@ -54,6 +50,7 @@ from tests.support import (
     FakeClock,
     add_stored_file,
     answering_chunk,
+    prepare_search,
 )
 
 SERVER_DIR = Path(__file__).parents[1]
@@ -261,7 +258,6 @@ def services(
             max_upload_mb=MAX_UPLOAD_MB,
         ),
         sql_engine=engine,
-        retrieval_engine=SalemdexEngine(validity=ServedVersionsOnly(session_factory)),
         files=file_store,
         session_factory=session_factory,
         passwords=passwords,
@@ -283,10 +279,11 @@ def search_index() -> InMemoryIndex:
 @pytest.fixture
 def search_service(services: Services, search_index: InMemoryIndex) -> SearchService:
     """The search service, on the in-memory index with the fake models."""
-    source = Source(name="dense", index=search_index, binding=SEARCH_BINDING, depth=10)
     return build_search_service(
         services,
-        build_statement=DenseThenRerank(source=source, reranker=FakeReranker()),
+        prepared_statement=prepare_search(
+            search_index, validity=ServedVersionsOnly(services.session_factory)
+        ),
     )
 
 

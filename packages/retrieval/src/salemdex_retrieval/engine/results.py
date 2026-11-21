@@ -1,9 +1,9 @@
 """What a search produces: passages, each with the trail of how it was ranked.
 
-While a statement runs, the executor moves candidates from stage to stage, and each
+While a statement runs, the engine moves candidates from stage to stage, and each
 stage that ranks a candidate adds an entry to its trail, never changing an earlier
-one. A candidate that passes the final gate becomes a passage, which `execute`
-returns.
+one. A candidate that passes the final gate becomes a passage, which
+`PreparedStatement.execute` returns.
 
 A trail holds source names, ranks and scores, never text, so it can always be logged,
 and it answers "why is this passage here?" stage by stage.
@@ -29,7 +29,7 @@ type Trail = tuple[TrailEntry, ...]
 class Passage:
     """A chunk a search returns, with the trail of how it was ranked.
 
-    Only the executor builds passages, from the candidates that passed the final
+    Only the engine builds passages, from the candidates that passed the final
     gate. Python can't stop other code from building one, but a passage built
     elsewhere has skipped that gate.
 
@@ -79,7 +79,7 @@ class Passage:
 class Candidate:
     """A chunk being ranked while a statement runs, with its trail so far.
 
-    Each stage that ranks it adds an entry with `followed_by`; the executor turns the
+    Each stage that ranks it adds an entry with `followed_by`; the engine turns the
     candidates that pass the final gate into passages with `Passage.from_candidate`.
 
     Attributes:

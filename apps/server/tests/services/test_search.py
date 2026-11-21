@@ -13,7 +13,6 @@ from kb_server.domain.documents import Document
 from kb_server.domain.errors import InvalidRequest
 from kb_server.domain.groups import Group
 from kb_server.domain.users import User, UserRole
-from kb_server.search.statements import DenseThenRerank
 from kb_server.services.auth import AuthService
 from kb_server.services.search import SearchService
 from kb_server.storage.models import DocumentRow
@@ -21,11 +20,9 @@ from kb_server.storage.repositories.collections import CollectionRepository
 from kb_server.storage.repositories.documents import DocumentRepository
 from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.wiring import Services
-from salemdex_retrieval import Engine, Source
 from salemdex_retrieval.engine import AlwaysValid
 from salemdex_retrieval.index.in_memory import InMemoryIndex
-from salemdex_retrieval.rerankers.fake import FakeReranker
-from tests.support import QUESTION, SEARCH_BINDING, sign_in
+from tests.support import QUESTION, prepare_search, sign_in
 
 # people and places
 
@@ -332,12 +329,10 @@ def test_a_passage_whose_document_stops_being_served_after_the_last_gate_is_drop
     deleted = publish(hr_docs)
     documents.mark_deleting(deleted.id)
     session.flush()
-    source = Source(name="dense", index=search_index, binding=SEARCH_BINDING, depth=10)
     search_service = SearchService(
         max_limit=services.settings.search_max_limit,
         session_factory=services.session_factory,
-        retrieval_engine=Engine(validity=AlwaysValid()),
-        build_statement=DenseThenRerank(source=source, reranker=FakeReranker()),
+        prepared_statement=prepare_search(search_index, validity=AlwaysValid()),
     )
 
     passages = search_service.search(admin, QUESTION)

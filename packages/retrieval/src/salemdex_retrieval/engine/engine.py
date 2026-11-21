@@ -1,0 +1,493 @@
+"""The engine and its prepared statements: the one way to run a search statement.
+
+The app builds one `Engine` for its whole life, registering under a name each source
+and reranker a statement may use, with the validity check every run applies.
+`Engine.prepare` checks a statement against them once, and returns a
+`PreparedStatement`, which runs it for any question:
+
+    engine = Engine(validity=validity, sources={"dense": dense}, rerankers={"bge": bge})
+    prepared = engine.prepare(
+        search().retrieve(source("dense", depth=50)).rerank("bge").take()
+    )
+    passages = prepared.execute(question=question, limit=10, where=where)
+
+Each run is given what changes from one search to the next: the question, how many
+passages, and a filter (`where`) applied inside every source's search, before
+ranking. The filter is required (`Everything()` matches every chunk), so no search
+runs unfiltered by accident. Validity applies at every gate: where candidates enter,
+after each retrieve, and again before `Take`.
+
+What's registered is private and read-only, and only `prepare` builds a prepared
+statement, so a statement runs only with what the app registered, and never
+unchecked. Like a prepared statement in SQL, with the slots fixed: the question, the
+limit and the filter.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import InitVar, dataclass, field
+from functools import partial
+from types import MappingProxyType
+from typing import assert_never
+
+from salemdex_retrieval.checks import check_positive_int, to_stripped_str
+from salemdex_retrieval.chunks import Chunk, Hit
+from salemdex_retrieval.embedders import DenseBinding, VectorBinding
+from salemdex_retrieval.engine.results import Candidate, Found, Fused, Passage, Reranked
+from salemdex_retrieval.engine.sources import VectorSource
+from salemdex_retrieval.engine.stages import (
+    Fusion,
+    Merge,
+    Rerank,
+    Retrieve,
+    Rrf,
+    Source,
+    Stage,
+    Take,
+)
+from salemdex_retrieval.engine.statements import Statement, replay
+from salemdex_retrieval.engine.validity import Validity
+from salemdex_retrieval.errors import StatementError
+from salemdex_retrieval.filters import Filter, check_is_filter
+from salemdex_retrieval.index.protocol import check_filter
+from salemdex_retrieval.rerankers import Reranker
+from salemdex_retrieval.rerankers.protocol import score_texts
+from salemdex_retrieval.vectors import Vector, VectorQuery
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class Engine:
+    """A search engine: the sources, rerankers and validity check statements run with.
+
+    Built once, for the whole life of the app. It's frozen and keeps read-only copies
+    of the mappings it's given, so nothing registered can change under a statement
+    already prepared. An app with nothing to check passes `AlwaysValid()`, which says
+    so explicitly.
+
+    Example:
+        engine = Engine(
+            validity=AlwaysValid(),
+            sources={"dense": VectorSource(index=index, binding=binding)},
+            rerankers={"bge": reranker},
+        )
+
+    Args:
+        validity: Which chunks may be served now, asked at every gate.
+        sources: What each source name a statement may use stands for.
+        rerankers: The reranker each name a statement may use stands for.
+    """
+
+    validity: InitVar[Validity]
+    sources: InitVar[Mapping[str, VectorSource]]
+    rerankers: InitVar[Mapping[str, Reranker]]
+
+    _validity: Validity = field(init=False, repr=False)
+    _sources: Mapping[str, VectorSource] = field(init=False, repr=False)
+    _rerankers: Mapping[str, Reranker] = field(init=False, repr=False)
+
+    def __post_init__(
+        self,
+        validity: Validity,
+        sources: Mapping[str, VectorSource],
+        rerankers: Mapping[str, Reranker],
+    ) -> None:
+        """Check the registered names, and keep read-only copies of what's registered.
+
+        Names must be given as statements hold them, stripped, or no statement could
+        name them.
+
+        Raises:
+            TypeError: A name isn't a `str`.
+            ValueError: A name is empty, or has whitespace at either end.
+        """
+        for name in sources:
+            if name != to_stripped_str(name, name="source's name"):
+                raise ValueError(
+                    f"source's name must be stripped and not empty, got {name!r}"
+                )
+
+        for name in rerankers:
+            if name != to_stripped_str(name, name="reranker's name"):
+                raise ValueError(
+                    f"reranker's name must be stripped and not empty, got {name!r}"
+                )
+
+        object.__setattr__(self, "_validity", validity)
+        object.__setattr__(self, "_sources", MappingProxyType(dict(sources)))
+        object.__setattr__(self, "_rerankers", MappingProxyType(dict(rerankers)))
+
+    def prepare(self, statement: Statement) -> PreparedStatement:
+        """Return `statement` checked against this engine, ready to run for any question.
+
+        Checked once, here, so a wrong statement fails before any model is called or
+        any index is read, and each run checks only its own inputs. The statement is
+        replayed first, so one built at run time is checked like one built by the
+        steps, and the replayed one is what runs.
+
+        Args:
+            statement: The statement to prepare, however it was built.
+
+        Returns:
+            The prepared statement.
+
+        Raises:
+            StatementError: The stages come in an order the steps don't allow; a
+                source or a reranker isn't registered; or the sources of a retrieve
+                search different indexes, or two of them one vector.
+            ValueError: A stage's settings are wrong (see `replay`).
+            TypeError: A source isn't a `Source`, or a reranker's name isn't a `str`.
+        """
+        statement = replay(statement)
+        for stage in statement.stages:
+            self._check_stage(stage)
+        return PreparedStatement._create(statement, engine=self)
+
+    def _check_stage(self, stage: Stage) -> None:
+        """Check that `stage` names only what's registered, and fits what it names.
+
+        Raises:
+            StatementError: A name isn't registered, or a retrieve's sources search
+                different indexes or one vector twice.
+        """
+        match stage:
+            case Retrieve(sources=sources):
+                seen_vectors: set[Vector] = set()
+                for source in sources:
+                    if source.name not in self._sources:
+                        raise StatementError(
+                            f"source {source.name!r} was not registered in the engine"
+                        )
+                    vector_source = self._sources[source.name]
+                    first_index = self._sources[sources[0].name].index
+                    if vector_source.index is not first_index:
+                        raise StatementError(
+                            "two sources in the same Retrieve stage search different indexes, "
+                            "which isn't supported yet; "
+                            "search one index, with one source per vector"
+                        )
+
+                    # One index, so the vector alone says what a source searches; vectors
+                    # hash by identity, as they compare
+                    vector = vector_source.binding.vector
+                    if vector in seen_vectors:
+                        raise StatementError(
+                            f"two sources in the same Retrieve stage search vector {vector.name!r}; "
+                            "give it once, with the depth you need"
+                        )
+                    seen_vectors.add(vector)
+            case Rerank(reranker=name):
+                if name not in self._rerankers:
+                    raise StatementError(
+                        f"reranker {name!r} was not registered in the engine"
+                    )
+
+            case Merge() | Take():
+                pass
+            case _:
+                assert_never(stage)
+
+
+class PreparedStatement:
+    """A statement an engine checked, run for any question with `execute`.
+
+    Only `Engine.prepare` builds one: calling the class raises `TypeError`, so holding
+    one proves the checks ran. For the same reason it can't be changed: a statement
+    swapped in later would run unchecked. Prepare once, when the app starts, and run it
+    for every search.
+
+    A plain class, not a dataclass: a dataclass's `__init__` is what's refused here,
+    and `dataclasses.replace` would build a changed copy without the checks.
+
+    Attributes:
+        statement: The statement it runs, as replayed when it was prepared.
+    """
+
+    __slots__ = ("_engine", "_statement")
+
+    _statement: Statement
+    _engine: Engine
+
+    def __init__(self) -> None:
+        """Refuse to build one: `Engine.prepare` is the only way.
+
+        Raises:
+            TypeError: Always.
+        """
+        raise TypeError("build a PreparedStatement with engine.prepare(statement)")
+
+    @property
+    def statement(self) -> Statement:
+        """The statement it runs, as replayed when it was prepared."""
+        # A property, so mypy refuses an assignment as `__setattr__` does at run time
+        return self._statement
+
+    def execute(self, *, question: str, limit: int, where: Filter) -> list[Passage]:
+        """Run the statement for `question`, and return its best passages, best first.
+
+        The inputs are checked before any model is called or any index is read.
+
+        Args:
+            question: The question, as asked; stripped of whitespace at either end.
+            limit: The most passages to return.
+            where: Which chunks may be found, applied inside every source's search,
+                before ranking; `Everything()` for every chunk. It must fit the schema
+                of every index the statement searches.
+
+        Returns:
+            At most `limit` passages, each with its trail.
+
+        Raises:
+            TypeError: `question` isn't a `str`, `where` isn't a filter, or a score or
+                a vector number isn't a real number.
+            ValueError: `question` is empty or only whitespace, or `limit` isn't a
+                positive `int`; or an embedder or a reranker returned the wrong number
+                of rows or scores, or a number that doesn't fit.
+            SchemaMismatchError: `where` uses a field that isn't in the schema of an
+                index the statement searches.
+        """
+        question = to_stripped_str(question, name="question")
+        check_positive_int(limit, name="limit")
+        self._check_filter(where)
+
+        lists: list[list[Candidate]] = []
+        for stage in self.statement.stages:
+            match stage:
+                case Retrieve(sources=sources):
+                    lists = _retrieve(
+                        question,
+                        sources,
+                        where=where,
+                        registered=self._engine._sources,
+                        validity=self._engine._validity,
+                    )
+
+                case Merge(fusion=fusion):
+                    lists = [_fuse(lists, fusion=fusion)]
+                case Rerank(reranker=name):
+                    lists = [
+                        _rerank(
+                            candidates,
+                            question=question,
+                            reranker=self._engine._rerankers[name],
+                        )
+                        for candidates in lists
+                    ]
+                case Take():
+                    [candidates] = lists
+                    return _take(
+                        candidates, validity=self._engine._validity, limit=limit
+                    )
+                case _:
+                    assert_never(stage)
+        raise AssertionError("replay guarantees a Take ends every statement")
+
+    def _check_filter(self, where: Filter) -> None:
+        """Check that `where` is a filter fitting every index the statement searches.
+
+        Raises:
+            TypeError: `where` isn't a filter.
+            SchemaMismatchError: `where` uses a field that isn't in a source's schema.
+        """
+        check_is_filter(where, owner="execute")
+        all_sources: list[Source] = []
+        for stage in self.statement.stages:
+            match stage:
+                case Retrieve(sources=sources):
+                    all_sources.extend(sources)
+                case Merge() | Rerank() | Take():
+                    pass
+                case _:
+                    assert_never(stage)
+
+        for source in all_sources:
+            vector_source = self._engine._sources[source.name]
+            check_filter(where, schema=vector_source.index.schema)
+
+    @classmethod
+    def _create(cls, statement: Statement, *, engine: Engine) -> PreparedStatement:
+        """Return `statement` prepared for `engine`; only `Engine.prepare` calls it."""
+        # `__new__` skips `__init__`, which refuses every other caller
+        prepared = cls.__new__(cls)
+        object.__setattr__(prepared, "_statement", statement)
+        object.__setattr__(prepared, "_engine", engine)
+        return prepared
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Refuse every change.
+
+        Raises:
+            AttributeError: Always.
+        """
+        raise AttributeError(f"a PreparedStatement can't be changed ({name})")
+
+
+def _retrieve(
+    question: str,
+    sources: Sequence[Source],
+    *,
+    where: Filter,
+    registered: Mapping[str, VectorSource],
+    validity: Validity,
+) -> list[list[Candidate]]:
+    """Return one ranked list of valid candidates per source, each found by it.
+
+    Every source searches with the `where` filter; the chunks of all lists are checked
+    in one call, then each list keeps its valid ones. A candidate's `Found` rank is its
+    place in what the source returned, so a dropped chunk doesn't move the others up.
+
+    Raises:
+        ValueError: An embedder returned other than one row for the question.
+    """
+    hits_by_source = [
+        (
+            source.name,
+            _search(question, source, where=where, registered=registered[source.name]),
+        )
+        for source in sources
+    ]
+    valid_ids = _valid_ids(
+        [hit.chunk for _, hits in hits_by_source for hit in hits], validity=validity
+    )
+
+    return [
+        [
+            Candidate(
+                chunk=hit.chunk,
+                trail=(Found(source=source_name, rank=rank, score=hit.score),),
+            )
+            for rank, hit in enumerate(hits, start=1)
+            if hit.chunk.id in valid_ids
+        ]
+        for source_name, hits in hits_by_source
+    ]
+
+
+def _search(
+    question: str, source: Source, *, where: Filter, registered: VectorSource
+) -> list[Hit]:
+    """Return what `source`'s index finds for `question`, at most its depth.
+
+    Raises:
+        ValueError: The embedder returned other than one row for the question.
+    """
+    query = _embed_question(question, binding=registered.binding)
+    return registered.index.search(query, where=where, limit=source.depth)
+
+
+def _embed_question(question: str, *, binding: VectorBinding) -> VectorQuery:
+    """Return the query searching `binding`'s vector for `question`.
+
+    Raises:
+        ValueError: The embedder returned other than one row, or the row doesn't fit
+            the vector.
+    """
+    match binding:
+        case DenseBinding(vector=vector, embedder=embedder):
+            rows = embedder.embed_queries([question])
+            if len(rows) != 1:
+                raise ValueError(
+                    f"the embedder for vector {vector.name!r} "
+                    f"returned {len(rows)} rows for one question"
+                )
+            return vector.query(rows[0])
+        case _:
+            assert_never(binding)
+
+
+def _fuse(lists: list[list[Candidate]], *, fusion: Fusion) -> list[Candidate]:
+    """Return the lists fused into one, best first, each candidate's trail joined.
+
+    Candidates are the same chunk when their ids are (a retrieve searches one index).
+    A fused candidate's trail holds the entries of every list that has it, in list
+    order, then its `Fused` entry. Ties keep the order of first appearance.
+    """
+    groups: dict[uuid.UUID, list[Candidate]] = defaultdict(list)
+    for candidates in lists:
+        for candidate in candidates:
+            groups[candidate.chunk.id].append(candidate)
+
+    match fusion:
+        case Rrf(k=k):
+            scorer = partial(_rrf, k=k)
+        case _:
+            assert_never(fusion)
+
+    scores = {chunk_id: scorer(group) for chunk_id, group in groups.items()}
+
+    sorted_groups = sorted(
+        groups.values(), key=lambda group: scores[group[0].chunk.id], reverse=True
+    )
+
+    return [
+        Candidate(
+            chunk=group[0].chunk,
+            trail=tuple(entry for candidate in group for entry in candidate.trail),
+        ).followed_by(Fused(rank=rank, score=scores[group[0].chunk.id]))
+        for rank, group in enumerate(sorted_groups, start=1)
+    ]
+
+
+def _rrf(group: list[Candidate], *, k: int) -> float:
+    """Return the RRF score of one chunk's candidates, one from each list that has it.
+
+    Each counts its current rank in its own list; a list without the chunk counts 0.
+    """
+    return sum(1 / (k + candidate.trail[-1].rank) for candidate in group)
+
+
+def _rerank(
+    candidates: list[Candidate], *, question: str, reranker: Reranker
+) -> list[Candidate]:
+    """Return `candidates` scored by `reranker` and sorted by its scores, best first.
+
+    The reranker reads each chunk's `embedded_text`, the text the index embedded,
+    context included. Ties keep their earlier order.
+
+    Raises:
+        ValueError: The reranker returned a score count other than the texts', or a
+            score that isn't finite.
+        TypeError: A score isn't a real number.
+    """
+    texts = [candidate.chunk.embedded_text for candidate in candidates]
+    scores = score_texts(question, texts, reranker=reranker)
+
+    reranked = sorted(
+        zip(scores, candidates, strict=True), key=lambda pair: pair[0], reverse=True
+    )
+
+    return [
+        candidate.followed_by(Reranked(rank=rank, score=score))
+        for rank, (score, candidate) in enumerate(reranked, start=1)
+    ]
+
+
+def _take(
+    candidates: list[Candidate], *, validity: Validity, limit: int
+) -> list[Passage]:
+    """Return the best `limit` candidates that pass the final gate, as passages.
+
+    The gate runs before the cut, so the limit still fills when it can; this is the
+    one place passages are built.
+    """
+    valid_ids = _valid_ids(
+        [candidate.chunk for candidate in candidates], validity=validity
+    )
+    valid_candidates = [
+        candidate for candidate in candidates if candidate.chunk.id in valid_ids
+    ]
+    return [Passage.from_candidate(candidate) for candidate in valid_candidates[:limit]]
+
+
+def _valid_ids(
+    chunks: Sequence[Chunk], *, validity: Validity
+) -> AbstractSet[uuid.UUID]:
+    """Return the ids of `chunks` that may be served, asking once, and only if needed."""
+    # One chunk found by several sources is asked about once
+    unique = list({chunk.id: chunk for chunk in chunks}.values())
+    if not unique:
+        return frozenset()
+    return validity.valid_ids(unique)

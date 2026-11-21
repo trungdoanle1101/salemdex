@@ -57,8 +57,9 @@ class Index(Protocol):
     def find(self, *, where: Filter) -> list[Chunk]:
         """Return the stored chunks that `where` matches, in no promised order.
 
-        This reads without any asker's access filter. Only indexing code, tests and
-        the engine may call it; anything serving a user searches through a session.
+        This reads without any asker's filter. Only indexing code, tests and the
+        engine may call it; anything serving a user searches through a prepared
+        statement, which the app gives its filter.
 
         Args:
             where: Which chunks to return.
@@ -109,11 +110,12 @@ class Index(Protocol):
         no place among the hits, so `limit` is filled by matching chunks whenever there
         are enough. Hits with equal scores come in no promised order.
 
-        Like `find`, this applies no asker's access filter of its own. The engine
-        passes it in `where`; anything serving a user searches through a session.
+        Like `find`, this applies no asker's filter of its own. The engine passes the
+        run's filter in `where`; anything serving a user searches through a prepared
+        statement.
 
         Example:
-            index.search(KbChunks.dense.query(numbers), where=access, limit=20)
+            index.search(KbChunks.dense.query(numbers), where=where, limit=20)
 
         Args:
             query: What to search for, and in which of the schema's vectors.

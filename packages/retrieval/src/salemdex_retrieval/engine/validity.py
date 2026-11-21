@@ -3,7 +3,7 @@
 Whether a chunk may be served can depend on facts outside the index, which change
 without the chunk being rewritten: in the server, whether its document is still
 active and whether its version is the one currently served. The index can't filter
-on those, so the executor asks the app after each search, through this port, at
+on those, so the engine asks the app after each search, through this port, at
 every gate: where candidates enter, and again before `Take`.
 
 The package defines only the shape (ports and adapters): the app's adapter reads its
@@ -22,7 +22,7 @@ class Validity(Protocol):
     """A check of which chunks may be served now, whoever is asking.
 
     The engine holds it for its whole life: it doesn't depend on the asker, whose
-    limits are the session's access filter.
+    limits are the app's to give, in each run's filter.
     """
 
     def valid_ids(self, chunks: Sequence[Chunk]) -> AbstractSet[uuid.UUID]:

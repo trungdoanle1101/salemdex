@@ -4,47 +4,19 @@ import pytest
 
 from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
 from salemdex_retrieval.embedders.protocol import DenseBinding
-from salemdex_retrieval.engine.stages import Merge, Rerank, Retrieve, Rrf, Source, Take
-from salemdex_retrieval.errors import SchemaMismatchError
+from salemdex_retrieval.engine.sources import VectorSource
+from salemdex_retrieval.engine.stages import (
+    Merge,
+    Rerank,
+    Retrieve,
+    Rrf,
+    Source,
+    Take,
+    source,
+)
 from salemdex_retrieval.index.in_memory import InMemoryIndex
-from salemdex_retrieval.rerankers.fake import FakeReranker
-from salemdex_retrieval.schema import One, Schema
+from salemdex_retrieval.schema import Schema
 from salemdex_retrieval.vectors import Dense
-
-
-class Chunks(Schema):
-    position = One(int)
-    dense = Dense(size=8, distance="cosine")
-    title = Dense(size=8, distance="cosine")
-
-
-class Entries(Schema):
-    position = One(int)
-    dense = Dense(size=8, distance="cosine")
-
-
-CHUNKS = InMemoryIndex(schema=Chunks)
-EMBEDDER = FakeDenseEmbedder(size=8)
-
-
-def build_source(
-    vector: Dense = Chunks.dense,
-    *,
-    name: str | None = None,
-    index: InMemoryIndex = CHUNKS,
-    depth: int = 20,
-) -> Source:
-    """Return a source searching `vector` of `index`, keeping `depth` hits.
-
-    It's named after the vector unless `name` is given.
-    """
-    return Source(
-        name=vector.name if name is None else name,
-        index=index,
-        binding=DenseBinding(vector=vector, embedder=EMBEDDER),
-        depth=depth,
-    )
-
 
 BAD_COUNTS = [
     pytest.param(0, id="zero"),
@@ -52,58 +24,55 @@ BAD_COUNTS = [
     pytest.param(True, id="a bool"),
 ]
 
+NAMES_WITHOUT_TEXT = ["", "   ", "\n\t"]
+
 
 # Source
 
 
-def test_a_source_keeps_its_name_index_binding_and_depth() -> None:
-    source = build_source(name="meaning", depth=50)
+def test_a_source_keeps_its_name_and_depth() -> None:
+    dense = Source(name="dense", depth=50)
 
-    assert source.name == "meaning"
-    assert source.index is CHUNKS
-    assert source.binding.vector is Chunks.dense
-    assert source.depth == 50
+    assert dense.name == "dense"
+    assert dense.depth == 50
+
+
+def test_the_source_function_builds_the_same_source() -> None:
+    assert source("dense", depth=50) == Source(name="dense", depth=50)
+
+
+def test_two_sources_with_the_same_name_and_depth_are_equal() -> None:
+    # Plain data: a statement built twice, or read back from a log, compares equal
+    assert source("dense", depth=50) == source("dense", depth=50)
+    assert source("dense", depth=50) != source("dense", depth=20)
 
 
 @pytest.mark.parametrize("depth", BAD_COUNTS)
 def test_a_source_refuses_a_depth_that_isnt_a_positive_int(depth: Any) -> None:
     with pytest.raises(ValueError, match="depth must be a positive integer"):
-        build_source(depth=depth)
+        source("dense", depth=depth)
 
 
-@pytest.mark.parametrize("name", ["", "   ", "\n\t"])
+@pytest.mark.parametrize("name", NAMES_WITHOUT_TEXT)
 def test_a_source_refuses_a_name_without_text(name: str) -> None:
     with pytest.raises(ValueError, match="name"):
-        build_source(name=name)
+        source(name, depth=20)
 
 
 def test_a_source_strips_whitespace_from_either_end_of_its_name() -> None:
-    assert build_source(name=" meaning\n").name == "meaning"
+    assert source(" dense\n", depth=20).name == "dense"
 
 
 def test_a_source_refuses_a_name_that_isnt_a_str() -> None:
     with pytest.raises(TypeError, match="name"):
-        Source(
-            name=None,  # type: ignore[arg-type]
-            index=CHUNKS,
-            binding=DenseBinding(vector=Chunks.dense, embedder=EMBEDDER),
-            depth=20,
-        )
-
-
-def test_a_source_refuses_a_vector_its_index_doesnt_declare() -> None:
-    with pytest.raises(
-        SchemaMismatchError,
-        match=r"vector 'dense' \(another schema's vector\) not in schema Chunks",
-    ):
-        build_source(Entries.dense)
+        source(None, depth=20)  # type: ignore[arg-type]
 
 
 # Retrieve
 
 
 def test_a_retrieve_keeps_its_sources_in_order() -> None:
-    dense, title = build_source(Chunks.dense), build_source(Chunks.title)
+    dense, title = source("dense", depth=50), source("title", depth=20)
 
     retrieve = Retrieve(sources=(dense, title))
 
@@ -115,59 +84,46 @@ def test_a_retrieve_refuses_no_sources() -> None:
         Retrieve(sources=())
 
 
-def test_a_retrieve_refuses_the_same_vector_of_the_same_index_twice() -> None:
-    with pytest.raises(ValueError, match="'dense'"):
-        Retrieve(sources=(build_source(), build_source()))
-
-
-def test_a_retrieve_refuses_the_same_vector_twice_even_at_different_depths() -> None:
-    with pytest.raises(ValueError, match="'dense'"):
-        Retrieve(sources=(build_source(depth=20), build_source(depth=50)))
-
-
-def test_a_retrieve_takes_two_vectors_of_one_index() -> None:
-    Retrieve(sources=(build_source(Chunks.dense), build_source(Chunks.title)))
-
-
-def test_a_retrieve_refuses_sources_searching_different_indexes() -> None:
-    # A candidate is known by its chunk id, unique only within one index
-    other = InMemoryIndex(schema=Chunks)
-
-    with pytest.raises(ValueError, match="different indexes"):
-        Retrieve(sources=(build_source(), build_source(name="other", index=other)))
-
-
 def test_a_retrieve_refuses_two_sources_with_the_same_name() -> None:
     # The trail names each source, so two of one name couldn't be told apart
-    with pytest.raises(ValueError, match="'meaning'"):
-        Retrieve(
-            sources=(
-                build_source(Chunks.dense, name="meaning"),
-                build_source(Chunks.title, name="meaning"),
-            )
-        )
+    with pytest.raises(ValueError, match="share a name: 'dense'"):
+        Retrieve(sources=(source("dense", depth=50), source("dense", depth=50)))
+
+
+def test_a_retrieve_refuses_one_name_twice_even_at_different_depths() -> None:
+    with pytest.raises(ValueError, match="share a name: 'dense'"):
+        Retrieve(sources=(source("dense", depth=20), source("dense", depth=50)))
 
 
 def test_a_retrieve_refuses_names_that_differ_only_by_surrounding_whitespace() -> None:
-    with pytest.raises(ValueError, match="'meaning'"):
-        Retrieve(
-            sources=(
-                build_source(Chunks.dense, name="meaning"),
-                build_source(Chunks.title, name="meaning "),
-            )
-        )
+    with pytest.raises(ValueError, match="share a name: 'dense'"):
+        Retrieve(sources=(source("dense", depth=20), source("dense ", depth=20)))
+
+
+def test_a_retrieve_refuses_a_registered_source_in_place_of_a_name() -> None:
+    # A statement holds names only; the engine holds what they stand for
+    class Chunks(Schema):
+        dense = Dense(size=8, distance="cosine")
+
+    registered = VectorSource(
+        index=InMemoryIndex(schema=Chunks),
+        binding=DenseBinding(vector=Chunks.dense, embedder=FakeDenseEmbedder(size=8)),
+    )
+
+    with pytest.raises(TypeError, match=r"sources\[1\] is VectorSource"):
+        Retrieve(sources=(source("dense", depth=20), registered))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
     "not_a_source",
     [
-        pytest.param(Chunks.dense, id="a vector"),
+        pytest.param("dense", id="a bare name"),
         pytest.param(None, id="None"),
     ],
 )
 def test_a_retrieve_refuses_something_that_isnt_a_source(not_a_source: Any) -> None:
     with pytest.raises(TypeError, match="Source"):
-        Retrieve(sources=(build_source(), not_a_source))
+        Retrieve(sources=(source("dense", depth=20), not_a_source))
 
 
 # Merge, Rrf
@@ -188,20 +144,28 @@ def test_rrf_refuses_a_k_that_isnt_a_positive_int(k: Any) -> None:
 # Rerank
 
 
-def test_a_rerank_keeps_its_reranker() -> None:
-    reranker = FakeReranker()
+def test_a_rerank_keeps_its_rerankers_name() -> None:
+    assert Rerank(reranker="cross_encoder").reranker == "cross_encoder"
 
-    assert Rerank(reranker=reranker).reranker is reranker
+
+def test_a_rerank_strips_whitespace_from_either_end_of_its_rerankers_name() -> None:
+    assert Rerank(reranker=" cross_encoder\n").reranker == "cross_encoder"
+
+
+@pytest.mark.parametrize("name", NAMES_WITHOUT_TEXT)
+def test_a_rerank_refuses_a_rerankers_name_without_text(name: str) -> None:
+    with pytest.raises(ValueError, match="reranker"):
+        Rerank(reranker=name)
+
+
+def test_a_rerank_refuses_a_rerankers_name_that_isnt_a_str() -> None:
+    with pytest.raises(TypeError, match="reranker"):
+        Rerank(reranker=None)  # type: ignore[arg-type]
 
 
 # Take
 
 
-def test_a_take_keeps_its_limit() -> None:
-    assert Take(limit=10).limit == 10
-
-
-@pytest.mark.parametrize("limit", BAD_COUNTS)
-def test_a_take_refuses_a_limit_that_isnt_a_positive_int(limit: Any) -> None:
-    with pytest.raises(ValueError, match="limit must be a positive integer"):
-        Take(limit=limit)
+def test_every_take_is_equal_since_it_holds_no_limit() -> None:
+    # The limit is given each time the statement runs, not in the statement
+    assert Take() == Take()

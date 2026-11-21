@@ -1,5 +1,5 @@
 import logging
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI
@@ -15,7 +15,6 @@ from kb_server.api import (
     users,
 )
 from kb_server.api.errors import register_error_handlers
-from kb_server.search.statements import BuildStatement
 from kb_server.services.search import SearchService
 from kb_server.settings import Settings
 from kb_server.wiring import (
@@ -26,6 +25,7 @@ from kb_server.wiring import (
     close_services,
     open_search_tools,
 )
+from salemdex_retrieval.engine import PreparedStatement
 
 API_V1 = "/api/v1"
 
@@ -46,10 +46,10 @@ def create_app(
             return
         built = build_services(Settings())
         try:
-            with _open_search_tools_or_log(built) as build_statement:
+            with _open_search_tools_or_log(built) as prepared_statement:
                 app.state.services = built
                 app.state.search_service = build_search_service(
-                    built, build_statement=build_statement
+                    built, prepared_statement=prepared_statement
                 )
                 yield
         finally:
@@ -71,15 +71,17 @@ def create_app(
 
 
 @contextmanager
-def _open_search_tools_or_log(services: Services) -> Iterator[BuildStatement]:
+def _open_search_tools_or_log(
+    services: Services,
+) -> Generator[PreparedStatement, None, None]:
     """Yield `open_search_tools`, logging in one line why it can't be built.
 
     Raises:
         ToolSetupError: The search tools can't be built; uvicorn then stops.
     """
     try:
-        with open_search_tools(services) as build_statement:
-            yield build_statement
+        with open_search_tools(services) as prepared_statement:
+            yield prepared_statement
     except ToolSetupError as error:
         # Uvicorn prints the traceback after this; the line says what to fix
         logger.error("The API can't start: %s", error)

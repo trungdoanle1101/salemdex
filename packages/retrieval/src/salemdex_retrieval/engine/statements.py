@@ -1,15 +1,16 @@
-"""Search statements, built step by step: `search(question)`, then the stages in order.
+"""Search statements, built step by step: `search()`, then the stages in order.
 
-A statement describes a search; the session's executor runs it. Each step returns a
-new statement in a new state, and each state offers only the steps allowed next, so
-mypy checks the order:
+A statement describes how to search, for any question: it holds no question and no
+limit, which are given each time it runs, so one statement serves every search, and
+can be named, logged and compared. Each step returns a new statement in a new state,
+and each state offers only the steps allowed next, so mypy checks the order:
 
-    search(question)            → Question
+    search()                    → Question
     Question.retrieve(source)   → Candidates
     Question.retrieve(a, b, …)  → CandidateLists   (several lists: merge them)
     CandidateLists.merge(…)     → Candidates
     Candidates.rerank(…)        → Candidates
-    Candidates.take(limit)      → Search           (complete: what `execute` takes)
+    Candidates.take()           → Statement        (complete: what the engine prepares)
 
 Statements are immutable data: a step never changes the statement it starts from, so
 one statement can branch into several. A statement built at run time, without these
@@ -17,21 +18,19 @@ steps, is checked by `replay`, which takes the steps for it.
 
 Example:
     statement = (
-        search("thời hạn nộp hồ sơ")
-        .retrieve(dense, sparse)
+        search()
+        .retrieve(source("dense", depth=50), source("sparse", depth=50))
         .merge(Rrf())
-        .rerank(cross_encoder)
-        .take(10)
+        .rerank("cross_encoder")
+        .take()
     )
-    passages = session.execute(statement)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import overload
 
-from salemdex_retrieval.checks import to_stripped_str
 from salemdex_retrieval.engine.stages import (
     Fusion,
     Merge,
@@ -42,66 +41,39 @@ from salemdex_retrieval.engine.stages import (
     Take,
 )
 from salemdex_retrieval.errors import StatementError
-from salemdex_retrieval.rerankers.protocol import Reranker
 
 
 @dataclass(frozen=True, kw_only=True)
-class _Statement:
-    """What every state holds: the question, and the stages added so far, in order.
+class _State:
+    """What every state holds: the stages added so far, in order.
 
-    Private, so that no signature can accept any state: `execute` takes a `Search`.
-    The states subclass it side by side, never one another, or a later state would be
-    accepted where an earlier one is expected.
-
-    The question stays out of `repr`: it can reveal what the asker is after, and a
-    statement in a traceback or a log line would print it. An app that audits
-    questions reads `question` itself and stores it where its own rules apply.
+    Private, so that no signature can accept any state: only a complete `Statement`
+    can be prepared. The states subclass it side by side, never one another, or a
+    later state would be accepted where an earlier one is expected.
 
     Attributes:
-        question: The question as asked, stripped of whitespace at either end.
         stages: The stages so far, in the order they run.
     """
 
-    question: str = field(repr=False)
     stages: tuple[Stage, ...]
 
-    def __post_init__(self) -> None:
-        """Strip the question and check it has text, however the state was built.
-
-        Raises:
-            TypeError: `question` isn't a `str`.
-            ValueError: `question` is empty or only whitespace.
-        """
-        # The dataclass is frozen; this is the one place its question is set
-        object.__setattr__(
-            self, "question", to_stripped_str(self.question, name="question")
-        )
-
-    def _add[S: _Statement](self, stage: Stage, *, becomes: type[S]) -> S:
+    def _add[S: _State](self, stage: Stage, *, becomes: type[S]) -> S:
         """Return this statement with `stage` added, as the state `becomes`."""
-        return becomes(question=self.question, stages=(*self.stages, stage))
+        return becomes(stages=(*self.stages, stage))
 
 
-def search(question: str) -> Question:
-    """Start a statement searching for answers to `question`.
-
-    Args:
-        question: The question as asked; it's embedded for each source, and judged
-            against each candidate by a reranker.
+def search() -> Question:
+    """Start a statement searching for answers.
 
     Returns:
         A statement with no stages yet, ready to retrieve.
-
-    Raises:
-        TypeError: `question` isn't a `str`.
-        ValueError: `question` is empty or only whitespace.
     """
-    return Question(question=question, stages=())
+    return Question(stages=())
 
 
 @dataclass(frozen=True, kw_only=True)
-class Question(_Statement):
-    """A statement holding exactly one question, with nothing retrieved yet.
+class Question(_State):
+    """A statement where exactly one question flows, with nothing retrieved yet.
 
     One question is what makes a single source give a single list. Query transforms
     (rewrite, split into several questions) will start from this state too.
@@ -122,15 +94,14 @@ class Question(_Statement):
         list each, which must be merged first.
 
         Args:
-            sources: Where to look; at least one, no two searching the same vector of
-                the same index.
+            sources: Where to look, each named as the engine registered it; at least
+                one, no two with the same name.
 
         Returns:
             `Candidates` for one source, `CandidateLists` for several.
 
         Raises:
-            ValueError: There are no sources, or they search different indexes, or
-                two repeat each other or share a name (see `Retrieve`).
+            ValueError: There are no sources, or two share a name (see `Retrieve`).
             TypeError: A source isn't a `Source`.
         """
         stage = Retrieve(sources=sources)
@@ -140,7 +111,7 @@ class Question(_Statement):
 
 
 @dataclass(frozen=True, kw_only=True)
-class CandidateLists(_Statement):
+class CandidateLists(_State):
     """A statement whose candidates are in several ranked lists, one per source.
 
     Nothing but a merge can follow: every later stage needs a single ranking.
@@ -159,51 +130,52 @@ class CandidateLists(_Statement):
 
 
 @dataclass(frozen=True, kw_only=True)
-class Candidates(_Statement):
+class Candidates(_State):
     """A statement whose candidates are in one ranked list, ready to refine or take."""
 
-    def rerank(self, reranker: Reranker) -> Candidates:
+    def rerank(self, reranker: str) -> Candidates:
         """Return the statement with a stage reranking every candidate.
 
         Args:
-            reranker: The model scoring each candidate against the question.
+            reranker: The name of the reranker, as the engine registered it, scoring
+                each candidate against the question.
 
         Returns:
             The statement with its candidates reordered by the reranker's scores.
+
+        Raises:
+            TypeError: `reranker` isn't a `str`.
+            ValueError: `reranker` is empty or only whitespace.
         """
         return self._add(Rerank(reranker=reranker), becomes=Candidates)
 
-    def take(self, limit: int) -> Search:
-        """Return the complete statement, keeping the best `limit` candidates.
+    def take(self) -> Statement:
+        """Return the complete statement, ending in a stage keeping the best candidates.
 
-        Args:
-            limit: The most passages the search returns.
+        How many it keeps is given each time the statement runs.
 
         Returns:
-            The complete statement, ready for `execute`.
-
-        Raises:
-            ValueError: `limit` isn't a positive `int`.
+            The complete statement, ready to be prepared.
         """
-        return self._add(Take(limit=limit), becomes=Search)
+        return self._add(Take(), becomes=Statement)
 
 
 @dataclass(frozen=True, kw_only=True)
-class Search(_Statement):
-    """A complete search statement: the only state a session executes.
+class Statement(_State):
+    """A complete search statement: the only state the engine prepares.
 
-    It offers no further steps. One built at run time, without the steps above, is
-    checked by `replay` before it runs.
+    It offers no further steps. Preparing it checks it again, through `replay`, so one
+    built at run time, without the steps above, is checked the same way.
     """
 
 
-def replay(statement: Search) -> Search:
+def replay(statement: Statement) -> Statement:
     """Return `statement` built again through the steps, checking the order of its stages.
 
     A statement built at run time (from config, by an agent) never went through the
     steps, so mypy never saw its order. Replaying takes the step each stage stands for,
     in order: every stage must be a step the state so far offers, and the last state
-    must be a `Search`. The order rules thus live only in the steps.
+    must be a `Statement`. The order rules thus live only in the steps.
 
     Args:
         statement: The statement to check, however it was built.
@@ -216,9 +188,9 @@ def replay(statement: Search) -> Search:
             at all), or the stages stop before a `Take`.
         ValueError: A stage's settings are wrong, found as its step builds it again
             (see the steps).
-        TypeError: The question isn't a `str`, or a source isn't a `Source`.
+        TypeError: A source isn't a `Source`, or a reranker's name isn't a `str`.
     """
-    state: _Statement = search(statement.question)
+    state: _State = search()
     for position, stage in enumerate(statement.stages):
         match state, stage:
             case Question(), Retrieve(sources=sources):
@@ -227,14 +199,14 @@ def replay(statement: Search) -> Search:
                 state = state.merge(fusion)
             case Candidates(), Rerank(reranker=reranker):
                 state = state.rerank(reranker)
-            case Candidates(), Take(limit=limit):
-                state = state.take(limit)
+            case Candidates(), Take():
+                state = state.take()
             case _:
                 raise StatementError(
                     f"stages[{position}] is a {type(stage).__name__}, "
                     f"which can't follow {type(state).__name__}"
                 )
-    if not isinstance(state, Search):
+    if not isinstance(state, Statement):
         raise StatementError(
             f"the statement ends at {type(state).__name__}; end with a Take"
         )

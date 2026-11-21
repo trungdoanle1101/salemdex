@@ -1,13 +1,16 @@
 """The engine: running search statements, and what they give back.
 
-`Engine`, `search` and the stages callers build are exported from the package's top
-level. Here are the names callers receive, annotate or implement: the `Session` that
-`Engine.session` returns, the `Search` a statement ends as, the `Passage` results with
-their trail entries, and the `Validity` port with `AlwaysValid`.
+`Engine`, `VectorSource`, `search`, `source` and the stages callers build are exported
+from the package's top level. Here are the names callers receive, annotate or
+implement: the `Statement` a statement ends as, the `PreparedStatement` that
+`Engine.prepare` returns, the `Passage` results with their trail entries, and the
+`Validity` port with `AlwaysValid`.
 
-`execute` isn't exported: `Session.execute` is the one way to run a statement.
+No `execute` function is exported: `PreparedStatement.execute` is the one way to run
+a statement, so none runs without being prepared.
 """
 
+from salemdex_retrieval.engine.engine import PreparedStatement
 from salemdex_retrieval.engine.results import (
     Found,
     Fused,
@@ -15,8 +18,7 @@ from salemdex_retrieval.engine.results import (
     Reranked,
     TrailEntry,
 )
-from salemdex_retrieval.engine.session import Session
-from salemdex_retrieval.engine.statements import Search
+from salemdex_retrieval.engine.statements import Statement
 from salemdex_retrieval.engine.validity import AlwaysValid, Validity
 
 __all__ = [
@@ -24,9 +26,9 @@ __all__ = [
     "Found",
     "Fused",
     "Passage",
+    "PreparedStatement",
     "Reranked",
-    "Search",
-    "Session",
+    "Statement",
     "TrailEntry",
     "Validity",
 ]

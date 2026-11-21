@@ -1,12 +1,15 @@
-"""The steps a search statement is made of, as plain data: what to do, never how.
+"""The steps a search statement is made of, as plain data: what to do, never with what.
 
-Each stage holds only its own settings; the statement holds the stages in order, and
-the executor gives them meaning when it runs them. Being data, a statement can be
-logged, compared and replayed, and one built at run time (from config, by an agent) is
-checked the same way as one built in code.
+Each stage holds only its own settings, and names the sources and rerankers it uses;
+the engine holds what those names stand for (indexes, embedders, models), and gives
+the stages meaning when a prepared statement runs them. Holding no objects, a statement
+can be logged, compared and replayed, and one built at run time (from config, by an
+agent) can name only what the app registered.
 
-A stage checks its settings when it's built, so a wrong statement fails before any
-model is called or any index is read.
+A stage checks its own settings when it's built. Checks that need the engine (a name
+is registered, the sources of a retrieve search one index) run when the statement is
+prepared, so a wrong statement still fails before any model is called or any index is
+read.
 """
 
 from __future__ import annotations
@@ -14,12 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from salemdex_retrieval.checks import check_positive_int, to_stripped_str
-from salemdex_retrieval.embedders.protocol import VectorBinding
-from salemdex_retrieval.index.protocol import Index
-from salemdex_retrieval.rerankers.protocol import Reranker
-from salemdex_retrieval.vectors import Vector
 
-# Every kind of stage. A closed union: the executor's `match` over it ends in
+# Every kind of stage. A closed union: the engine's `match` over it ends in
 # `assert_never`, so mypy points at every place that hasn't learned a new kind.
 type Stage = Retrieve | Merge | Rerank | Take
 
@@ -31,18 +30,19 @@ type Fusion = Rrf
 class Retrieve:
     """A stage finding candidates for the question, one ranked list per source.
 
-    The executor embeds the question for each source and searches its index with the
-    session's access filter. Several sources give several lists, which a `Merge`
-    must fuse before any other stage.
+    Each source's question is embedded, and its index searched with the run's filter
+    (`where`). Several sources give several lists, which a `Merge` must fuse before
+    any other stage.
 
-    Every source searches the same index, for now: a candidate is known by its chunk
-    id, which is unique only within one index, and one index has one schema, so one
-    access filter fits every source. Indexes are compared as objects, so build one
-    index object per stored collection.
+    No two sources may share a name: each candidate's trail names the sources that
+    found it. That is checked here; two rules need the registered sources, so they're
+    checked when the statement is prepared:
 
-    No two sources may search the same vector, whatever their depths: the shallower
-    list would be the start of the deeper one, and fusion would count it twice. No two
-    may share a name either: each candidate's trail names the sources that found it.
+    - every source searches the same index, for now: a candidate is known by its
+      chunk id, which is unique only within one index, and one index has one schema,
+      so one filter fits every source;
+    - no two sources search the same vector, whatever their depths: the shallower
+      list would be the start of the deeper one, and fusion would count it twice.
 
     Attributes:
         sources: Where to look, in order; at least one.
@@ -54,80 +54,75 @@ class Retrieve:
         """Check the sources.
 
         Raises:
-            ValueError: There are no sources, or they search different indexes, or
-                two search the same vector or share a name.
+            ValueError: There are no sources, or two share a name.
             TypeError: A source isn't a `Source`.
         """
         if not self.sources:
             raise ValueError("a retrieve needs at least one source")
 
-        seen_vectors: set[Vector] = set()
-        seen_source_names: set[str] = set()
+        seen_sources: set[str] = set()
         for position, source in enumerate(self.sources):
             if type(source) is not Source:
                 raise TypeError(
                     f"sources[{position}] is {type(source).__name__}; expected a Source"
                 )
 
-            if source.index is not self.sources[0].index:
+            if source.name in seen_sources:
                 raise ValueError(
-                    "two sources search different indexes, which isn't supported yet; "
-                    "search one index, with one source per vector"
+                    f"two sources in one retrieve share a name: {source.name!r}"
                 )
-
-            # One index, so the vector alone says what a source searches; vectors
-            # hash by identity, as they compare
-            vector = source.binding.vector
-            if vector in seen_vectors:
-                raise ValueError(
-                    f"two sources search vector {vector.name!r}; "
-                    "give it once, with the depth you need"
-                )
-            seen_vectors.add(vector)
-
-            if source.name in seen_source_names:
-                raise ValueError(
-                    f"two sources have the same name {source.name!r}; "
-                    "give them different names"
-                )
-            seen_source_names.add(source.name)
+            seen_sources.add(source.name)
 
 
 @dataclass(frozen=True, kw_only=True)
 class Source:
-    """One way of finding candidates: a vector of an index, searched with a question.
+    """A source a retrieve searches, named as the engine registered it, and how deep.
 
-    The binding's embedder turns the question into a query for its vector; the index
-    returns the nearest chunks the access filter lets through.
+    Build it with `source`. It holds only data; the engine resolves the name to what
+    the source searches (e.g. a `VectorSource`) when the statement is prepared.
 
     Attributes:
-        name: What the source is called in each candidate's trail, e.g. "dense";
-            unique within a retrieve, and stripped of whitespace at either end.
-        index: The index to search.
-        binding: The vector to search, and the embedder for the question; the vector
-            must be one of the index's schema.
+        name: The source's name in the engine, also what each candidate's trail calls
+            it, e.g. "dense"; unique within a retrieve, and stripped of whitespace at
+            either end.
         depth: The most candidates this source returns.
     """
 
     name: str
-    index: Index
-    binding: VectorBinding
     depth: int
 
     def __post_init__(self) -> None:
-        """Strip the name, check it and the depth, and that the schema has the vector.
+        """Strip the name, and check it and the depth.
 
         Raises:
             TypeError: `name` isn't a `str`.
             ValueError: `name` is empty or only whitespace, or `depth` isn't a
                 positive `int`.
-            SchemaMismatchError: The vector isn't one of the index's schema, checked
-                here so that no question is embedded for it.
         """
         # The dataclass is frozen; this is the one place its name is set
         object.__setattr__(self, "name", to_stripped_str(self.name, name="name"))
         check_positive_int(self.depth, name="depth")
-        self.index.schema.check_declares(self.binding.vector)
+
+
+def source(name: str, *, depth: int) -> Source:
+    """Return the source registered as `name`, searched for at most `depth` candidates.
+
+    Args:
+        name: The source's name in the engine, e.g. "dense".
+        depth: The most candidates it returns.
+
+    Returns:
+        The source, ready for a retrieve.
+
+    Raises:
+        TypeError: `name` isn't a `str`.
+        ValueError: `name` is empty or only whitespace, or `depth` isn't a positive
+            `int`.
+
+    Example:
+        search().retrieve(source("dense", depth=50), source("sparse", depth=50))
+    """
+    return Source(name=name, depth=depth)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -175,26 +170,29 @@ class Rerank:
     sources' lists.
 
     Attributes:
-        reranker: The model scoring each candidate against the question.
+        reranker: The name of the reranker, as the engine registered it, that scores
+            each candidate against the question; stripped of whitespace at either end.
     """
 
-    reranker: Reranker
+    reranker: str
+
+    def __post_init__(self) -> None:
+        """Strip the reranker's name, and check it.
+
+        Raises:
+            TypeError: `reranker` isn't a `str`.
+            ValueError: `reranker` is empty or only whitespace.
+        """
+        # The dataclass is frozen; this is the one place its name is set
+        object.__setattr__(
+            self, "reranker", to_stripped_str(self.reranker, name="reranker")
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
 class Take:
     """The last stage: keep the best candidates and return them as passages.
 
-    Attributes:
-        limit: The most passages returned.
+    It holds no limit: how many passages to return is given with the question, each
+    time the statement runs.
     """
-
-    limit: int
-
-    def __post_init__(self) -> None:
-        """Check the limit.
-
-        Raises:
-            ValueError: `limit` isn't a positive `int`.
-        """
-        check_positive_int(self.limit, name="limit")

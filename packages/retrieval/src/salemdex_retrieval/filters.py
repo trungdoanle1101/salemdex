@@ -157,8 +157,8 @@ class Everything:
     out, so the intent is clear where it's used. An empty `and_()` is refused instead,
     because it comes from a list of conditions that turned out empty, by accident.
 
-    It names no field, so it fits every schema. A session given it as its access
-    filter lets every asker see every chunk.
+    It names no field, so it fits every schema. Given to `PreparedStatement.execute`,
+    it searches every chunk.
 
     Example:
         index.delete(where=Everything())

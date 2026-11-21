@@ -17,11 +17,12 @@ TOP_LEVEL = [
     "One",
     "Rrf",
     "Schema",
-    "Source",
+    "VectorSource",
     "and_",
     "not_",
     "or_",
     "search",
+    "source",
 ]
 
 
@@ -34,8 +35,15 @@ def test_every_exported_name_can_be_imported() -> None:
         assert hasattr(salemdex_retrieval, name), name
 
 
-def test_execute_is_not_exported_so_every_search_runs_through_a_session() -> None:
+def test_execute_is_not_exported_so_every_search_runs_prepared() -> None:
     assert "execute" not in salemdex_retrieval.__all__
     assert "execute" not in salemdex_retrieval.engine.__all__
     assert not hasattr(salemdex_retrieval, "execute")
     assert not hasattr(salemdex_retrieval.engine, "execute")
+
+
+def test_the_engine_tier_exports_the_prepared_statement_and_not_the_session() -> None:
+    assert "PreparedStatement" in salemdex_retrieval.engine.__all__
+    assert "Session" not in salemdex_retrieval.engine.__all__
+    for name in salemdex_retrieval.engine.__all__:
+        assert hasattr(salemdex_retrieval.engine, name), name

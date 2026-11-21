@@ -17,7 +17,7 @@ class Reranker(Protocol):
     """A model scoring how well each text answers a question, one score per text.
 
     The app implements it, for a hosted model (a cross-encoder service, an LLM judge)
-    or a local one. It returns scores, not an order: the executor sorts the candidates
+    or a local one. It returns scores, not an order: the engine sorts the candidates
     and records each score in their trail.
 
     Higher is better. Scores are comparable only within one call, never across

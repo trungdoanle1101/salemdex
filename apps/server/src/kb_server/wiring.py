@@ -18,7 +18,7 @@ from kb_server.indexing.handlers import (
     ProfileChooser,
 )
 from kb_server.indexing.worker import Worker
-from kb_server.search.statements import BuildStatement, DenseThenRerank
+from kb_server.search.statements import CROSS_ENCODER, DENSE, dense_then_rerank
 from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
@@ -37,8 +37,9 @@ from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
 from salemdex_retrieval import Engine as SalemdexEngine
-from salemdex_retrieval import Source
+from salemdex_retrieval import VectorSource
 from salemdex_retrieval.embedders import DenseBinding, DenseEmbedder
+from salemdex_retrieval.engine import PreparedStatement
 from salemdex_retrieval.errors import ModelLoadError, SchemaMismatchError
 from salemdex_retrieval.index import Index
 from salemdex_retrieval.rerankers import Reranker
@@ -59,7 +60,6 @@ def utc_now() -> datetime:
 class Services:
     settings: Settings
     sql_engine: Engine
-    retrieval_engine: SalemdexEngine
     files: FileStore
     session_factory: sessionmaker[Session]
     passwords: Passwords
@@ -72,7 +72,6 @@ def build_services(settings: Settings) -> Services:
     return Services(
         settings=settings,
         sql_engine=engine,
-        retrieval_engine=SalemdexEngine(validity=ServedVersionsOnly(session_factory)),
         files=build_file_store(settings),
         session_factory=session_factory,
         passwords=Passwords(hasher=PasswordHasher()),
@@ -150,15 +149,15 @@ def build_file_store(settings: Settings) -> FileStore:
 
 
 def build_search_service(
-    services: Services, *, build_statement: BuildStatement
+    services: Services, *, prepared_statement: PreparedStatement
 ) -> SearchService:
     """Return the search service the API holds for its whole life.
 
     Args:
-        services: What every process builds; its settings, session factory and
-            retrieval engine are used.
-        build_statement: Turns a question into the statement to run, with the models
-            from `open_search_tools`.
+        services: What every process builds; its settings and session factory are
+            used.
+        prepared_statement: The statement every search runs, prepared by
+            `open_search_tools` with the models.
 
     Returns:
         The service, built once, not per request.
@@ -166,8 +165,7 @@ def build_search_service(
     return SearchService(
         max_limit=services.settings.search_max_limit,
         session_factory=services.session_factory,
-        retrieval_engine=services.retrieval_engine,
-        build_statement=build_statement,
+        prepared_statement=prepared_statement,
     )
 
 
@@ -223,17 +221,24 @@ def open_job_tools(services: Services) -> Generator[JobTools, None, None]:
 
 
 @contextmanager
-def open_search_tools(services: Services) -> Generator[DenseThenRerank, None, None]:
-    """Yield the API's search statement, closing the Qdrant client however it stops.
+def open_search_tools(
+    services: Services,
+) -> Generator[PreparedStatement, None, None]:
+    """Yield the API's prepared statement, closing the Qdrant client however it stops.
 
-    Built in this order: the embedder, the index of `KbChunks`, then the reranker. The
-    source returns `KB_RERANK_DEPTH` candidates, all of which the reranker reads.
+    Built in this order: the embedder, the index of `KbChunks`, the reranker, then the
+    engine registering them with the validity check, which prepares the statement.
+    The source returns `KB_RERANK_DEPTH` candidates, all of which the reranker reads.
+
+    A statement the engine refuses raises `StatementError`, not `ToolSetupError`: the
+    statement is code, not configuration, so that's a bug, shown with its traceback.
 
     Args:
-        services: What every process builds; only its settings are used.
+        services: What every process builds; its settings and session factory (for
+            the validity check) are used.
 
     Yields:
-        The statement builder: dense retrieval, then reranking.
+        The prepared statement: dense retrieval, then reranking.
 
     Raises:
         ToolSetupError: A setting is missing or wrong, a model can't be loaded, or
@@ -243,16 +248,17 @@ def open_search_tools(services: Services) -> Generator[DenseThenRerank, None, No
     embedder, _ = _build_embedder(settings)
     qdrant_client = _open_qdrant_client(settings)
     try:
-        index = _open_index(settings, client=qdrant_client)
-        yield DenseThenRerank(
-            source=Source(
-                name=KbChunks.dense.name,
-                index=index,
-                binding=DenseBinding(vector=KbChunks.dense, embedder=embedder),
-                depth=settings.rerank_depth,
-            ),
-            reranker=_build_reranker(settings),
+        engine = SalemdexEngine(
+            validity=ServedVersionsOnly(services.session_factory),
+            sources={
+                DENSE: VectorSource(
+                    index=_open_index(settings, client=qdrant_client),
+                    binding=DenseBinding(vector=KbChunks.dense, embedder=embedder),
+                )
+            },
+            rerankers={CROSS_ENCODER: _build_reranker(settings)},
         )
+        yield engine.prepare(dense_then_rerank(depth=settings.rerank_depth))
     finally:
         qdrant_client.close()
 

@@ -2,9 +2,9 @@
 
 Status: build steps 1 to 3 done: the core, both index backends with `Index.search`
 (section 10), embedders and rerankers (section 6, "Embedders") with Hugging Face adapters,
-and the engine with its session (sections 5 and 6). Next: build step 4, in the server, as
-part of replacing the old retrieval ("Pick up here" below). Branch:
-`features/retrieval-redesign`.
+and the engine with its prepared statements (sections 5 and 6). Build step 4 is under way
+in the server, as part of replacing the old retrieval: its index and search run on the
+engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
 
 - Built, in `packages/retrieval` (`salemdex_retrieval`), with tests:
   - `schema.py`: `One` / `Many` fields, `Schema` with presets, `OneValue` / `ManyValues`,
@@ -43,22 +43,27 @@ part of replacing the old retrieval ("Pick up here" below). Branch:
   - `checks.py`: `check_positive_int`, `to_finite_float`, `to_stripped_str`, shared by
     every layer;
   - `rerankers/`: the `Reranker` protocol, `score_texts`, and `FakeReranker`;
-  - `engine/stages.py`: `Retrieve` (named sources, one index), `Merge` with `Rrf`,
-    `Rerank`, `Take`, as data;
-  - `engine/statements.py`: `search(question)`, the type-state steps, and `replay`;
+  - `engine/stages.py`: `Retrieve` (sources by name, `source(name, depth=…)`), `Merge`
+    with `Rrf`, `Rerank` (a reranker by name), `Take` (no limit), as plain data naming
+    what the engine registered;
+  - `engine/statements.py`: `search()`, the type-state steps ending in `Statement`, and
+    `replay`;
+  - `engine/sources.py`: `VectorSource(index=…, binding=…)`, what a registered source
+    name stands for, refusing a vector its index's schema doesn't declare;
   - `engine/results.py`: the trail entries (`Found`, `Fused`, `Reranked`), `Candidate`
     and `Passage`;
   - `engine/validity.py`: the `Validity` port (`valid_ids(chunks) -> ids to keep`) and
     `AlwaysValid`;
-  - `engine/executor.py`: `execute(statement, *, access, validity)`. It replays the
-    statement and checks the access filter against every source's schema, before any
-    model is called; then it searches every source with the access filter, gates where
+  - `engine/engine.py`: `Engine(validity=…, sources=…, rerankers=…)`, frozen, keeping
+    read-only copies of what it registers, and `Engine.prepare(statement)`. Preparing
+    replays the statement and checks that every name is registered, each retrieve searches
+    one index, and no vector is searched twice. It returns a `PreparedStatement`, which
+    only `prepare` builds and which can't be changed. `PreparedStatement.execute(*,
+    question, limit, where)` checks its inputs (the filter against every searched schema)
+    before any model is called; then it searches every source with `where`, gates where
     candidates enter (one validity call per retrieve) and again inside `Take`, fuses by
-    RRF, and reranks every candidate it receives. Tested in `tests/engine/test_executor.py`
+    RRF, and reranks every candidate it receives. Tested in `tests/engine/test_engine.py`
     with a scripted index and spies that count embedder, validity and reranker calls.
-  - `engine/session.py`: `Engine(validity=…)` and `Session`, from `engine.session(access=…)`,
-    both frozen; `Session.execute(statement)` is the one public way to run a statement.
-    Tested in `tests/engine/test_session.py`.
   - The re-exports, in three tiers (section 10, "Import paths"); `tests/test_public_api.py`
     pins the top level's `__all__`.
   - `chunks.py`: typed reads, `chunk[field]`; `filters.py`: `In`, from `One.in_`.
@@ -105,11 +110,12 @@ part of replacing the old retrieval ("Pick up here" below). Branch:
   3. **Move the index to a new collection:** `QdrantIndex.open` refuses the old payload
      layout, so the new code writes to a new `KB_QDRANT_COLLECTION` and every active
      document needs an index job. Prepared output is unchanged: only re-embedding.
-  4. **Search** (build step 4, server build step 5): the validity adapter (a hit is kept
-     when its document is active and its version is `indexed_version`, one query per
-     gate), one service opening sessions, a test of the access filter it builds for each
-     kind of asker, `POST /search`, `HuggingFaceReranker` from a reranker setting, and the
-     import-boundary check.
+  4. **Search** (build step 4, server build step 5; built): the validity adapter (a hit is
+     kept when its document is active and its version is `indexed_version`, one query per
+     gate), `SearchService` holding the statement prepared at startup and passing each
+     asker's access filter as `where`, a test of that filter for each kind of asker,
+     `POST /search`, and `HuggingFaceReranker` from a reranker setting. Still to do: the
+     import-boundary check (only the wiring builds an `Engine`).
   5. **Evaluation:** hit rate and MRR on a labelled question set, which only
      `document_processor.retrieval.evaluation` does today. It must exist before the old
      package goes, or the two can't be compared.
@@ -134,8 +140,9 @@ part of replacing the old retrieval ("Pick up here" below). Branch:
     searches by them. Drop them, or add a `Many(str)` field to `KbChunks` and move
     `address_keys` out of the old package first.
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
-  rerank), resolving sources for generated entries, caller filters
-  (`search(q).where(…)`), `expand`, query transforms (sections 5 and 6).
+  rerank), resolving sources for generated entries, a statement-level filter
+  (`.where(…)`, ANDed with each run's), `expand`, query transforms, the trace (sections 5
+  and 6).
 - Later, when a caller needs it: filtering by chunk ids.
 
 The project is named **Salemdex**. This engine is its first package under that name,
@@ -201,6 +208,9 @@ request: question, asker, scope?, k
 - 4 runs before 5: no reranking of candidates about to be dropped.
 - The filter runs inside the index. Why: filtering afterwards loses results and reveals hidden
   hits. The index applies access; the database confirms currency.
+- Step 2 is the app's: it builds the filter from the asker. The framework requires a filter
+  on every run and applies it inside every source, without knowing it holds access
+  (section 6, "The guarantee slots").
 - **One score per passage:** from the last stage that ordered the candidates (rerank if present,
   else the index or fusion score). Comparable only within one response. Why: scores from
   different stages, or different questions, aren't on the same scale.
@@ -230,32 +240,73 @@ faithful → passages carry source text + origin     reranking, expansion, pruni
 | prune | candidates → candidates | dedupe, threshold, diversity |
 
 Every stage that adds candidates (source, expand) receives the filter. The framework fixes
-*where* the guarantees apply. The app decides *what* they mean (section 6).
+*where* the guarantees apply. The app decides *what* they mean (section 6): to the framework,
+"allow" is a filter each run must be given; that it holds access is the app's meaning.
 
-## 5. Statements and the executor (the SQLAlchemy pattern)
+## 5. Statements and prepared statements
 
-**A statement describes a search; an executor runs it**, like `select()` and
-`session.execute()`.
+**A statement describes a search; the engine prepares it once; the prepared statement runs
+it for each question.** Like a prepared statement in SQL, with three fixed slots: the
+question, the limit and the filter.
 
 ```text
-stmt = search(question).retrieve(dense, sparse).merge(rrf).rerank(cross_encoder).take(10)
-passages = engine.session(access=access).execute(stmt)
+engine   = Engine(validity=validity,
+                  sources={"dense": dense, "sparse": sparse},
+                  rerankers={"cross_encoder": cross_encoder})
+stmt     = (search()
+            .retrieve(source("dense", depth=50), source("sparse", depth=50))
+            .merge(Rrf()).rerank("cross_encoder").take())
+prepared = engine.prepare(stmt)                                     # once, at startup
+passages = prepared.execute(question=q, limit=10, where=access)    # each search
 ```
 
-- **Access is bound to the session, not the statement.** Why: a statement can't forget the
-  access filter. The executor adds it to every source and runs the validity gate where
-  candidates enter and again before `Take`.
-  (How the slots plug in: section 6.)
-- **Type-state builder:** each method returns a type that offers only the steps allowed next, so
-  mypy checks the order:
+- **A statement holds no question and no limit.** They change with every search, while how
+  to search doesn't. Why: one statement then serves every question, can be named, logged and
+  compared, and isn't rebuilt per request. Anything else that must vary per search is
+  another statement, not another slot.
+- **A statement names what it uses; the engine holds it.** The app registers its sources
+  (`VectorSource(index=…, binding=…)`) and rerankers on the engine under names, and stages
+  name them: `source("dense", depth=50)`, `.rerank("cross_encoder")`. Names are stripped,
+  and a source's name is also what each candidate's trail calls it. Why:
+  - a statement holds no objects, so it can be logged, compared and replayed;
+  - one built at run time (from config, by an agent) can name only what the app registered;
+  - code holding a statement can't reach an index through it (section 11).
+  - Name by role, not model (`"cross_encoder"`, not `"bge"`): changing the model then
+    leaves every statement, and every log of one, true.
+  - Rejected: a resolved twin of each stage holding the objects. It doubles the stage
+    classes only to hide what a frozen, private registry already hides.
+- **Preparing checks once, against the engine.** `prepare` replays the statement (below),
+  then checks that every source and reranker it names is registered, that each retrieve
+  searches one index, and that no vector is searched twice, even under two names. Every
+  failure is a `StatementError`. Why once: a wrong statement fails at startup, before any
+  model is called, and each run then checks only its own inputs.
+- **Only `prepare` builds a `PreparedStatement`** (parse, don't validate: holding one proves
+  the checks ran). Calling the class raises `TypeError`; `prepare` uses a private
+  `_create`. It's a plain class with slots, not a dataclass, refusing changes, and its
+  `statement` is a read-only property. Why: an assignment or `dataclasses.replace` would
+  give a "prepared" statement that `prepare` never saw. `object.__new__` can still get
+  around it; that is deliberate abuse, plain in review.
+- **The engine is frozen and keeps read-only copies of what it's given**
+  (`MappingProxyType(dict(…))`), so nothing registered changes under a prepared statement.
+  The registry is private, and nothing exposes it.
+- **Every run is given a filter** (`where=`; `Everything()` searches every chunk), checked
+  against the schema of every index the statement searches before any model is called.
+  The framework calls it a filter, not access: what it holds is the app's (section 6).
+- **Rejected: a `Session`** binding an access filter for one asker, opened from the engine
+  (`engine.session(access=…).execute(statement)`, the first design). The session's "access"
+  was only a filter that conventionally held access; nothing in the framework depended on
+  that, so the idea leaked from the app into the framework. A required `where` on each run
+  gives the same guarantee, a filter in every source, with one concept fewer.
+- **Type-state builder:** each method returns a type that offers only the steps allowed
+  next, so mypy checks the order:
 
   ```text
-  search(question)                                   → Question
+  search()                                           → Question
   Question       → .retrieve(source)                 → Candidates
   Question       → .retrieve(a, b, …)                → CandidateLists
   CandidateLists → .merge(fusion)                    → Candidates
-  Candidates     → .rerank() (later .expand() .prune()) → Candidates
-  Candidates     → .take(limit)                      → Search   (complete)
+  Candidates     → .rerank(name) (later .expand() .prune()) → Candidates
+  Candidates     → .take()                           → Statement   (complete)
 
   later, with query transforms:
   Question       → .rewrite()                        → Question
@@ -263,30 +314,31 @@ passages = engine.session(access=access).execute(stmt)
   Queries        → .retrieve(sources…)               → CandidateLists (always)
   ```
 
-  - **A state is named after what it guarantees,** so later steps only add. `Question` holds
-    exactly one question, which is why one source gives one list; `Queries` (several) arrives
-    with `split`, and its `retrieve` always gives lists to merge.
+  - **A state is named after what it guarantees,** so later steps only add. `Question` means
+    exactly one question flows, which is why one source gives one list; `Queries` (several)
+    arrives with `split`, and its `retrieve` always gives lists to merge.
   - **Several lists must be merged before anything else.** `CandidateLists` offers only
     `merge`, so mypy refuses `retrieve(a, b).rerank(…)`.
-  - **The complete state is `Search`, not `Passages`:** `execute(search: Search) ->
-    list[Passage]` would otherwise put the plan and its result under nearly one name.
-  - **States are siblings over a private base** holding `question` and `stages`. Why: a
-    state subclassing another would be accepted where the earlier one is expected.
+  - **The complete state is `Statement`, the only state `prepare` accepts.** SQL's word for
+    a complete command one prepares. Why not `Search` (the first name): beside the
+    `search()` builder and `Index.search`, a third "search" would read poorly.
+  - **States are siblings over a private base** holding `stages`. Why: a state subclassing
+    another would be accepted where the earlier one is expected.
 
 - **A statement built at run time is replayed through the steps.** `replay(statement)`
-  starts again from `search(statement.question)` and takes one step per stage. Each
-  (state, stage) pair must be a step that state offers, and the last state must be a
-  `Search`; anything else raises `StatementError` naming the stage's position. The executor
-  runs the replayed statement.
+  starts again from `search()` and takes one step per stage. Each (state, stage) pair must
+  be a step that state offers, and the last state must be a `Statement`; anything else
+  raises `StatementError` naming the stage's position. `prepare` keeps the replayed
+  statement, and that is what runs.
   - Why: the order rules then live once, in the steps. A separate check over the whole
     tuple ("first a retrieve, a merge exactly when…, one take at the end") would encode the
     same state machine twice, and the copies would drift. A new step is one method and one
     `case`.
-  - Why not in `Search.__post_init__`: replaying ends with `take()`, which builds a
-    `Search`, which would replay again.
+  - Why not in `Statement.__post_init__`: replaying ends with `take()`, which builds a
+    `Statement`, which would replay again.
   - **Every bound limits what a stage keeps, never what it reads:** a source's `depth`, a
-    take's `limit` (later a merge's). Each is "at most" (a source can return fewer hits,
-    access and validity remove more), and none is compared with another: a loose statement
+    run's `limit` (later a merge's). Each is "at most" (a source can return fewer hits, the
+    filter and validity remove more), and none is compared with another: a loose statement
     isn't a wrong one.
   - **A rerank scores every candidate it receives,** so its cost is set by the stages before
     it: the source's `depth`, or after a merge the union of the sources' lists. Why: the
@@ -295,14 +347,19 @@ passages = engine.session(access=access).execute(stmt)
     the sources' output bound. Search engines' alternative, a window of the top N to rescore
     (Elasticsearch's `window_size`, Vespa's `rerank-count`), returns as an output bound on
     `merge` when fusing deep lists leaves too many to rerank.
-- **Every state checks its question:** stripped, and refused when it's empty, in the base's
-  `__post_init__`. Why: a state built by hand skips `search()`.
+- **Each run checks its inputs where they enter:** the question is stripped and refused when
+  empty, the limit must be a positive `int`, and the filter must be a `Filter` fitting every
+  searched schema; all before any model is called or any index is read.
+- **Query transforms keep the same split (later):** the statement holds the transforms
+  (`rewrite`, `split`), the run holds the queries they produce, and the result returns those
+  queries, each `Found` naming which one found the candidate. Why: a rewritten question is
+  per-run data, like the question itself.
 - **Immutable and generative:** each method returns a new statement. Statements are data: they
   can be inspected, logged as provenance and replayed.
-- **The question stays out of `repr`.** Why: it can reveal what the asker is after, and a
-  traceback or a debug line would print it. Auditing questions is the app's choice: it reads
-  `statement.question` and stores it under its own rules (access, retention). The executor's
-  trace, like the trail, holds no text.
+- **The question never enters a statement,** so a logged statement can't reveal what an
+  asker is after. Auditing questions is the app's choice: it stores them under its own rules
+  (access, retention). The trace (planned: plain data per stage, ranked ids and scores, drop
+  counts, durations), like the trail, holds no text.
 - **Composite stages:** a stage can contain stages (a merge over several sources). That gives a
   tree, which covers fan-out and fan-in. There is no free-form graph of untyped nodes. Why: it
   would lose strict typing and make the guarantees hard to prove.
@@ -448,8 +505,8 @@ the operations differ: `eq` and ranges fit one value, `any_of` / `all_of` fit se
 - **When optional fields come:** with the first genuinely sparse, kind-specific field (a page,
   a sender, a sheet name). Adding them later breaks no existing declaration. Two rules come with
   them, so "missing" never matches by accident:
-  - fields used by the guarantee slots (access, validity) must be required; the compile step
-    checks it;
+  - fields the guarantee slots read (the app's filter, validity) must be required; checked
+    before any work, with the filter;
   - `not_` over an optional field is rejected unless the filter says what happens to missing
     values (`is_missing()` / `is_present()`).
 
@@ -499,7 +556,7 @@ Chunk(
 **Each index owns its schema; the engine reads it from the index (`index.schema`).**
 
 - Why: one source of truth. Two copies, one on the index and one on the engine, could drift.
-  The compile step would then approve a filter on a field the index doesn't have.
+  The checks before a run would then approve a filter on a field the index doesn't have.
 - There is more than one schema (chunks, generated entries), each with its own index.
 - **One index, one schema.** Why: `check_fits`, the filter check and the startup check all
   compare against a single schema; with two, a filter on one schema would run over the other's
@@ -507,13 +564,14 @@ Chunk(
   records are several indexes, combined by a merge stage. Two logical indexes sharing one Qdrant
   collection is a backend detail; each still has one schema. A schema that changes over time is
   a migration (backfill or re-index), not a second schema.
-- The compile step checks that every field in a statement belongs to the schema of the index it
-  runs against. A chunk field can't filter the entries index.
+- Before any work, every field a run uses (its filter, later a stage's settings) is checked
+  against the schema of the index it runs against. A chunk field can't filter the entries
+  index.
 - **The index checks its stored data when it opens:** it compares the schema with the backend
   (e.g. Qdrant payload indexes), then creates what's missing or fails with a clear message.
   Why: otherwise filters run slowly or wrongly without saying so.
 - Not now: statements generic over their schema (`Candidates[KbChunks]`), which would let mypy
-  catch cross-schema fields. The compile check is enough to start with.
+  catch cross-schema fields. The check before each run is enough to start with.
 
 **Other uses of the schema:**
 
@@ -597,9 +655,10 @@ Chunk(
     would otherwise match nothing inside the `not_`, so everything, and empty the index.
   - **Writes are methods, not statements.** They come from the indexing worker, which has no
     asker, so nothing needs to sit between the caller and the index. Searches are statements
-    (section 5) because the session must add the access filter to every one. Revisit if writes
+    (section 5) because each must carry the filter into every source and pass the validity
+    gates. Revisit if writes
     need a unit of work, a trace or a dry run.
-  - **`index.find(where=…)` reads without any access filter**, like a raw database
+  - **`index.find(where=…)` reads with only the filter its caller gives**, like a raw database
     connection: only indexing code, tests and the engine may call it, never anything serving a
     user.
 - **The in-memory index** (`InMemoryIndex`) is the reference behaviour every backend must match,
@@ -627,7 +686,7 @@ Chunk(
     else.
 - **Stages that need meaning take fields as settings:**
   `expand(neighbours, order_by=KbChunks.position, within=KbChunks.document_id)`,
-  `prune(dedupe, by=KbChunks.document_id)`. The compile step checks that those fields exist
+  `prune(dedupe, by=KbChunks.document_id)`. Preparing checks that those fields exist
   and have the right types.
 - **The package ships no schema preset.** Why: nothing in it reads a field by its role
   (stages take fields as settings), so a preset would be a guess at an app's schema, and a
@@ -694,7 +753,7 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
   correctness. Each kind adds a `…Value` and a `…Query` to the closed unions `VectorValue` and
   `VectorQuery`, so mypy points at every backend that hasn't learned it.
 - **Max-sim scores grow with the question's length,** so they aren't on any dense score's
-  scale. The executor merges sources by rank, and a score threshold can't be applied to a
+  scale. The engine merges sources by rank, and a score threshold can't be applied to a
   multi-vector source as it is.
 - **Adding, dropping or changing a vector means a new collection:** Qdrant can't change a
   collection's vectors in place.
@@ -837,14 +896,14 @@ index.put(embedded)
   independent statements run in a thread pool as concurrently as with `asyncio.gather`. Two gaps
   remain:
   - inside one statement, sources run one after another (roughly 50–100 ms per extra source). A
-    thread pool inside the executor can remove that without changing any API;
+    thread pool inside `execute` can remove that without changing any API;
   - a thread can't be cancelled: a controller's timeout stops waiting, but the statement runs to
-    its end. The executor checks a deadline between stages, and adapters set timeouts on their
+    its end. `execute` will check a deadline between stages, and adapters set timeouts on their
     HTTP clients. An abandoned statement only reads, so only work is lost.
 
   **When to add async:** agents run many statements in parallel, or the trace shows fan-out
   taking a large share of a search. Then add async protocols (`AsyncDenseEmbedder`,
-  `AsyncIndex`) and an async executor beside the synchronous ones. Statements and stages are
+  `AsyncIndex`) and an async `execute` beside the synchronous one. Statements and stages are
   data, so they stay unchanged.
 
 ### Chunk length and the models
@@ -905,8 +964,8 @@ several, and the reranker reads every chunk too.
     of conditions that turned out empty; `Everything()` has to be written out, so the intent
     is clear at the call site. It names no field, so it fits every schema. It's a frozen
     dataclass with no fields, like the other nodes, so two compare equal.
-    - Its uses: an app without access control passes it as the session's access filter
-      ("The guarantee slots"); tests and indexing code read or clear a whole index with it.
+    - Its uses: an app without access control passes it as every run's `where` ("The
+      guarantee slots"); tests and indexing code read or clear a whole index with it.
     - In Qdrant it becomes a filter with no conditions, which matches every point, also
       nested (`not_(Everything())` matches none).
     - Rejected: allowing it in reads only, with writes keeping `Filter` (a second filter type
@@ -943,7 +1002,7 @@ become a separate source, not a special case inside the index.
 This is a **resolving source**: it searches one index (the entries) and returns chunks of
 another (its *target*, the chunks).
 
-- **It resolves through the target index's `find`, with the access filter.** What it returns is
+- **It resolves through the target index's `find`, with the run's filter.** What it returns is
   then checked on the chunks' own schema, whatever the entries hold. Validity runs on the
   resolved chunks as usual.
 - **It keeps one entry per chunk, the best ranked.** Several entries can lead to one chunk, and
@@ -955,7 +1014,7 @@ another (its *target*, the chunks).
 
 **A `Retrieve` searches one index, for now.** Its sources may search different vectors of it,
 never different indexes. Why: a candidate is identified by its chunk id, which is only unique
-within one index, and one index means one schema, so one access filter fits every source.
+within one index, and one index means one schema, so one filter fits every source.
 When resolving sources arrive, the rule becomes "every source returns chunks of the same
 target index", and the chunk id stays a sound merge key.
 
@@ -977,28 +1036,30 @@ field, or run as separate statements that the app shows separately.
 
 ### The guarantee slots
 
-The executor can't enforce access or currency on data it doesn't understand. So the frame has
+The engine can't enforce access or currency on data it doesn't understand. So the frame has
 fixed **slots**, and the app fills them:
 
 ```text
-framework (generic)                         app (server) fills
-─────────────────────────────────────────   ─────────────────────────────────────
-schema: declared fields, types, indexes  ← document_id, version, groups, collection…
+framework (generic)                          app (server) fills
+──────────────────────────────────────────   ─────────────────────────────────────
+schema: declared fields, types, indexes   ← document_id, version, groups, collection…
 chunk = id + text + field values
 filter expressions over fields
-access slot:   a filter, given per session ← "shares a group OR manages the collection"
-validity slot: chunks → ids to keep        ← "document active, last indexed version"
-stages, executor, plan, gates
+filter slot:   a filter, required each run ← access: "shares a group OR manages the collection"
+validity slot: chunks → ids to keep         ← "document active, last indexed version"
+stages, the engine, prepared statements, gates
 ```
 
-- **Every slot must be filled.** An engine can't be built without an access policy. An app that
-  wants no access control says so with an explicit `access=Everything()`, so the absence is
-  visible. Why no separate `AllowEverything`: `Everything` is already a `Filter`, so the
-  executor passes it to every source unchanged, and one idea keeps one word.
-- The executor still decides *where* the slots apply: the access filter goes into every source
-  and expand stage, and the validity gate runs where candidates enter and again before `Take`.
-- **What access means is the app's design, not the framework's.** The framework only requires
-  the access slot to be a filter expression. How the app builds it (which fields,
+- **Every slot must be filled.** No run starts without a filter, and no engine is built
+  without a validity check. An app with no access control says so with an explicit
+  `where=Everything()`, and one with nothing to check passes `AlwaysValid()`, so each absence
+  is visible. Why no separate `AllowEverything`: `Everything` is already a `Filter`, so the
+  engine passes it to every source unchanged, and one idea keeps one word.
+- The engine decides *where* the slots apply: the filter goes into every source (later every
+  expand), and the validity gate runs where candidates enter and again before `Take`.
+- **What the filter means is the app's design, not the framework's.** The framework calls the
+  slot a filter, not access: the server's holds access, but nothing in the framework depends
+  on that, and another app may filter by anything. How the app builds it (which fields,
   combinators or a denormalised field) is decided in the app.
 
 ### Filters, gates, validity and cuts
@@ -1007,8 +1068,8 @@ One word per idea, since all four narrow the results:
 
 | Word | Means | Applied |
 |---|---|---|
-| **filter** | a `Filter` expression over chunk fields, evaluated by the index; the access filter is one | inside the index, before ranking |
-| **gate** | a point in the executor where every candidate must pass a check, whatever the statement says | in code, after search |
+| **filter** | a `Filter` expression over chunk fields, evaluated by the index; each run's `where` is one, and the server's holds access | inside the index, before ranking |
+| **gate** | a point in the engine where every candidate must pass a check, whatever the statement says | in code, after search |
 | **validity** | the check a gate runs: should anyone be served this chunk now? Its truth lives outside the index | at each gate |
 | **cut** | keeping the top N by rank, judging no content (`depth`, `limit`) | in each stage |
 
@@ -1023,8 +1084,9 @@ One word per idea, since all four narrow the results:
   filter applies before ranking. A regulation's legal effect (in force, replaced) is such a
   field: a filter ("in force only") or a marker on the passage, the app's choice, never hidden
   silently by validity.
-- **Later:** caller filters (a collection, "in force only") are `Filter` expressions the executor
-  ANDs with access; prunes (thresholds, dedupe) are stages that cut by score. Neither is a
+- **Later:** a statement-level filter (`.where(…)`: a collection, "in force only") is a
+  `Filter` the engine ANDs with each run's; prunes (thresholds, dedupe) are stages that cut
+  by score. Neither is a
   gate: a gate always runs, and a statement can leave a stage out.
 
 ### How the slots plug in
@@ -1032,7 +1094,8 @@ One word per idea, since all four narrow the results:
 **Validity: a port the engine holds.**
 
 ```text
-engine = Engine(validity=ServerValidity(session_factory))   # Protocol: chunks → ids to keep
+engine = Engine(validity=ServedVersionsOnly(session_factory), sources=…, rerankers=…)
+# validity's Protocol: chunks → ids to keep
 ```
 
 - It is part of the frame, not a stage the app writes into statements. Why: a statement author
@@ -1042,7 +1105,7 @@ engine = Engine(validity=ServerValidity(session_factory))   # Protocol: chunks �
 - **The port: `valid_ids(chunks: Sequence[Chunk]) -> Set[UUID]`, the ids to keep.** A port
   (ports and adapters): the package defines the shape, the server's adapter queries Postgres,
   and the package never imports a database. Why this shape:
-  - **It can only narrow.** The executor keeps a candidate only if its id is returned, so an
+  - **It can only narrow.** The engine keeps a candidate only if its id is returned, so an
     adapter can't add, swap or reorder chunks, and extra ids are ignored.
   - **It fails closed.** A buggy adapter returning nothing serves nothing, which is noticed at
     once. Returning the ids to drop would fail open: stale and deleted chunks served.
@@ -1052,8 +1115,8 @@ engine = Engine(validity=ServerValidity(session_factory))   # Protocol: chunks �
     the app never imports engine internals.
   - Rejected: returning chunks (could widen), one flag per chunk (positional, so a misaligned
     list keeps the wrong chunk), one chunk per call (N+1), verdicts with reasons (no need yet).
-  - Synchronous for now; an async port comes with the async executor.
-- **Where the executor runs it:**
+  - Synchronous for now; an async port comes with an async `execute`.
+- **Where a run calls it:**
   - **where candidates enter:** after `Retrieve` (later after `expand` too), so no stale chunk
     costs a reranker call and every later stage works on valid candidates. After a retrieve with
     several sources, the chunks of every list go in one call, then each list is filtered: the
@@ -1065,26 +1128,29 @@ engine = Engine(validity=ServerValidity(session_factory))   # Protocol: chunks �
     passages are built: "only after the final gate" is then true in the code.
   - An app with nothing to check passes an explicit `AlwaysValid()`.
 
-**Access: the filter is passed when a session opens.**
+**The filter: given to each run.**
 
 ```text
-access = documents.access_filter(principal)     # server service, with its own DB session
-session = engine.session(access=access)
+access = self._read_access_filter(principal)   # server service, with its own DB session
+passages = prepared.execute(question=question, limit=limit, where=access)
 ```
 
-- Why this over a policy the engine holds (asker → filter): it is simpler. The framework has no
-  asker type and no per-request plumbing. In the server, building the filter needs a DB lookup
-  (the principal doesn't carry its groups or managed collections), and services already check
-  permissions with a DB session.
-- The cost: the guarantee rests on a convention, not on structure. A call site that passes a
-  filter that's too broad breaks it. Kept robust by:
-  - **one server service opens sessions**; `/search`, `/answer` and agents all go through it;
+- Why each run, over a policy the engine holds (asker → filter): it is simpler. The framework
+  has no asker type and no per-request plumbing. In the server, building the filter needs a
+  DB lookup (the principal doesn't carry its groups or managed collections), and services
+  already check permissions with a DB session.
+- The cost: that the filter holds the right access rests on the app, not on structure. A call
+  site that passes a filter that's too broad breaks it. The server keeps it robust by:
+  - **one service runs searches** (`SearchService`); `/search`, `/answer` and agents all go
+    through it. It holds the statement prepared at startup, never the engine, so it can run
+    that checked statement and nothing else (least authority);
   - a test of the filter that service builds for each kind of asker;
-  - an import-boundary check in CI: only that module imports `Engine`.
-- **When to switch to an engine-held policy:** when agents or other entry points need to open
-  sessions themselves. The engine sees a filter either way, so the switch stays cheap.
+  - planned: an import-boundary check in CI: only the wiring builds an `Engine`.
+- **When to switch to an engine-held policy:** when agents or other entry points need to run
+  statements themselves. The engine sees a filter either way, so the switch stays cheap.
+- Rejected: a `Session` holding the filter (section 5).
 
-**One filter for every schema: an access preset.** A session holds one filter, but a statement
+**One filter for every schema: an access preset.** A run gives one filter, but a statement
 may search indexes with different schemas (chunks and generated entries), and a filter's
 fields are checked against each schema by identity. So the access fields live in a schema
 preset that every searchable schema inherits, and the app builds the filter over the
@@ -1103,13 +1169,13 @@ access = Restricted.access_group_ids.any_of(groups)   # valid on both schemas
   fields (my groups, or the collections I manage) must be valid on every schema too. Fields
   the validity adapter reads belong there for the same reason: it is called on candidates
   from every source. Which fields those are is the app's decision.
-- The executor checks the filter against every source's schema before any model is called.
+- `execute` checks the filter against every source's schema before any model is called.
 - The cost: entries copy their chunk's access fields when indexed, so a change to a document's
   groups updates its chunks and its entries. A missed update can't leak a passage: the
   resolving source fetches chunks through the chunks index with the filter. On the chunks the
   filter is the guarantee; on the entries it keeps recall (hidden entries don't fill the
   depth) and closes the rank side channel.
-- Rejected: a filter per schema on the session (one rule built twice, which can drift; kept as
+- Rejected: a filter per schema in each run (one rule built twice, which can drift; kept as
   the fallback for a schema whose access really uses other fields), a schema → filter function
   (the same, harder to inspect), entries stored in the chunks index with a `kind` field (an
   entry's text isn't the source's words, and every chunk search would need `kind = chunk`).
@@ -1160,18 +1226,18 @@ Consequences:
 
 | When | What | Why |
 |---|---|---|
-| Before any work ("compile") | stage order, by replaying the stages through the steps; one index per retrieve; the access filter fits every source's schema | nothing is spent on a statement that would fail |
+| Preparing (once, at startup) | stage order, by replaying the stages through the steps; every source and reranker registered; one index per retrieve; no vector searched twice | a wrong statement stops the app before it serves anyone |
+| Each run, before any work | the question has text; the limit is a positive `int`; the filter is a `Filter` fitting every searched schema | nothing is spent on a run that would fail |
 | During the run | empty results, wrong score counts, a tool failing | only known as it runs |
 
 mypy covers statements written in code. Statements built at run time (from config, or by an
-agent) still need the compile check, so the executor always replays the statement (section 5)
-and runs the replayed one. Limits aren't compared with depths: each is "at most" for its own
-stage.
+agent) still need the checks, so `prepare` always replays the statement (section 5) and keeps
+the replayed one. Limits aren't compared with depths: each is "at most" for its own stage.
 
 ## 8. Loops
 
 Loops are common in advanced retrieval (retrieve → grade → rewrite → retrieve again: CRAG,
-Self-RAG, iterative retrieval). **Statements stay acyclic. A controller above the executor owns
+Self-RAG, iterative retrieval). **Statements stay acyclic. A controller above the engine owns
 the loop.**
 
 ```text
@@ -1187,7 +1253,7 @@ controller (the loop)       run → look at the candidates → next statement, o
   controller. Its body is still an acyclic statement.
 
 An agent step continues from earlier results, e.g. `from_candidates(previous).expand(...)`.
-These still go through the same executor.
+These still run as prepared statements, through the same gates.
 
 ## 9. Agents that recommend decisions
 
@@ -1196,7 +1262,7 @@ Retrieval is the agent's evidence layer. The guarantees carry up to the recommen
 ```text
 decision agent (controller)
   1. frame     the decision → what must be known (options, constraints, criteria)
-  2. gather    one statement per need  ──→ a session with the user's access
+  2. gather    one statement per need  ──→ prepared, run with the user's filter
   3. weigh     options against evidence (the LLM's work)
   4. check     is every claim backed by a passage? does any evidence conflict?
   5. answer    recommendation + cited evidence, or "not enough evidence"
@@ -1204,7 +1270,7 @@ decision agent (controller)
 
 | Concern | Provided by |
 |---|---|
-| No recommendation rests on, or hints at, hidden knowledge | every statement runs in a session with the user's access |
+| No recommendation rests on, or hints at, hidden knowledge | every run is given the user's access filter; the agent holds prepared statements, never the engine or an index |
 | No deciding on outdated knowledge | the validity gate on every statement |
 | "Why did it recommend this?" | passages with origin; statements logged and replayable |
 | Coverage: every constraint that applies, counter-evidence | different statements per need ("supports A", "argues against A", "everything in scope") |
@@ -1218,7 +1284,7 @@ where most of the remaining safety comes from.
 ## 10. Scope of the first version
 
 Build only the stage kinds that basic search needs: **retrieve, merge, rerank, take**, with the
-filter expression and the executor's frame. Add rewrite, expand, prune and the controller when
+filter expression and the engine's frame. Add rewrite, expand, prune and the controller when
 something uses them. Why: the type-state structure is the costly part to get right; adding
 stage kinds afterwards is cheap.
 
@@ -1236,17 +1302,18 @@ stage kinds afterwards is cheap.
   | schema, chunks, filter expressions | the data being retrieved and the language for selecting it |
   | index backends, reads and writes (`put`, `replace`, `delete`) | the index is what retrieval reads; writing it is the other half (as SQLAlchemy has `insert` beside `select`) |
   | embedders, rerankers | used by both writes and searches |
-  | statements, stages, executor, session, validity | retrieval itself |
+  | statements, stages, the engine and prepared statements, validity | retrieval itself |
 
   | In a later package (e.g. `salemdex_agents`) | Why separate |
   |---|---|
-  | the controller, agent loops, LLM tools | the controller sits above the executor (section 8); a package boundary makes that layering real |
+  | the controller, agent loops, LLM tools | the controller sits above the engine (section 8); a package boundary makes that layering real |
   | answer generation, LLM providers | separate dependencies; retrieval stays usable without an LLM |
 
   Why the split also helps safety: an agents package uses retrieval's public API, where
-  the only way to run a statement is a session with the user's access. The boundary
-  doesn't enforce it fully, though: a `Source` holds its `Index`, whose `find` and `search`
-  apply no access filter of their own (section 11).
+  the only way to run a statement is a prepared statement given a filter. Statements hold
+  names, never indexes, so an agent given prepared statements can't reach an index through
+  them. The rest is a convention: agents are never handed the `Engine` or an `Index`
+  (section 11).
 
 - **Nothing domain-specific.** Every technique in the packages works for any knowledge
   base; regulations, Vietnamese and other domains are the app's (section 12).
@@ -1294,15 +1361,17 @@ src/salemdex_retrieval/
                            Hugging Face names it, behind the `huggingface` extra
 
   engine/                  retrieval itself (build step 3)
-    statements.py          search(question) and the type-state steps:
-                           Question → CandidateLists → Candidates → Search
-    stages.py              retrieve (named sources), merge (rrf), rerank, take, as data
+    stages.py              retrieve (sources by name), merge (rrf), rerank (a reranker by
+                           name), take, as plain data
+    statements.py          search() and the type-state steps:
+                           Question → CandidateLists → Candidates → Statement; replay
+    sources.py             VectorSource: what a registered source name stands for
     results.py             Candidate, the trail entries (Found, Fused, Reranked),
                            Passage
-    executor.py            compiles a statement and runs it: adds the access filter to every
-                           source, the validity gate where candidates enter and before Take
-    session.py             Engine, Session(access=…)
     validity.py            the Validity port, AlwaysValid
+    engine.py              Engine (the registry, prepare) and PreparedStatement (execute):
+                           the filter in every source, the validity gate where candidates
+                           enter and before Take
 
   rerankers/               with the rerank stage
     protocol.py  fake.py
@@ -1313,18 +1382,20 @@ src/salemdex_retrieval/
 tests/                     mirrors the source folders, each with its own __init__.py
   index/                   test_contract.py holds the search cases too
   embedders/               test_embed_chunks.py
-  engine/                  test_statements.py  test_executor.py  test_session.py
+  engine/                  test_stages.py  test_statements.py  test_sources.py
+                           test_results.py  test_engine.py
   test_public_api.py       the top level's __all__, written out in full
 ```
 
 - **`engine/`, not `search/`.** "Search" would otherwise name three things:
-  `index.search(query, where=…)` (one source, raw hits), the package, and the `search(question)`
+  `index.search(query, where=…)` (one source, raw hits), the package, and the `search()`
   builder, so a reader couldn't tell from the call site which one runs.
   - `Index.search` keeps the word every vector store uses for a single-source read.
   - The package is named after the `Engine` it exports.
-  - `search(question)` reads as "a search for this question", which is what a statement is.
+  - `search()` reads as "a search", which is what a statement is: a way of searching, run
+    for any question.
 - **`Hit` lives in `chunks.py`, beside `EmbeddedChunk`.** One wraps a chunk on its way into the
-  index, the other on its way out. The executor then imports it from the core, not from
+  index, the other on its way out. The engine then imports it from the core, not from
   `index/`, to start each candidate's trail.
 - **`embed_chunks` sits beside the embedder protocols,** as `check_batch` sits beside `Index`:
   it's the one helper every caller of the protocol shares.
@@ -1332,10 +1403,13 @@ tests/                     mirrors the source folders, each with its own __init_
   one without loading torch.
 - **Backends and models sit behind extras** (`qdrant`, `huggingface`). No package
   `__init__.py` imports them.
-- **`engine/` modules depend only on those before them here:** stages, statements, results,
-  validity, executor, session.
+- **`engine/` modules depend only on those before them here:** stages, statements, sources,
+  results, validity, engine.
+- **`engine.py` holds both `Engine` and `PreparedStatement`:** each reaches the other's
+  private parts (`prepare` calls `_create`, `execute` reads the registry), so one module keeps
+  that access inside it. Its run helpers move to a private `_run.py` if it grows too long.
 - **`validity.py`, not `gates.py`:** the module holds the check, not the place it runs. A
-  *gate* is where the executor runs it; "the validity gate" stays a word in the executor's
+  *gate* is where a run calls it; "the validity gate" stays a word in the engine's
   docstrings, with no module of its own.
 
 **Import paths (built).** Each public name has exactly one path to import it from. The
@@ -1343,10 +1417,10 @@ question isn't what's public, but which path is the one to use:
 
 | Tier | Holds | Names |
 |---|---|---|
-| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `Source`, `Rrf`, `Engine` |
-| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Session`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
+| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource` |
+| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
 | a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
-| not exported | what only the package uses | `execute`, `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
+| not exported | what only the package uses | `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
 
 - **Why not everything at the top:** where a name lives tells the reader what it is.
   `errors.SchemaMismatchError` says more than a bare name, and the protocols adapter
@@ -1358,8 +1432,8 @@ question isn't what's public, but which path is the one to use:
   then says it's test code, and `.fake import` outside `tests/` is easy to find.
   `InMemoryIndex` isn't a fake: it's a real backend for single-process runs and the
   reference behaviour, so `index` exports it.
-- **`execute` is exported nowhere,** so `Session.execute` is the one public way to run a
-  statement, and no search runs without an access filter.
+- **There is no `execute` function:** `PreparedStatement.execute` is the one way to run a
+  statement, so none runs unchecked, and none without a filter.
 - **`AlwaysValid` isn't at the top,** though it's built: only apps with nothing to check
   and tests use it, and the top level shouldn't suggest it's the usual choice.
 - **`tests/test_public_api.py` pins the top level's `__all__`,** written out in full, as
@@ -1374,7 +1448,7 @@ question isn't what's public, but which path is the one to use:
   - Its numbers were checked where they entered (`Dense.query`).
   - The union is closed, so each backend `match`es on it and ends with `assert_never`. mypy
     then points at every backend that hasn't learned a new kind.
-- **One query per call.** Several sources are the executor's job: it calls `search` once per
+- **One query per call.** Several sources are the engine's job: it calls `search` once per
   source and merges by rank.
 - **`check_query(query, *, schema)`** in `index/protocol.py`: the query's vector must be the
   schema's own, compared as an object, as `check_filter` compares fields. Another schema's
@@ -1388,7 +1462,7 @@ question isn't what's public, but which path is the one to use:
 - **Ties come in no promised order.** The in-memory index keeps storage order; Qdrant
   promises nothing, so the contract tests never build a tie.
 - **`Hit.score` is comparable only within one search's results:** higher is better for cosine
-  and dot, but never compared across vectors or questions. That's why the executor merges by
+  and dot, but never compared across vectors or questions. That's why the engine merges by
   rank. A `Hit` holds the chunk without its vectors, as `find` does.
 - **The in-memory index scores in plain Python** (`math.sumprod`, `math.hypot`), not numpy.
   Why: the core package has no dependencies, and numpy only arrived through
@@ -1422,8 +1496,8 @@ question isn't what's public, but which path is the one to use:
 2. **The Qdrant backend:** translating filters, creating payload indexes from the schema, the
    startup check, `put` / `find` / `replace` / `delete`, with the in-memory index's tests run
    against it too. Extract the `Index` protocol the two share. **(done)**
-3. **Statements and the executor** with retrieve, merge, rerank and take, plus the session, the
-   access filter and the validity check. **(done)**
+3. **Statements, the engine and prepared statements** with retrieve, merge, rerank and take,
+   the filter each run requires and the validity check. **(done)**
 4. **Port the server's indexing handlers** to the new API, then build search on it. The
    server's schema declares `access_group_ids` and every other field each search filters by
    with `indexed=True` ("`Index.search`" above).
@@ -1437,8 +1511,8 @@ latency per candidate count on the target hardware, and hit rate / MRR per depth
 evaluation set (build step 9). Pick the smallest depths where quality stops improving, within
 the waiting-time budget. Why it matters: a cross-encoder scores each question–passage pair
 through a large model, so what reaches it trades recall (it can only lift what it sees) against
-waiting time and throughput. For the measurement, the executor records each stage's duration in
-the session's trace.
+waiting time and throughput. For the measurement, each run will record each stage's duration
+in its trace (planned, section 5).
 
 ## 11. Open questions
 
@@ -1453,15 +1527,19 @@ the session's trace.
     rounds.
   - What the controller, and so the LLM, sees after a tool call: passage text and handles, how
     much of the trail, how many passages per round (the context window limits this).
-  - Everything the LLM writes is untrusted input. The session's access is what keeps that safe.
-- **Keeping agents inside a session.** A `Source` holds its `Index`, and `Index` is
-  public, so code holding a statement can call `source.index.find(where=Everything())`
-  with no access filter. Python can't hide the attribute, so the package boundary alone
-  doesn't keep agents inside a session (section 10). A likely shape, with the agents
-  package: agents never hold `Source` objects. Statements name their sources, and the
-  engine resolves the names from sources the app registered with it, so an agent gets a
-  session and source names, never an index. Until then, the rule rests on code review
-  and on agents being given sessions only.
+  - Everything the LLM writes is untrusted input. What keeps that safe: every run is given
+    the user's filter, and a statement can name only what the app registered.
+- **Keeping agents away from indexes (mostly settled).** A source used to hold its
+  `Index`, so code holding a statement could call `source.index.find(where=Everything())`
+  with no access filter. Statements now name their sources, and the engine resolves the
+  names from its private, read-only registry (section 5), so a statement or a prepared
+  statement leads to no index. What remains is a convention: agents get prepared
+  statements (or tools over them), never the `Engine` or an `Index`, whose `find` reads with
+  only the filter its caller gives. Python can't hide the engine's `_sources`; ruff's
+  `SLF001` (private member access) would flag reaching for it outside the engine.
+- **Still to design:** score scales for thresholds (a prune needs to know whose score it
+  cuts on), multi-vector bindings for bge-m3's dense, sparse and multi-vector outputs from
+  one model call, adapter error types, and deadlines between stages.
 
 ## 12. Techniques to come, and where they belong
 
@@ -1505,7 +1583,7 @@ manuals instead? If not, it's the app's.
 | Checking claims | each claim tied to a passage handle; unsupported claims revised or abstained from | — |
 | Routing | classify the question, pick a statement | the categories and their statements |
 | Conversation | condensing a follow-up question with the history | how many turns |
-| Tools for an agent | tools bound to a session: search, expand, get by field, a document's outline; handles (`p2`) instead of ids (section 11) | which tools, the field names |
+| Tools for an agent | tools over prepared statements, run with the user's filter: search, expand, get by field, a document's outline; handles (`p2`) instead of ids (section 11) | which tools, the field names |
 | Browsing structure | an outline as a tree over a path field on chunks; opening a node | the levels (Chương, Điều) |
 | Extraction at ingestion | an LLM step filling a declared schema from a document, checked by the schema | the schema (issuer, number, effective date) |
 | Workflow patterns | prompt chaining, routing, parallel calls, orchestrator-workers, evaluator-optimizer, as small composable pieces | the workflows |

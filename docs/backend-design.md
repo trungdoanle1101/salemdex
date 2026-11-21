@@ -40,8 +40,9 @@ apps/server/
     manage.py               kb-server create-admin | serve | worker (built); migrate | reprepare | gc
     api/                    routers + request/response schemas; HTTP only
     services/               use cases and permission checks; no HTTP, no SQL
-    search/                 the search statement (DenseThenRerank) and the validity adapter
-                            (ServedVersionsOnly), plugged into salemdex_retrieval (built)
+    search/                 the search statement (dense_then_rerank, and the names it uses)
+                            and the validity adapter (ServedVersionsOnly), plugged into
+                            salemdex_retrieval; prepared once at startup (built)
     domain/                 frozen dataclasses and errors: User, Principal, Document, StoredFile, …;
                             chunks.py: the index schema (Guarded, KbChunks), read by the worker and search
     storage/                SQL and files only
@@ -58,6 +59,12 @@ apps/server/
 
 - `api` → `services` → `domain` and `storage`; `services` → `search` → `storage` and
   salemdex_retrieval; `indexing` → `storage` and the framework. Nothing imports upward. Why: each layer can be tested without the ones above it.
+- Only the wiring builds the retrieval `Engine`: `open_search_tools` registers the source and
+  the reranker under the names in `search/statements.py` and prepares the statement at
+  startup. Services receive the prepared statement, never the engine or an index. Why: a
+  service can then run only that checked statement, with the filter it passes (least
+  authority), and a wrong statement stops `serve` before it answers anyone. An
+  import-boundary check in CI will enforce it (later).
 - Routers convert `XIn` → arguments, call one service method, convert the result → `XOut`.
 - Services check permissions and raise domain errors. Repositories only report (`None`, `bool`,
   counts); they never raise for "not found". Why: one place decides what's an error and which one.
@@ -221,8 +228,8 @@ class KbChunks(Guarded):
 
 - **A field goes in `Guarded` when a guarantee slot reads it from every source:** the access
   filter (`access_group_ids`, `collection_id`) and validity (`document_id`,
-  `document_version`). Why: a session holds one filter and the engine one validity check, and
-  both apply to every index a statement searches. A field on one schema only would be refused
+  `document_version`). Why: each search passes one filter and the engine holds one validity
+  check, and both apply to every index a statement searches. A field on one schema only would be refused
   on the others (retrieval design, section 6, "One filter for every schema"). Generated
   entries will inherit it too.
 - **The access filter, by asker:**
@@ -681,6 +688,8 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | One worker | No races between jobs; follow-up jobs run in order |
 | Model dependencies imported inside `open_job_tools` and `open_search_tools` | A top-level import loads torch in every command |
 | `SearchService` lives for the app and reads in short transactions | A request holding a connection through the models can exhaust the pool |
+| The search statement is prepared at startup; `SearchService` holds only the prepared statement | A wrong statement stops `serve` at startup; the service can run that checked statement and nothing else, never an index directly |
+| Sources and rerankers are registered by role (`dense`, `cross_encoder`), not by model | Changing a model's spec leaves the statement, and every log of it, true |
 | Models found by reference under one `KB_MODELS_FOLDER` | A folder setting per model drifts from its spec |
 | The claim commits before the handler runs | A rolled-back claim is retried forever and never counts its attempts |
 | A job with no version is never superseded by a new version | It applies to the whole document, not to one version |

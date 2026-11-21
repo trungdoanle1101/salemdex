@@ -21,11 +21,13 @@ class SchemaMismatchError(ValueError):
 
 
 class StatementError(ValueError):
-    """Raised when a statement's stages come in an order its steps don't allow.
+    """Raised when a statement is wrong as a whole, or for the engine preparing it.
 
-    Only a statement built at run time (from config, by an agent) can be out of order:
-    the steps refuse it in code, and `replay` refuses it at run time. An API can answer
-    it as a bad request.
+    Its stages come in an order its steps don't allow, which only a statement built at
+    run time (from config, by an agent) can do: the steps refuse it in code, and
+    `replay` at run time. Or it doesn't fit the engine: it names a source or reranker
+    the engine didn't register, or its sources can't be searched together. An API can
+    answer it as a bad request.
     """
 
 
