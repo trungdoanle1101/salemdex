@@ -119,9 +119,9 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   5. **Evaluation** (designed, section 13; next): hit rate and MRR on a labelled question
      set, which only `document_processor.retrieval.evaluation` does today. It must exist
      before the old package goes, or the two can't be compared. The question types
-     (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`) and the
-     quote judge (`evaluation/judges/`) are built; next, the facts check and the
-     evaluator.
+     (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`), the
+     quote judge (`evaluation/judges/`) and the quote occurrences
+     (`evaluation/occurrences.py`) are built; next, the evaluator and runs.
   6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
      `integrations/qdrant`, their tests (`tests/retrieval`,
      `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
@@ -1623,7 +1623,7 @@ compare statements on the developer's own questions (depths, rerank or not, late
 
 | Kind | Question it answers | Input | Measures | When |
 |---|---|---|---|---|
-| facts | is each gold quote whole inside some chunk? | questions, the corpus; no model | quotes found / not found | now; first, since a quote no chunk holds makes that question's score meaningless |
+| quote occurrences (facts) | is each gold quote whole inside some chunk, in its place? | questions, the corpus; no model | per quote: chunks in place, chunks elsewhere | now; first, since a quote no chunk holds makes that question's score meaningless |
 | retrieval | did the key points reach the results, at what rank, at each stage? | questions, a prepared statement, a limit | hit@k, MRR, all-key-points rate@k, found by each source, rerank moves; per tag; misses | now |
 | comparison | is statement B better than A, on which questions? | two runs, one set of judgments | questions improved, worsened, unchanged | now |
 | abstention | can a score tell answerable from unanswerable? | a run | top scores of each | now; a threshold holds for one reranker only |
@@ -1655,7 +1655,7 @@ Built in `evaluation/questions.py`, tested in `tests/evaluation/test_questions.p
   comes when a second app needs one.
 - **No location.** A label such as "Article 1, clause 2: …" is cheap to write but goes
   stale, can't be checked, and often paraphrases the document, so it's restricted text. A
-  miss is explained instead by the ids of the chunks the facts check found its quotes in;
+  miss is explained instead by the ids of the chunks its quotes occur in;
   the app can show those chunks' headings locally.
 - **Not limited to one document:** each quote has its own `where`, so key points, and the
   quotes within one, may sit in different documents. Every document a question
@@ -1705,12 +1705,37 @@ Judge      protocol: name, e.g. "quote"; judge(question, chunks) → one questio
 | `LlmQuoteJudge` (later) | does the passage state what the quote states? | answered or unrelated | yes | no |
 | `LlmRelevanceJudge` (later) | does the passage help answer the question? | unrelated, related, answered | no | yes |
 
-`QuoteJudge`, `QuoteMatcher` and `normalize_text` are built in `evaluation/judges/quote.py`,
-`Judgment` and `Judge` in `evaluation/judges/protocol.py`; tested in
-`tests/evaluation/judges/`. A `QuoteMatcher` is a quote prepared once (its text normalised,
-its `where` built into a matcher); a chunk's text is normalised once, and the facts check
-uses the same matchers, so it and the judge can't disagree about a match. An unanswerable
-question has no key points, so every chunk is "unrelated" to it.
+`QuoteJudge` is built in `evaluation/judges/quote.py`, `Judgment` and `Judge` in
+`evaluation/judges/protocol.py`, `QuoteMatcher` and `normalize_text` in
+`evaluation/matching.py`; tested in `tests/evaluation/judges/` and
+`tests/evaluation/test_matching.py`. A `QuoteMatcher` is a quote prepared once (its text
+normalised, its `where` built into a matcher); a chunk's text is normalised once. The
+quote occurrences use the same matchers, so they and the judge can't disagree about a
+match. An unanswerable question has no key points, so every chunk is "unrelated" to it.
+
+### Quote occurrences
+
+```text
+QuoteOccurrences     where one gold quote occurs among the corpus's chunks
+  question_id, key_point, quote      the quote, by its question and positions (no text)
+  chunk_ids_in_place                 chunks matching its `where` whose text holds it
+  chunk_ids_elsewhere                chunks outside its `where` whose text holds it
+  is_found                           chunk_ids_in_place isn't ()
+```
+
+`find_quote_occurrences(questions, *, chunks)` gives one per quote, in question order.
+Built in `evaluation/occurrences.py`, tested in `tests/evaluation/test_occurrences.py`.
+
+- **Per quote, not per chunk:** the judge's "this chunk supplies key point 0" can't say
+  that the second alternative of key point 0 is a broken label; this can.
+- **Two id tuples tell a wrong place from wrong text:** found only elsewhere, the `where`
+  is wrong (likely the loader's document-id mapping); found nowhere, the text is wrong,
+  split across chunks, or its document isn't in the corpus.
+- **A question stays gradable while every key point has a quote found;** a quote not
+  found is still listed, for fixing, even when an alternative is.
+- **It trusts the evaluator:** question ids unique, each `where` checked against the
+  index's schema. The text is checked before the place, so a wrong field raises only on a
+  chunk holding the text.
 
 - **The quote judge is cheap and exact,** and judges everything. `LlmQuoteJudge` finds the
   same fact worded differently or stated in another chunk; `LlmRelevanceJudge` needs no
@@ -1730,7 +1755,7 @@ question has no key points, so every chunk is "unrelated" to it.
 ```python
 evaluator = Evaluator(questions, corpus=index)  # checks and finds every quote once, here
 
-evaluator.quotes_not_found  # QuoteChecks: labels or chunking to fix
+evaluator.quotes_not_found  # QuoteOccurrences: labels or chunking to fix
 evaluator.gradable_questions  # the ones every metric counts
 
 dense = evaluator.run_statement(dense_only, limit=50)
@@ -1769,7 +1794,7 @@ comparison.questions_unchanged
   metric would take a run and judgments on each call.
 - **`for_tag` instead of a `tag=` on every metric:** it returns a scorecard over that subset,
   so every metric, those added later too, works per tag.
-- **The facts check runs once, when the evaluator is built,** and stays visible:
+- **Quotes are found once, when the evaluator is built,** and stays visible:
   `quotes_not_found` lists the questions it can't grade, and a scorecard reports how many it
   left out. A wrong label never counts as a retrieval miss.
 - **Each run records the evaluator's fingerprint** (questions and corpus); `score` and
@@ -1812,9 +1837,11 @@ evaluation/
   runs.py           Run, RankedPassage; running a prepared statement (no grading)
   judges/
     protocol.py     Judge, Judgment (built); Judgments, agreement
-    quote.py        QuoteJudge, QuoteMatcher, normalize_text (built); the facts check uses them
+    quote.py        QuoteJudge (built)
     llm.py          the LLM judges (later, over the agents package's LLM protocol)
-  facts.py          QuoteCheck: every quote against the corpus
+  matching.py       QuoteMatcher, normalize_text (built): what "a chunk holds a quote" means,
+                    shared by the judge and the occurrences
+  occurrences.py    QuoteOccurrences, find_quote_occurrences (built)
   scorecard.py      Scorecard: the metrics over one run and its judgments
   comparison.py     Comparison: two runs, question by question
 ```
