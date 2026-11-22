@@ -8,7 +8,6 @@ import uuid
 from collections.abc import Iterable
 from typing import Protocol, assert_never
 
-from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.filters import (
     And,
@@ -135,7 +134,7 @@ class Index(Protocol):
         ...
 
 
-def check_batch(
+def check_batch_matches_schema(
     embedded_chunks: Iterable[EmbeddedChunk], *, schema: type[Schema]
 ) -> list[EmbeddedChunk]:
     """Return `embedded_chunks` as a list, after checking each against `schema`.
@@ -165,7 +164,7 @@ def check_batch(
     return batch
 
 
-def check_filter(where: Filter, *, schema: type[Schema]) -> None:
+def check_filter_matches_schema(where: Filter, *, schema: type[Schema]) -> None:
     """Check that every field `where` uses is one of `schema`'s fields.
 
     Every backend calls it before reading or changing anything, so a wrong filter
@@ -186,16 +185,16 @@ def check_filter(where: Filter, *, schema: type[Schema]) -> None:
             schema.check_declares(field)
         case And(filters=filters) | Or(filters=filters):
             for f in filters:
-                check_filter(f, schema=schema)
+                check_filter_matches_schema(f, schema=schema)
         case Not(filter=inner):
-            check_filter(inner, schema=schema)
+            check_filter_matches_schema(inner, schema=schema)
         case Everything():
             pass
         case _:
             assert_never(where)
 
 
-def check_query(query: VectorQuery, *, schema: type[Schema]) -> None:
+def check_query_matches_schema(query: VectorQuery, *, schema: type[Schema]) -> None:
     """Check that `query` searches one of `schema`'s vectors.
 
     Every backend calls it before reading anything. Vectors are compared as objects,
@@ -211,18 +210,3 @@ def check_query(query: VectorQuery, *, schema: type[Schema]) -> None:
             schema's vector with the same name.
     """
     schema.check_declares(query.vector)
-
-
-def check_limit(limit: int) -> None:
-    """Check that `limit` is a positive `int`.
-
-    Every backend calls it before reading anything, so none has to decide what a limit
-    of 0 means.
-
-    Args:
-        limit: The most hits a search may return.
-
-    Raises:
-        ValueError: `limit` isn't an `int` (a `bool` doesn't count), or is below 1.
-    """
-    check_positive_int(limit, name="limit")

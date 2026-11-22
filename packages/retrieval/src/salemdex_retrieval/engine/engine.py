@@ -53,7 +53,7 @@ from salemdex_retrieval.engine.statements import Statement, replay
 from salemdex_retrieval.engine.validity import Validity
 from salemdex_retrieval.errors import StatementError
 from salemdex_retrieval.filters import Filter, check_is_filter
-from salemdex_retrieval.index.protocol import check_filter
+from salemdex_retrieval.index.protocol import check_filter_matches_schema
 from salemdex_retrieval.rerankers import Reranker
 from salemdex_retrieval.rerankers.protocol import score_texts
 from salemdex_retrieval.vectors import Vector, VectorQuery
@@ -305,7 +305,7 @@ class PreparedStatement:
 
         for source in all_sources:
             vector_source = self._engine._sources[source.name]
-            check_filter(where, schema=vector_source.index.schema)
+            check_filter_matches_schema(where, schema=vector_source.index.schema)
 
     @classmethod
     def _create(cls, statement: Statement, *, engine: Engine) -> PreparedStatement:

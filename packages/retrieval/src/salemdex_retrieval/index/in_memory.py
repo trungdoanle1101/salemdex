@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from typing import Final, assert_never
 
+from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.filters import (
     And,
@@ -22,10 +23,9 @@ from salemdex_retrieval.filters import (
     Or,
 )
 from salemdex_retrieval.index.protocol import (
-    check_batch,
-    check_filter,
-    check_limit,
-    check_query,
+    check_batch_matches_schema,
+    check_filter_matches_schema,
+    check_query_matches_schema,
 )
 from salemdex_retrieval.schema import Schema
 from salemdex_retrieval.vectors import DenseDistance, DenseValue, VectorQuery
@@ -50,12 +50,12 @@ class InMemoryIndex:
 
     def put(self, embedded_chunks: Iterable[EmbeddedChunk]) -> None:
         """Store `embedded_chunks`, overwriting any stored chunk with the same id (`Index.put`)."""
-        for embedded in check_batch(embedded_chunks, schema=self.schema):
+        for embedded in check_batch_matches_schema(embedded_chunks, schema=self.schema):
             self._embedded_chunks[embedded.chunk.id] = embedded
 
     def find(self, *, where: Filter) -> list[Chunk]:
         """Return the stored chunks that `where` matches (`Index.find`)."""
-        check_filter(where, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         matches = self._build_matcher(where)
         return [
             embedded.chunk
@@ -65,15 +65,15 @@ class InMemoryIndex:
 
     def delete(self, *, where: Filter) -> None:
         """Remove the stored chunks that `where` matches (`Index.delete`)."""
-        check_filter(where, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         matches = self._build_matcher(where)
         self._remove(matches)
 
     def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
         """Swap the chunks `where` matches for `with_` (`Index.replace`)."""
-        check_filter(where, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         matches = self._build_matcher(where)
-        batch = check_batch(with_, schema=self.schema)
+        batch = check_batch_matches_schema(with_, schema=self.schema)
         self._remove(matches)
         for embedded in batch:
             self._embedded_chunks[embedded.chunk.id] = embedded
@@ -84,9 +84,9 @@ class InMemoryIndex:
         Scores every matching chunk, then keeps the best `limit`. Equal scores keep the
         order the chunks were stored in, but other backends don't promise that.
         """
-        check_limit(limit)
-        check_query(query, schema=self.schema)
-        check_filter(where, schema=self.schema)
+        check_positive_int(limit, name="limit")
+        check_query_matches_schema(query, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         matches = self._build_matcher(where)
         hits = [
             Hit(chunk=embedded.chunk, score=_score(embedded, query=query))

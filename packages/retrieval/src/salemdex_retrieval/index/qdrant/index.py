@@ -19,14 +19,14 @@ from typing import Final, Self, assert_never
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import Filter
 from salemdex_retrieval.index.protocol import (
-    check_batch,
-    check_filter,
-    check_limit,
-    check_query,
+    check_batch_matches_schema,
+    check_filter_matches_schema,
+    check_query_matches_schema,
 )
 from salemdex_retrieval.index.qdrant.filters import build_qdrant_filter
 from salemdex_retrieval.index.qdrant.payload import (
@@ -133,7 +133,7 @@ class QdrantIndex:
 
     def put(self, embedded_chunks: Iterable[EmbeddedChunk]) -> None:
         """Store `embedded_chunks`, overwriting any stored chunk with the same id (`Index.put`)."""
-        self._store(check_batch(embedded_chunks, schema=self.schema))
+        self._store(check_batch_matches_schema(embedded_chunks, schema=self.schema))
 
     def find(self, *, where: Filter) -> list[Chunk]:
         """Return the stored chunks that `where` matches (`Index.find`).
@@ -142,13 +142,13 @@ class QdrantIndex:
             SchemaMismatchError: `where` uses a field that isn't in the schema, or a
                 matched point doesn't hold a chunk of the schema.
         """
-        check_filter(where, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         records = self._scroll_all(build_qdrant_filter(where))
         return [self._to_chunk(record) for record in records]
 
     def delete(self, *, where: Filter) -> None:
         """Remove the stored chunks that `where` matches (`Index.delete`)."""
-        check_filter(where, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         self._delete(build_qdrant_filter(where))
 
     def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
@@ -159,8 +159,8 @@ class QdrantIndex:
         old and new chunks together for a moment, but never neither. If the removal
         fails, both stay stored; repeating the call finishes it.
         """
-        check_filter(where, schema=self.schema)
-        batch = check_batch(with_, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
+        batch = check_batch_matches_schema(with_, schema=self.schema)
         self._store(batch)
         self._delete(_left_over(where, kept=[embedded.chunk.id for embedded in batch]))
 
@@ -185,9 +185,9 @@ class QdrantIndex:
                 doesn't hold a chunk of the schema; the message names it.
             ValueError: `limit` isn't a positive `int`; nothing is read.
         """
-        check_limit(limit)
-        check_query(query, schema=self.schema)
-        check_filter(where, schema=self.schema)
+        check_positive_int(limit, name="limit")
+        check_query_matches_schema(query, schema=self.schema)
+        check_filter_matches_schema(where, schema=self.schema)
         response = self._client.query_points(
             collection_name=self._collection,
             query=_to_qdrant_query(query),
