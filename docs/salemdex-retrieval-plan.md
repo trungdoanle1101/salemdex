@@ -116,9 +116,12 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
      asker's access filter as `where`, a test of that filter for each kind of asker,
      `POST /search`, and `HuggingFaceReranker` from a reranker setting. Still to do: the
      import-boundary check (only the wiring builds an `Engine`).
-  5. **Evaluation:** hit rate and MRR on a labelled question set, which only
-     `document_processor.retrieval.evaluation` does today. It must exist before the old
-     package goes, or the two can't be compared.
+  5. **Evaluation** (designed, section 13; next): hit rate and MRR on a labelled question
+     set, which only `document_processor.retrieval.evaluation` does today. It must exist
+     before the old package goes, or the two can't be compared. The question types
+     (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`) and the
+     quote judge (`evaluation/judges/`) are built; next, the facts check and the
+     evaluator.
   6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
      `integrations/qdrant`, their tests (`tests/retrieval`,
      `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
@@ -133,12 +136,13 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
     indexed model. Passing Hugging Face's own `revision` through is one answer.
   - **How to re-index into the new collection** (step 3): a one-off command now, or
     server build step 8's re-index early.
-  - **Where evaluation lives** (step 5): in salemdex, running statements against labelled
-    questions, or in the server.
   - **Reference keys:** the old index stored `reference_keys` (`address_keys` in
     `retrieval/reference.py`), and `ChunkFilter` could filter by them; no server caller
-    searches by them. Drop them, or add a `Many(str)` field to `KbChunks` and move
+    searches by them, and evaluation grades by quote, so it doesn't need them either
+    (section 13). Drop them, or add a `Many(str)` field to `KbChunks` and move
     `address_keys` out of the old package first.
+- Decided: evaluation lives in salemdex, and the app supplies the questions and the
+  corpus (section 13).
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
   rerank), resolving sources for generated entries, a statement-level filter
   (`.where(…)`, ANDed with each run's), `expand`, query transforms, the trace (sections 5
@@ -1571,7 +1575,7 @@ manuals instead? If not, it's the app's.
 | Prune | dedupe near-identical text, MMR diversity, cut at a score gap or threshold | the thresholds, set from evaluation |
 | Time scope | nothing new: a filter on date fields, and the validity slot | effective dates, what "in force" means |
 | LLM rerank | a reranker adapter over the LLM protocol | the model |
-| Evaluation | a question-set format; hit@k, MRR, nDCG; statements run side by side; the trail of each passage | the question sets, under `data/` |
+| Evaluation | question types, runs, judges (quote, LLM), scorecards and comparisons (section 13) | the question sets, under `data/`; the corpus; the LLM judge's model and prompts |
 
 ### Agents and workflows (the later agents package, section 10)
 
@@ -1597,3 +1601,254 @@ manuals instead? If not, it's the app's.
 - Domain workflows: compliance checks against regulations, the impact of an amendment,
   comparing regulations.
 - Every threshold and budget, and every question set.
+
+## 13. Evaluation
+
+Designed, not built (build step 5 in "Pick up here"). Salemdex holds the evaluation; the
+app supplies the questions and the corpus (`salemdex-product.md`, sections 4 and 5).
+
+**The problem.** The old evaluator (`document_processor.retrieval.evaluation`) grades a hit
+at three levels: by document, by reference key (`"dieu:9"`), by quote. The new index has
+neither of the first two as the old one knew them: `document_id` is a UUID assigned at
+upload, and salemdex chunks carry no reference keys. A port would grade nothing. It would
+also measure only the final list, while improving one lever at a time needs to know which
+stage lost the answer. And a grade fused into the run leaves nothing for a judge added
+later (an LLM's) to work on.
+
+What it's for, in order: show that the new engine scores at least as well as the old one,
+on the same documents, model and questions (the gate for deleting the old package); then
+compare statements on the developer's own questions (depths, rerank or not, later hybrid).
+
+### Kinds of evaluation
+
+| Kind | Question it answers | Input | Measures | When |
+|---|---|---|---|---|
+| facts | is each gold quote whole inside some chunk? | questions, the corpus; no model | quotes found / not found | now; first, since a quote no chunk holds makes that question's score meaningless |
+| retrieval | did the key points reach the results, at what rank, at each stage? | questions, a prepared statement, a limit | hit@k, MRR, all-key-points rate@k, found by each source, rerank moves; per tag; misses | now |
+| comparison | is statement B better than A, on which questions? | two runs, one set of judgments | questions improved, worsened, unchanged | now |
+| abstention | can a score tell answerable from unanswerable? | a run | top scores of each | now; a threshold holds for one reranker only |
+| cost | what does each stage cost? | the trace (planned, section 5) | duration and candidates read, per stage | with the trace |
+| reasoning, agents | is the answer right, with the real context and with the gold passages? supported claims, citations? | answers, agent runs | a judge or labelled answers | with the answers and agents packages |
+
+### The question set: types, not a file format
+
+```text
+Question   id, text, tags (sorted, no two alike), key_points: tuple[KeyPoint, ...]   all needed
+           is_answerable: key_points isn't ()
+KeyPoint   one thing a full answer says: quotes: tuple[Quote, ...]   any one will do; at least one
+Quote      text, where: Filter                                       the chunks that may hold it
+```
+
+Built in `evaluation/questions.py`, tested in `tests/evaluation/test_questions.py`.
+
+- **A question needs all its key points; a key point needs any one of its quotes.** A key
+  point is one thing a full answer says (a rule, its exception); its quotes are the places
+  stating it, alternatives to one another. TREC calls key points nuggets. The old flat list
+  ("any answer counts") can't say "several places": 7 of the current set's 53 questions
+  need two places each, and were graded found when only one was.
+- **Grade by quote** (`salemdex-product.md`, section 5): a quote survives re-chunking and a
+  new outline; an article label doesn't. So evaluation needs no reference keys.
+- **`where` instead of a document id:** for this server, `KbChunks.document_id.eq(…)`.
+  Salemdex then knows nothing of documents, and any schema works.
+- **Types only.** A file format would need filters written as JSON, a design of its own;
+  the app's loader builds the objects (mapping its file names to document ids). A format
+  comes when a second app needs one.
+- **No location.** A label such as "Article 1, clause 2: …" is cheap to write but goes
+  stale, can't be checked, and often paraphrases the document, so it's restricted text. A
+  miss is explained instead by the ids of the chunks the facts check found its quotes in;
+  the app can show those chunks' headings locally.
+- **Not limited to one document:** each quote has its own `where`, so key points, and the
+  quotes within one, may sit in different documents. Every document a question
+  cites must be in the corpus.
+
+### Runs and judgments, kept apart
+
+The pattern from TREC: a **run** records what a system returned, **judgments** (TREC's
+"qrels") record what is relevant, and a **metric** is a function of both.
+
+```text
+Run        the Statement, the limit, per question: the ranked passages as (chunk id, trail);
+           the questions' ids, tags and answerability; a fingerprint of the evaluator
+           no grading, no text
+Judgment   question id, chunk id (a UUID), grade, key_points: tuple[int, ...], judge (a name)
+           grade: "unrelated" | "related" | "answered"; only "answered" may name key points
+Judgments  one judge's judgments; agreement_with(other)                     (with the evaluator)
+Judge      protocol: name, e.g. "quote"; judge(question, chunks) → one question's judgments
+```
+
+- **The grade is about one chunk:** "answered" when it supplies any key point. Whether
+  every key point was found is the question's, across the top k (the all-key-points rate):
+  a chunk holding only the rule still answered, and gets the credit.
+- **`key_points` are positions in the question's `key_points`,** a tuple since one chunk
+  may supply several (a rule and its exception in one passage). "Answered" with none named
+  is allowed, for a judge that can't link (`LlmRelevanceJudge`).
+- **No version and no text hash, for now:** judgments live in memory for one evaluation,
+  where neither the judge nor the corpus changes. They come back with reusing judgments
+  across evaluations ("Later").
+- **Why apart:** a judge that is slow, costs something or isn't deterministic (an LLM)
+  judges once, and its judgments serve every metric and comparison. An old run can be
+  scored again by a new judge.
+- **Judgments are keyed by question and chunk, not by run:** comparing two statements
+  judges the union of their top k once (pooling).
+- **The run keeps every passage it returned,** not only the one that matched: a judge added
+  later has them all.
+- **The matching passage's trail gives per-stage ranks:** which source found it at what
+  rank (`Found`), then after fusion and after the rerank.
+- **A run holds no text:** ids, ranks, scores and tags only, so it can be saved, logged and
+  diffed. Judges read chunk text by id from the corpus.
+
+### Judges
+
+| Judge | Asks | Grade | Names the key points | Unlabelled questions |
+|---|---|---|---|---|
+| `QuoteJudge` (built) | does the chunk match a quote's `where` and contain its text? | answered or unrelated | yes | no |
+| `LlmQuoteJudge` (later) | does the passage state what the quote states? | answered or unrelated | yes | no |
+| `LlmRelevanceJudge` (later) | does the passage help answer the question? | unrelated, related, answered | no | yes |
+
+`QuoteJudge`, `QuoteMatcher` and `normalize_text` are built in `evaluation/judges/quote.py`,
+`Judgment` and `Judge` in `evaluation/judges/protocol.py`; tested in
+`tests/evaluation/judges/`. A `QuoteMatcher` is a quote prepared once (its text normalised,
+its `where` built into a matcher); a chunk's text is normalised once, and the facts check
+uses the same matchers, so it and the judge can't disagree about a match. An unanswerable
+question has no key points, so every chunk is "unrelated" to it.
+
+- **The quote judge is cheap and exact,** and judges everything. `LlmQuoteJudge` finds the
+  same fact worded differently or stated in another chunk; `LlmRelevanceJudge` needs no
+  labels, which lets real users' questions in.
+- **An LLM judge is checked against the quotes:** `by_llm.agreement_with(by_quote)` gives the
+  agreement and the disagreements where both judged, saying whether to trust it where only
+  it judges.
+- **One `Judgments` holds one judge's grades:** grades from two judges aren't comparable;
+  combining judges is a new judge with its own name.
+- **An LLM judge's output that doesn't parse raises;** the pair stays unjudged, never a
+  made-up 0.
+- **The LLM protocol is the agents package's** (planned); prompts are the app's, in the
+  domain's language.
+
+### The toolkit: three classes
+
+```python
+evaluator = Evaluator(questions, corpus=index)  # checks and finds every quote once, here
+
+evaluator.quotes_not_found  # QuoteChecks: labels or chunking to fix
+evaluator.gradable_questions  # the ones every metric counts
+
+dense = evaluator.run_statement(dense_only, limit=50)
+reranked = evaluator.run_statement(dense_then_rerank, limit=50)
+
+judgments = evaluator.judge_top_passages(
+    [dense, reranked], depth=10, judge=QuoteJudge()
+)
+
+scorecard = evaluator.score(reranked, judgments=judgments)
+scorecard.hit_rate_at(5)
+scorecard.mean_reciprocal_rank()
+scorecard.all_key_points_rate_at(10)  # every key point in the top 10
+scorecard.found_by_source_rate("dense")  # retrieval reached it at all
+scorecard.count_rerank_moves()  # up / down / unchanged
+scorecard.top_scores_by_answerability()  # for abstention
+scorecard.questions_missed()
+scorecard.judged_share_at(10)  # how much of the top 10 has a judgment
+scorecard.for_tag("paraphrase").hit_rate_at(5)  # any metric, one kind
+
+comparison = evaluator.compare(dense, reranked, judgments=judgments)
+comparison.questions_improved
+comparison.questions_worsened
+comparison.questions_unchanged
+```
+
+| Class | Holds | Offers |
+|---|---|---|
+| `Evaluator` | questions, the corpus (an `Index`), where each quote was found | `quotes_not_found`, `gradable_questions`, `run_statement`, `judge_top_passages`, `score`, `compare` |
+| `Scorecard` | one run, its judgments, a subset of the questions | `hit_rate_at`, `mean_reciprocal_rank`, `all_key_points_rate_at`, `found_by_source_rate`, `count_rerank_moves`, `top_scores_by_answerability`, `questions_missed`, `judged_share_at`, `tags`, `for_tag` |
+| `Comparison` | two runs, their judgments | `questions_improved`, `questions_worsened`, `questions_unchanged` |
+| `Run`, `Judgments` | plain data | saved, loaded, passed around |
+
+- **Three classes, not one:** the evaluator holds what every step shares; a scorecard holds
+  one run and its judgments, so its metrics take only their cut-off. One class holding every
+  metric would take a run and judgments on each call.
+- **`for_tag` instead of a `tag=` on every metric:** it returns a scorecard over that subset,
+  so every metric, those added later too, works per tag.
+- **The facts check runs once, when the evaluator is built,** and stays visible:
+  `quotes_not_found` lists the questions it can't grade, and a scorecard reports how many it
+  left out. A wrong label never counts as a retrieval miss.
+- **Each run records the evaluator's fingerprint** (questions and corpus); `score` and
+  `compare` refuse a run from another evaluator, so a comparison is always on the same
+  corpus and questions.
+- **The classes are thin:** the logic lives in the modules below and is tested there.
+
+### Rules
+
+- **A chunk holds a quote** when it matches the quote's `where` and its `text`, never its
+  `embedded_text` (which adds the headings path), contains the quote after NFC,
+  case-folding and collapsing whitespace. Diacritics are kept.
+- **Matching a filter in Python** is `filters.build_chunk_matcher` (built), used by the
+  in-memory index and the quote judge, so a filter means the same in search and grading.
+  Each quote's `where` is checked against the index's schema once, when the evaluator is
+  built: a chunk doesn't know its schema, so the matcher can't check it.
+- **A run asks for every candidate:** `limit` at least the sum of the sources' depths (after
+  a merge, the union can exceed any one depth). The engine runs with `AlwaysValid` on a
+  fixed corpus, so no gate hides a chunk; `where` is `Everything()` unless the caller
+  evaluates under one asker's access.
+- **A question's rank** is the best rank of any chunk supplying a key point (hit@k, MRR);
+  the all-key-points rate needs every key point in the top k. Hit rate counts "answered"
+  as relevant; nDCG, once grades are graded, maps the three grades to gains.
+- **Unanswerable questions** are left out of the rank metrics and appear only in the
+  abstention scores.
+- **Unjudged isn't irrelevant:** past the judged depth, a scorecard reports the judged share
+  rather than counting gaps as misses.
+- **A metric that needs key point links** (the all-key-points rate) refuses judgments that
+  have none (`LlmRelevanceJudge`'s), rather than returning 0.
+- **The old/new gate** compares the new numbers with the old evaluator's passage level,
+  which also required the reference key: quote-only grading is slightly more lenient.
+
+### Layout
+
+```text
+evaluation/
+  __init__.py       the public names
+  questions.py      Question, KeyPoint, Quote, and their checks (built)
+  evaluator.py      Evaluator
+  runs.py           Run, RankedPassage; running a prepared statement (no grading)
+  judges/
+    protocol.py     Judge, Judgment (built); Judgments, agreement
+    quote.py        QuoteJudge, QuoteMatcher, normalize_text (built); the facts check uses them
+    llm.py          the LLM judges (later, over the agents package's LLM protocol)
+  facts.py          QuoteCheck: every quote against the corpus
+  scorecard.py      Scorecard: the metrics over one run and its judgments
+  comparison.py     Comparison: two runs, question by question
+```
+
+Dependencies point down: `runs` alone uses the engine (`PreparedStatement`, `Passage`);
+`scorecard` and `comparison` read runs and judgments, so they're tested without an engine.
+Nothing in `engine/` imports `evaluation/`. Tests mirror the layout under
+`tests/evaluation/`, with invented questions and text only (`FakeDenseEmbedder`,
+`FakeReranker`, `InMemoryIndex`): the real question set never appears in a test.
+
+### Security
+
+- Grading reads document text, locally only. Runs and judgments hold ids, ranks, scores
+  and grades; a miss is shown by question id, key point position and chunk ids, never
+  passage text.
+- An LLM judge sends question and document text to a model: for the regulation documents
+  it must be a local model (Ollama) unless approved otherwise. The framework takes any
+  model; the app's wiring keeps it local.
+- A judge's reasoning quotes text, so it never goes in a `Judgment`; if kept to debug
+  disagreements, it goes to its own file under `data/`.
+
+### Later
+
+- What a run ran: each role's model identity (statements name roles, not models), a label,
+  and the corpus and questions fingerprints in saved runs.
+- Saving and loading runs and judgments (a format for `Statement` and trails, versioned).
+- Reusing LLM judgments across evaluations (a cache, or known judgments passed back in), so
+  each round judges only new pairs and the judge's noise doesn't enter comparisons; with
+  it, how a reused judgment is known to be current: the judge's version (its prompt and
+  model), and a hash of the chunk's text, since a re-chunked chunk can keep its id.
+- Wording variants (`variant_of` on `Question`), per-question scope (`scope: Filter`),
+  timing per question.
+- Confidence: paired tests in `Comparison`, bootstrap intervals in `Scorecard`.
+- People's judgments as a judge (`HumanJudge`, from a file); misses counted by stage
+  (facts, retrieval, rerank).
+- Text that must not appear (superseded versions, false premises), follow-up pairs,
+  context-level and answer evaluation, a saved baseline to compare new runs with.

@@ -2,14 +2,18 @@
 
 Build them from a schema's fields (`One.eq`, `One.in_`, `Many.any_of`), which check the values,
 combine them with `and_`, `or_` and `not_`, or match every chunk with `Everything()`.
+An index runs them where it stores the chunks; `build_chunk_matcher` runs them in Python,
+on chunks already at hand (the in-memory index, grading an evaluation).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, assert_never, get_args, get_origin
 
 if TYPE_CHECKING:
+    from salemdex_retrieval.chunks import Chunk
     from salemdex_retrieval.schema import Many, One
 
 # Any filter, whatever its field's type: what searches, writes and backends accept.
@@ -181,6 +185,53 @@ def check_is_filter(value: object, *, owner: str) -> None:
     """
     if not isinstance(value, _FILTER_CLASSES):
         raise TypeError(f"{owner}: {type(value).__name__} is not a valid Filter")
+
+
+def build_chunk_matcher(where: Filter) -> Callable[[Chunk], bool]:
+    """Return a function telling whether a chunk matches `where`.
+
+    The filter is walked once, here; the function returned only reads the chunk, so
+    build it once and use it on every chunk.
+
+    Check `where` against the chunks' schema first (`check_filter_matches_schema`).
+    The function can't do it: a chunk doesn't know its schema, and `and_` and `or_`
+    stop at the first part that decides, so a field outside the schema raises only on
+    the chunks that reach it, and the others quietly don't match.
+
+    Args:
+        where: The filter to match, already checked against the chunks' schema.
+
+    Returns:
+        A function taking a chunk and returning whether `where` matches it.
+
+    Raises:
+        SchemaMismatchError: Raised by the function returned, not by this one, when
+            it reads a field the chunk holds no value for.
+
+    Example:
+        matches = build_chunk_matcher(KbChunks.document_id.eq(document_id))
+        found = [chunk for chunk in chunks if matches(chunk)]
+    """
+    match where:
+        case Equals(field=field, value=value):
+            return lambda chunk: chunk[field] == value
+        case In(field=field, values=values):
+            return lambda chunk: chunk[field] in values
+        case AnyOf(field=field, values=values):
+            return lambda chunk: not values.isdisjoint(chunk[field])
+        case And(filters=filters):
+            parts = [build_chunk_matcher(f) for f in filters]
+            return lambda chunk: all(part(chunk) for part in parts)
+        case Or(filters=filters):
+            parts = [build_chunk_matcher(f) for f in filters]
+            return lambda chunk: any(part(chunk) for part in parts)
+        case Not(filter=f):
+            part = build_chunk_matcher(f)
+            return lambda chunk: not part(chunk)
+        case Everything():
+            return lambda chunk: True
+        case _:
+            assert_never(where)
 
 
 def _check_filters(filters: tuple[Filter, ...], *, owner: str) -> None:

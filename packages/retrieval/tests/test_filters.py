@@ -5,6 +5,8 @@ from typing import Any
 
 import pytest
 
+from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.filters import (
     And,
     AnyOf,
@@ -14,6 +16,7 @@ from salemdex_retrieval.filters import (
     Not,
     Or,
     and_,
+    build_chunk_matcher,
     check_is_filter,
     not_,
     or_,
@@ -284,3 +287,111 @@ def test_a_combinator_built_directly_is_checked_too() -> None:
 
     with pytest.raises(TypeError, match="not a valid Filter"):
         Or(filters=(Chunks.version.eq(1), "version = 2"))  # type: ignore[arg-type]
+
+
+# build_chunk_matcher
+
+
+def chunk(
+    *,
+    document_id: uuid.UUID = DOCUMENT_ID,
+    version: int = 1,
+    groups: tuple[uuid.UUID, ...] = (HR,),
+) -> Chunk:
+    return Chunk(
+        id=uuid.uuid4(),
+        text="text",
+        field_values=[
+            Chunks.document_id.value(document_id),
+            Chunks.version.value(version),
+            Chunks.position.value(0),
+            Chunks.groups.value(groups),
+            Chunks.headings.value(()),
+        ],
+    )
+
+
+OTHER_DOCUMENT = uuid.UUID("00000000-0000-0000-0000-000000000002")
+
+
+@pytest.mark.parametrize(
+    ("where", "expected"),
+    [
+        pytest.param(Chunks.version.eq(1), True, id="eq, same value"),
+        pytest.param(Chunks.version.eq(2), False, id="eq, other value"),
+        pytest.param(Chunks.version.in_([1, 3]), True, id="in_, among the values"),
+        pytest.param(Chunks.version.in_([2, 3]), False, id="in_, not among them"),
+        pytest.param(Chunks.version.in_([]), False, id="in_, no values"),
+        pytest.param(Chunks.groups.any_of([HR, LEGAL]), True, id="any_of, sharing one"),
+        pytest.param(Chunks.groups.any_of([LEGAL]), False, id="any_of, sharing none"),
+        pytest.param(Chunks.groups.any_of([]), False, id="any_of, no values"),
+        pytest.param(
+            and_(Chunks.version.eq(1), Chunks.document_id.eq(DOCUMENT_ID)),
+            True,
+            id="and_, both match",
+        ),
+        pytest.param(
+            and_(Chunks.version.eq(1), Chunks.document_id.eq(OTHER_DOCUMENT)),
+            False,
+            id="and_, one doesn't",
+        ),
+        pytest.param(
+            or_(Chunks.version.eq(2), Chunks.document_id.eq(DOCUMENT_ID)),
+            True,
+            id="or_, one matches",
+        ),
+        pytest.param(
+            or_(Chunks.version.eq(2), Chunks.document_id.eq(OTHER_DOCUMENT)),
+            False,
+            id="or_, neither matches",
+        ),
+        pytest.param(not_(Chunks.version.eq(2)), True, id="not_, inner doesn't match"),
+        pytest.param(not_(Chunks.version.eq(1)), False, id="not_, inner matches"),
+        pytest.param(Everything(), True, id="Everything"),
+    ],
+)
+def test_a_chunk_matcher_tells_whether_a_chunk_matches_the_filter(
+    where: Any, expected: bool
+) -> None:
+    assert build_chunk_matcher(where)(chunk()) is expected
+
+
+def test_a_chunk_matcher_matches_nested_filters() -> None:
+    where = and_(
+        or_(Chunks.version.eq(2), Chunks.groups.any_of([HR])),
+        not_(Chunks.document_id.eq(OTHER_DOCUMENT)),
+    )
+    matches = build_chunk_matcher(where)
+
+    assert matches(chunk())
+    assert not matches(chunk(document_id=OTHER_DOCUMENT))
+    assert not matches(chunk(groups=(LEGAL,)))
+
+
+def test_a_chunk_matcher_is_built_once_and_used_on_many_chunks() -> None:
+    matches = build_chunk_matcher(Chunks.version.in_([1, 2]))
+
+    found = [matches(chunk(version=version)) for version in (1, 2, 3, 1)]
+
+    assert found == [True, True, False, True]
+
+
+def test_any_of_never_matches_a_chunk_with_no_values_for_its_field() -> None:
+    assert not build_chunk_matcher(Chunks.groups.any_of([HR]))(chunk(groups=()))
+
+
+def test_a_chunk_matcher_refuses_a_chunk_without_the_filters_field() -> None:
+    # The filter must be checked against the chunks' schema first; a chunk of
+    # another schema is an error, never quietly no match
+    title = Chunk(id=uuid.uuid4(), text="text", field_values=[Titles.title.value("A")])
+
+    with pytest.raises(SchemaMismatchError):
+        build_chunk_matcher(Chunks.version.eq(1))(title)
+
+
+def test_a_chunk_matcher_compares_fields_as_objects_not_by_name() -> None:
+    class Other(Schema):
+        version = One(int)
+
+    with pytest.raises(SchemaMismatchError):
+        build_chunk_matcher(Other.version.eq(1))(chunk())

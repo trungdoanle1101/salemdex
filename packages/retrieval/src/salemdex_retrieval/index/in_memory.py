@@ -13,14 +13,8 @@ from typing import Final, assert_never
 from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.filters import (
-    And,
-    AnyOf,
-    Equals,
-    Everything,
     Filter,
-    In,
-    Not,
-    Or,
+    build_chunk_matcher,
 )
 from salemdex_retrieval.index.protocol import (
     check_batch_matches_schema,
@@ -56,7 +50,7 @@ class InMemoryIndex:
     def find(self, *, where: Filter) -> list[Chunk]:
         """Return the stored chunks that `where` matches (`Index.find`)."""
         check_filter_matches_schema(where, schema=self.schema)
-        matches = self._build_matcher(where)
+        matches = build_chunk_matcher(where)
         return [
             embedded.chunk
             for embedded in self._embedded_chunks.values()
@@ -66,13 +60,13 @@ class InMemoryIndex:
     def delete(self, *, where: Filter) -> None:
         """Remove the stored chunks that `where` matches (`Index.delete`)."""
         check_filter_matches_schema(where, schema=self.schema)
-        matches = self._build_matcher(where)
+        matches = build_chunk_matcher(where)
         self._remove(matches)
 
     def replace(self, *, where: Filter, with_: Iterable[EmbeddedChunk]) -> None:
         """Swap the chunks `where` matches for `with_` (`Index.replace`)."""
         check_filter_matches_schema(where, schema=self.schema)
-        matches = self._build_matcher(where)
+        matches = build_chunk_matcher(where)
         batch = check_batch_matches_schema(with_, schema=self.schema)
         self._remove(matches)
         for embedded in batch:
@@ -87,40 +81,13 @@ class InMemoryIndex:
         check_positive_int(limit, name="limit")
         check_query_matches_schema(query, schema=self.schema)
         check_filter_matches_schema(where, schema=self.schema)
-        matches = self._build_matcher(where)
+        matches = build_chunk_matcher(where)
         hits = [
             Hit(chunk=embedded.chunk, score=_score(embedded, query=query))
             for embedded in self._embedded_chunks.values()
             if matches(embedded.chunk)
         ]
         return heapq.nlargest(limit, hits, key=lambda hit: hit.score)
-
-    def _build_matcher(self, where: Filter) -> Callable[[Chunk], bool]:
-        """Return a function telling whether a chunk matches `where`.
-
-        `where` must already be checked by `check_filter`: a field outside the schema
-        would raise `SchemaMismatchError` on the first chunk.
-        """
-        match where:
-            case Equals(field=field, value=value):
-                return lambda chunk: chunk[field] == value
-            case In(field=field, values=values):
-                return lambda chunk: chunk[field] in values
-            case AnyOf(field=field, values=values):
-                return lambda chunk: not values.isdisjoint(chunk[field])
-            case And(filters=filters):
-                parts = [self._build_matcher(f) for f in filters]
-                return lambda chunk: all(part(chunk) for part in parts)
-            case Or(filters=filters):
-                parts = [self._build_matcher(f) for f in filters]
-                return lambda chunk: any(part(chunk) for part in parts)
-            case Not(filter=f):
-                part = self._build_matcher(f)
-                return lambda chunk: not part(chunk)
-            case Everything():
-                return lambda chunk: True
-            case _:
-                assert_never(where)
 
     def _remove(self, matches: Callable[[Chunk], bool]) -> None:
         self._embedded_chunks = {
