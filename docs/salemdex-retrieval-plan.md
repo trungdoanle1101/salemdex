@@ -120,8 +120,11 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
      set, which only `document_processor.retrieval.evaluation` does today. It must exist
      before the old package goes, or the two can't be compared. The question types
      (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`), the
-     quote judge (`evaluation/judges/`) and the quote occurrences
-     (`evaluation/occurrences.py`) are built; next, the evaluator and runs.
+     quote judge (`evaluation/judges/`), the quote occurrences
+     (`evaluation/occurrences.py`) and the runs (`evaluation/runs.py`) are built; next,
+     `Assessment`, the scorecard, the comparison, and the evaluator's `judge_top_chunks`,
+     `score` and `compare` (its building, `quotes_not_found`, `gradable_questions` and
+     `run_statement` are built).
   6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
      `integrations/qdrant`, their tests (`tests/retrieval`,
      `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
@@ -1667,12 +1670,13 @@ The pattern from TREC: a **run** records what a system returned, **judgments** (
 "qrels") record what is relevant, and a **metric** is a function of both.
 
 ```text
-Run        the Statement, the limit, per question: the ranked passages as (chunk id, trail);
-           the questions' ids, tags and answerability; a fingerprint of the evaluator
-           no grading, no text
+Run            statement, chunks_by_question: question id → tuple[ReturnedChunk, ...]
+               (best first), evaluator_fingerprint                no grading, no text
+ReturnedChunk  chunk_id, trail      a chunk the statement returned, by its id
 Judgment   question id, chunk id (a UUID), grade, key_points: tuple[int, ...], judge (a name)
            grade: "unrelated" | "related" | "answered"; only "answered" may name key points
-Judgments  one judge's judgments; agreement_with(other)                     (with the evaluator)
+Assessment one judge's judgments, by (question id, chunk id): judge, judgment_of(question id,
+           chunk id) → Judgment | None (never judged), agreement_with(other)
 Judge      protocol: name, e.g. "quote"; judge(question, chunks) → one question's judgments
 ```
 
@@ -1690,12 +1694,22 @@ Judge      protocol: name, e.g. "quote"; judge(question, chunks) → one questio
   scored again by a new judge.
 - **Judgments are keyed by question and chunk, not by run:** comparing two statements
   judges the union of their top k once (pooling).
-- **The run keeps every passage it returned,** not only the one that matched: a judge added
+- **The run keeps every chunk it returned,** not only the one that matched: a judge added
   later has them all.
 - **The matching passage's trail gives per-stage ranks:** which source found it at what
   rank (`Found`), then after fusion and after the rerank.
-- **A run holds no text:** ids, ranks, scores and tags only, so it can be saved, logged and
-  diffed. Judges read chunk text by id from the corpus.
+- **A run holds no text:** chunk ids and trails (ranks and scores) only, so it can be
+  logged and diffed. Judges read chunk text by id from the corpus. Hence `ReturnedChunk`
+  rather than the engine's `Passage`, which holds its chunk.
+- **No questions in the run:** their tags and answerability come from the evaluator, which
+  scores the run. A saved run will need them ("Later"); copied in now, they'd be a second
+  place to disagree.
+- **The fingerprint is a `uuid4` made once per evaluator,** enough to refuse another
+  evaluator's run while everything is in memory. A hash of the questions and the corpus
+  comes with saving runs.
+
+`Run`, `ReturnedChunk` and `run_statement(prepared, *, questions, fingerprint, where)` are
+built in `evaluation/runs.py`, tested in `tests/evaluation/test_runs.py`.
 
 ### Judges
 
@@ -1743,7 +1757,7 @@ Built in `evaluation/occurrences.py`, tested in `tests/evaluation/test_occurrenc
 - **An LLM judge is checked against the quotes:** `by_llm.agreement_with(by_quote)` gives the
   agreement and the disagreements where both judged, saying whether to trust it where only
   it judges.
-- **One `Judgments` holds one judge's grades:** grades from two judges aren't comparable;
+- **One `Assessment` holds one judge's grades:** grades from two judges aren't comparable;
   combining judges is a new judge with its own name.
 - **An LLM judge's output that doesn't parse raises;** the pair stays unjudged, never a
   made-up 0.
@@ -1753,19 +1767,19 @@ Built in `evaluation/occurrences.py`, tested in `tests/evaluation/test_occurrenc
 ### The toolkit: three classes
 
 ```python
-evaluator = Evaluator(questions, corpus=index)  # checks and finds every quote once, here
+evaluator = Evaluator.from_index(questions, index=index)  # checks, reads, finds once
 
 evaluator.quotes_not_found  # QuoteOccurrences: labels or chunking to fix
 evaluator.gradable_questions  # the ones every metric counts
 
-dense = evaluator.run_statement(dense_only, limit=50)
-reranked = evaluator.run_statement(dense_then_rerank, limit=50)
+dense = evaluator.run_statement(engine.prepare(dense_only))
+reranked = evaluator.run_statement(engine.prepare(dense_then_rerank))
 
-judgments = evaluator.judge_top_passages(
+assessment = evaluator.judge_top_chunks(
     [dense, reranked], depth=10, judge=QuoteJudge()
 )
 
-scorecard = evaluator.score(reranked, judgments=judgments)
+scorecard = evaluator.score(reranked, assessment=assessment)
 scorecard.hit_rate_at(5)
 scorecard.mean_reciprocal_rank()
 scorecard.all_key_points_rate_at(10)  # every key point in the top 10
@@ -1776,7 +1790,7 @@ scorecard.questions_missed()
 scorecard.judged_share_at(10)  # how much of the top 10 has a judgment
 scorecard.for_tag("paraphrase").hit_rate_at(5)  # any metric, one kind
 
-comparison = evaluator.compare(dense, reranked, judgments=judgments)
+comparison = evaluator.compare(dense, reranked, assessment=assessment)
 comparison.questions_improved
 comparison.questions_worsened
 comparison.questions_unchanged
@@ -1784,20 +1798,28 @@ comparison.questions_unchanged
 
 | Class | Holds | Offers |
 |---|---|---|
-| `Evaluator` | questions, the corpus (an `Index`), where each quote was found | `quotes_not_found`, `gradable_questions`, `run_statement`, `judge_top_passages`, `score`, `compare` |
+| `Evaluator` | questions, the corpus (every chunk, by id, read once from the index), where each quote occurs, the fingerprint | `quotes_not_found`, `gradable_questions`, `run_statement`, `judge_top_chunks`, `score`, `compare` |
 | `Scorecard` | one run, its judgments, a subset of the questions | `hit_rate_at`, `mean_reciprocal_rank`, `all_key_points_rate_at`, `found_by_source_rate`, `count_rerank_moves`, `top_scores_by_answerability`, `questions_missed`, `judged_share_at`, `tags`, `for_tag` |
 | `Comparison` | two runs, their judgments | `questions_improved`, `questions_worsened`, `questions_unchanged` |
-| `Run`, `Judgments` | plain data | saved, loaded, passed around |
+| `Run`, `Assessment` | plain data | saved, loaded, passed around |
 
 - **Three classes, not one:** the evaluator holds what every step shares; a scorecard holds
   one run and its judgments, so its metrics take only their cut-off. One class holding every
   metric would take a run and judgments on each call.
 - **`for_tag` instead of a `tag=` on every metric:** it returns a scorecard over that subset,
   so every metric, those added later too, works per tag.
-- **Quotes are found once, when the evaluator is built,** and stays visible:
-  `quotes_not_found` lists the questions it can't grade, and a scorecard reports how many it
-  left out. A wrong label never counts as a retrieval miss.
-- **Each run records the evaluator's fingerprint** (questions and corpus); `score` and
+- **Quotes are found once, when the evaluator is built,** and the result stays visible:
+  `quotes_not_found` lists the quotes no chunk in their place holds, and a scorecard reports
+  how many questions it left out. A wrong label never counts as a retrieval miss.
+- **Built by `Evaluator.from_index`, frozen:** it checks the questions (not empty, ids
+  unique, each `where` against the schema) before reading the index, then keeps its own
+  copy of the questions and the corpus: every chunk, by id, read once. The corpus is a
+  snapshot. The index itself isn't kept, and nothing checks that a statement searches the
+  same one: the caller prepares both from one index.
+- **Gradable questions** have a quote found for every key point; an unanswerable question
+  has none to find, so it's gradable, for the abstention scores. Every question is run,
+  gradable or not: what's left out is decided when scoring.
+- **Each run records the evaluator's fingerprint**, a `uuid4` for now; `score` and
   `compare` refuse a run from another evaluator, so a comparison is always on the same
   corpus and questions.
 - **The classes are thin:** the logic lives in the modules below and is tested there.
@@ -1811,8 +1833,10 @@ comparison.questions_unchanged
   in-memory index and the quote judge, so a filter means the same in search and grading.
   Each quote's `where` is checked against the index's schema once, when the evaluator is
   built: a chunk doesn't know its schema, so the matcher can't check it.
-- **A run asks for every candidate:** `limit` at least the sum of the sources' depths (after
-  a merge, the union can exceed any one depth). The engine runs with `AlwaysValid` on a
+- **A run asks for every candidate:** the limit is the sum of the sources' depths, worked
+  out from the statement rather than given (after a merge, the union can exceed any one
+  depth but never their sum). A metric takes its own cut-off, so no caller needs fewer, and
+  a smaller limit would hide a chunk a source found but the rerank left low. The engine runs with `AlwaysValid` on a
   fixed corpus, so no gate hides a chunk; `where` is `Everything()` unless the caller
   evaluates under one asker's access.
 - **A question's rank** is the best rank of any chunk supplying a key point (hit@k, MRR);
@@ -1833,10 +1857,12 @@ comparison.questions_unchanged
 evaluation/
   __init__.py       the public names
   questions.py      Question, KeyPoint, Quote, and their checks (built)
-  evaluator.py      Evaluator
-  runs.py           Run, RankedPassage; running a prepared statement (no grading)
+  evaluator.py      Evaluator: from_index, quotes_not_found, gradable_questions,
+                    run_statement (built); judge_top_chunks, score, compare
+  runs.py           Run, ReturnedChunk, run_statement: running a prepared statement
+                    (no grading) (built)
   judges/
-    protocol.py     Judge, Judgment (built); Judgments, agreement
+    protocol.py     Judge, Judgment (built); Assessment, agreement
     quote.py        QuoteJudge (built)
     llm.py          the LLM judges (later, over the agents package's LLM protocol)
   matching.py       QuoteMatcher, normalize_text (built): what "a chunk holds a quote" means,

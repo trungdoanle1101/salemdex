@@ -11,7 +11,7 @@ across its top chunks, by the scorecard, never by a judge.
 """
 
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -92,6 +92,68 @@ class Judgment:
             self, "question_id", to_stripped_str(self.question_id, name="question_id")
         )
         object.__setattr__(self, "judge", to_stripped_str(self.judge, name="judge"))
+
+
+@dataclass(frozen=True, kw_only=True)
+class Assessment:
+    """One judge's judgments of the chunks runs returned, by question and chunk.
+
+    Every metric and comparison reads one assessment, so runs scored against it share
+    the same grades. It holds one judge's grades only: grades from two judges aren't
+    comparable, and combining judges is a new judge with its own name.
+
+    Attributes:
+        judge: The name of the judge every judgment came from, e.g. "quote"; stripped
+            of whitespace at either end.
+        judgments: Each judgment, keyed by its question id and chunk id. Read-only
+            when built by the evaluator.
+
+    Example:
+        assessment = evaluator.judge_top_chunks(runs, depth=10, judge=QuoteJudge())
+        judgment = assessment.judgment_of("kt-07", chunk_id)
+    """
+
+    judge: str
+    judgments: Mapping[tuple[str, uuid.UUID], Judgment]
+
+    def __post_init__(self) -> None:
+        """Strip the judge's name, and check every judgment is its and under its key.
+
+        Raises:
+            TypeError: The judge's name isn't a `str`.
+            ValueError: The judge's name is empty or only whitespace, a judgment came
+                from another judge, or a judgment is keyed by another question or
+                chunk than its own.
+        """
+        # The dataclass is frozen; this is the one place its judge is set
+        object.__setattr__(self, "judge", to_stripped_str(self.judge, name="judge"))
+
+        for key, judgment in self.judgments.items():
+            if judgment.judge != self.judge:
+                raise ValueError(
+                    f"question {judgment.question_id!r}, chunk {judgment.chunk_id}: "
+                    f"judged by {judgment.judge!r}, in an assessment by {self.judge!r}"
+                )
+            if key != (judgment.question_id, judgment.chunk_id):
+                raise ValueError(
+                    f"the judgment of question {judgment.question_id!r}, chunk "
+                    f"{judgment.chunk_id} is filed under {key!r}"
+                )
+
+    def judgment_of(self, question_id: str, chunk_id: uuid.UUID) -> Judgment | None:
+        """Return the judgment of `chunk_id` for `question_id`, or None if never judged.
+
+        None isn't "unrelated": the chunk was never read, e.g. it ranked below the
+        judged depth, so a metric counts it as unjudged, not as a miss.
+
+        Args:
+            question_id: The question's id, as `Question.id` gives it.
+            chunk_id: The chunk's id, as `Chunk.id` gives it.
+
+        Returns:
+            The judgment, or None when the judge never read the chunk for the question.
+        """
+        return self.judgments.get((question_id, chunk_id))
 
 
 class Judge(Protocol):

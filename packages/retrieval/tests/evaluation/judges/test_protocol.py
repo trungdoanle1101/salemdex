@@ -4,7 +4,12 @@ from typing import Any
 
 import pytest
 
-from salemdex_retrieval.evaluation.judges.protocol import Grade, Judge, Judgment
+from salemdex_retrieval.evaluation.judges.protocol import (
+    Assessment,
+    Grade,
+    Judge,
+    Judgment,
+)
 from salemdex_retrieval.evaluation.judges.quote import QuoteJudge
 
 CHUNK_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -100,3 +105,52 @@ def test_the_quote_judge_is_a_judge() -> None:
     judge: Judge = QuoteJudge()
 
     assert judge.name == "quote"
+
+
+def assessment_of(*judgments: Judgment, judge: str = "quote") -> Assessment:
+    return Assessment(
+        judge=judge,
+        judgments={(j.question_id, j.chunk_id): j for j in judgments},
+    )
+
+
+def test_an_assessment_finds_a_judgment_by_question_and_chunk() -> None:
+    judged = judgment(question_id="q-07")
+
+    assert assessment_of(judged).judgment_of("q-07", CHUNK_ID) is judged
+
+
+def test_a_chunk_never_judged_has_no_judgment_rather_than_unrelated() -> None:
+    assessment = assessment_of(judgment(question_id="q-07"))
+
+    assert assessment.judgment_of("q-08", CHUNK_ID) is None
+    assert assessment.judgment_of("q-07", uuid.uuid4()) is None
+
+
+def test_an_assessment_strips_its_judges_name() -> None:
+    assert assessment_of(judge="  quote ").judge == "quote"
+
+
+@pytest.mark.parametrize("name", TEXTS_WITHOUT_TEXT)
+def test_an_assessment_refuses_a_judge_without_a_name(name: str) -> None:
+    with pytest.raises(ValueError):
+        assessment_of(judge=name)
+
+
+def test_an_assessment_refuses_a_judgment_by_another_judge() -> None:
+    with pytest.raises(ValueError, match="judged by 'llm'"):
+        assessment_of(judgment(judge="llm"), judge="quote")
+
+
+def test_an_assessment_refuses_a_judgment_filed_under_another_key() -> None:
+    judged = judgment(question_id="q-07")
+
+    with pytest.raises(ValueError, match="filed under"):
+        Assessment(judge="quote", judgments={("q-08", CHUNK_ID): judged})
+
+
+def test_an_assessment_cannot_be_changed() -> None:
+    assessment = assessment_of()
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        assessment.judge = "llm"  # type: ignore[misc]
