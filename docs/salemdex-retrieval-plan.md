@@ -122,9 +122,10 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
      (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`), the
      quote judge (`evaluation/judges/`), the quote occurrences
      (`evaluation/occurrences.py`), the runs (`evaluation/runs.py`), `Assessment` and the
-     evaluator's pooling (`judge_top_chunks`), and the scorecard with its rank metrics
-     (`evaluator.score`, `hit_rate_at`, `mean_reciprocal_rank_at`) are built; next, the
-     scorecard's other metrics and `for_tag`, then the comparison and `compare`.
+     evaluator's pooling (`judge_top_chunks`), and the scorecard (`evaluator.score`, its
+     metrics with a cut-off, `for_tag` and `tags`) are built; next, the old/new gate on
+     the real question set, the comparison and `compare`, abstention, then the stage
+     metrics.
   6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
      `integrations/qdrant`, their tests (`tests/retrieval`,
      `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
@@ -1789,7 +1790,7 @@ scorecard.all_key_points_rate_at(10)  # every key point in the top 10
 scorecard.found_by_source_rate("dense")  # retrieval reached it at all
 scorecard.count_rerank_moves()  # up / down / unchanged
 scorecard.top_scores_by_answerability()  # for abstention
-scorecard.questions_missed()
+scorecard.questions_missed_at(10)  # the rows to look into
 scorecard.questions_left_out  # a quote not found: not counted by any metric
 scorecard.for_tag("paraphrase").hit_rate_at(5)  # any metric, one kind
 
@@ -1802,7 +1803,7 @@ comparison.questions_unchanged
 | Class | Holds | Offers |
 |---|---|---|
 | `Evaluator` | questions, the corpus (every chunk, by id, read once from the index), where each quote occurs, the fingerprint | `quotes_not_found`, `gradable_questions`, `run_statement`, `judge_top_chunks`, `score`, `compare` |
-| `Scorecard` | one run's top chunks joined with their judgments, question by question; the questions left out; the judged depth | `hit_rate_at`, `mean_reciprocal_rank_at`, `all_key_points_rate_at`, `found_by_source_rate`, `count_rerank_moves`, `top_scores_by_answerability`, `questions_missed`, `questions_left_out`, `tags`, `for_tag` |
+| `Scorecard` | one run's top chunks joined with their judgments, question by question; the questions left out; the judged depth | `hit_rate_at`, `mean_reciprocal_rank_at`, `all_key_points_rate_at`, `found_by_source_rate`, `count_rerank_moves`, `top_scores_by_answerability`, `questions_missed_at`, `questions_left_out`, `tags`, `for_tag` |
 | `Comparison` | two runs, their judgments | `questions_improved`, `questions_worsened`, `questions_unchanged` |
 | `Run`, `Assessment` | plain data | saved, loaded, passed around |
 
@@ -1832,8 +1833,10 @@ comparison.questions_unchanged
 ```text
 Scorecard        statement, questions: tuple[ScoredQuestion, ...],
                  questions_left_out: tuple[Question, ...], judged_depth
-ScoredQuestion   question, chunks: tuple[RankedChunk, ...] (best first, at most judged_depth)
-                 first_answered_rank: from 1, or None
+ScoredQuestion   question, chunks: tuple[RankedChunk, ...]
+                   (best first, at most judged_depth)
+                 first_answered_rank, all_key_points_rank: from 1, or None
+                 is_answered_within(k), has_all_key_points_within(k)
 RankedChunk      returned: ReturnedChunk, judgment: Judgment; is_answered
 ```
 
@@ -1841,7 +1844,8 @@ RankedChunk      returned: ReturnedChunk, judgment: Judgment; is_answered
 so every metric reads one row per question. It refuses a run from another evaluator, and a
 run whose top `judged_depth` chunks aren't all judged: one that wasn't passed to
 `judge_top_chunks`. Built in `evaluation/scorecard.py` (`hit_rate_at`,
-`mean_reciprocal_rank_at`) and `evaluation/evaluator.py` (`score`), tested in
+`mean_reciprocal_rank_at`, `all_key_points_rate_at`, `questions_missed_at`, `for_tag`,
+`tags`) and `evaluation/evaluator.py` (`score`), tested in
 `tests/evaluation/test_scorecard.py` and `tests/evaluation/test_evaluator.py`.
 
 - **A join, but each unit kept whole:** a row holds its `Question`, and each chunk its
@@ -1855,6 +1859,19 @@ run whose top `judged_depth` chunks aren't all judged: one that wasn't passed to
 - **A metric checks its own subset:** a card of any questions, even none, can be built, and
   a rank metric with no answerable question to rank raises rather than returning 0. A card
   of unanswerable questions still serves abstention.
+- **Each metric with a cut-off reads one predicate of the row** (`is_answered_within`,
+  `has_all_key_points_within`), so the hit rate and the questions missed can't drift
+  apart: the missed are exactly the questions the hit rate doesn't count.
+- **The all-key-points rank compares sets, not counts:** the key points named so far must
+  include every position, so a judgment naming a position the question lacks can't
+  complete it. `judge_top_chunks` refuses such a judgment anyway; an assessment built
+  some other way doesn't pass that check.
+- **`questions_missed_at` returns the rows,** not ids: a miss is looked into through its
+  chunks, judgments and trails.
+- **`for_tag` returns a card over the tag's rows and left-out questions,** with the same
+  statement and depth, so every metric works per tag. A tag whose questions were all left
+  out gives a card with no rows, which says its labels need fixing; a tag no question
+  has is refused, to catch a typo. `tags` is worked out from the questions, never stored.
 - **Planned for the stage metrics** (`found_by_source_rate`, `count_rerank_moves`): they need
   chunks the rerank left below the depth. Each run then pools the top `depth` of each of
   its own stages, so those chunks are judged because of the run itself, never because of
@@ -1885,8 +1902,11 @@ run whose top `judged_depth` chunks aren't all judged: one that wasn't passed to
   else was pooled; below it, a chunk may be judged only because another run ranked it
   higher, so a score read there would depend on which runs were judged together. To score
   deeper, judge deeper: the quote judge is cheap.
-- **A metric that needs key point links** (the all-key-points rate) refuses judgments that
-  have none (`LlmRelevanceJudge`'s), rather than returning 0.
+- **A metric that needs key point links** (the all-key-points rate) refuses a card with an
+  answered chunk that names none (`LlmRelevanceJudge`'s), rather than counting it as
+  supplying nothing. It checks the whole card, not the top k: naming key points is the
+  judge's way, so the rate is readable at every k or at none. Unanswerable questions are
+  skipped, since they have no key points to name.
 - **The old/new gate** compares the new numbers with the old evaluator's passage level,
   which also required the reference key: quote-only grading is slightly more lenient.
 
@@ -1908,7 +1928,8 @@ evaluation/
                     shared by the judge and the occurrences
   occurrences.py    QuoteOccurrences, find_quote_occurrences (built)
   scorecard.py      Scorecard, ScoredQuestion, RankedChunk: the metrics over one run and
-                    its judgments (built: hit_rate_at, mean_reciprocal_rank_at)
+                    its judgments (built: hit_rate_at, mean_reciprocal_rank_at,
+                    all_key_points_rate_at, questions_missed_at, for_tag, tags)
   comparison.py     Comparison: two runs, question by question
 ```
 

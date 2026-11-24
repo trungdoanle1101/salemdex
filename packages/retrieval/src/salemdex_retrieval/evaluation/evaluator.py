@@ -160,7 +160,8 @@ class Evaluator:
             ValueError: `depth` isn't a positive `int`; there are no runs, or one was
                 made by another evaluator; a run returned a chunk that isn't in the
                 corpus; or the judge didn't return one judgment, by its name and for
-                the question, for each chunk it was given.
+                the question, for each chunk it was given, or named a key point the
+                question doesn't have.
         """
         check_positive_int(depth, name="depth")
         runs = tuple(runs)
@@ -210,6 +211,23 @@ class Evaluator:
         )
 
     def score(self, run: Run, *, assessment: Assessment) -> Scorecard:
+        """Return `run`'s scorecard: its top chunks joined with their judgments.
+
+        One row per gradable question, holding its top `judged_depth` chunks; the
+        other questions are kept as left out, so the card says what it didn't count.
+
+        Args:
+            run: The run to score, made by this evaluator.
+            assessment: Judgments of the run's top chunks: `run` was among the runs
+                passed to `judge_top_chunks`.
+
+        Returns:
+            The scorecard, read to the assessment's judged depth.
+
+        Raises:
+            ValueError: The run was made by another evaluator, or one of its chunks
+                within the judged depth has no judgment in `assessment`.
+        """
         self._check_runs([run])
         rows: list[ScoredQuestion] = []
         left_out: list[Question] = []
@@ -307,8 +325,9 @@ def _check_judged(
     output) fails at once, naming the question.
 
     Raises:
-        ValueError: A judgment is for another question or by another judge, a chunk
-            was judged twice, or the chunks judged aren't the chunks given.
+        ValueError: A judgment is for another question or by another judge, or names
+            a key point the question doesn't have; a chunk was judged twice; or the
+            chunks judged aren't the chunks given.
     """
     seen: set[uuid.UUID] = set()
     for judgment in judged:
@@ -327,6 +346,15 @@ def _check_judged(
                 f"judge {judge!r}, question {question.id!r}: judged chunk "
                 f"{judgment.chunk_id} twice"
             )
+
+        max_key_point_index = max(judgment.key_points, default=-1)
+        if max_key_point_index >= len(question.key_points):
+            raise ValueError(
+                f"judge {judge!r}, question {question.id!r}: returned a judgment "
+                f"with a key point index of {max_key_point_index}, "
+                f"but the question only has {len(question.key_points)} key points"
+            )
+
         seen.add(judgment.chunk_id)
 
     if seen != set(pool):
@@ -340,6 +368,12 @@ def _check_judged(
 def _score_question(
     question: Question, *, run: Run, assessment: Assessment
 ) -> ScoredQuestion:
+    """Return the question's row: its top `judged_depth` chunks, each with its judgment.
+
+    Raises:
+        ValueError: A chunk within the depth has no judgment: the run wasn't judged in
+            this assessment.
+    """
     ranked_chunks: list[RankedChunk] = []
     chunks = run.chunks_by_question[question.id][: assessment.judged_depth]
     for returned in chunks:

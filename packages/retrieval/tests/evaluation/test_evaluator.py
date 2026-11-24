@@ -528,6 +528,25 @@ def test_judging_refuses_a_judge_that_doesnt_judge_each_chunk_given_once(
         evaluator.judge_top_chunks([run], depth=2, judge=BrokenJudge(spoil))
 
 
+def name_a_key_point_the_question_lacks(judged: list[Judgment]) -> list[Judgment]:
+    return [
+        dataclasses.replace(judged[0], grade="answered", key_points=(0, 1)),
+        *judged[1:],
+    ]
+
+
+def test_judging_refuses_a_judgment_naming_a_key_point_the_question_lacks() -> None:
+    # A judgment doesn't know its question, so only the evaluator can check this
+    evaluator, [home, writing, _] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    run = run_of(evaluator, {"q-01": [home, writing]})
+    judge = BrokenJudge(name_a_key_point_the_question_lacks)
+
+    with pytest.raises(ValueError, match="key point"):
+        evaluator.judge_top_chunks([run], depth=2, judge=judge)
+
+
 # Scoring: a run and an assessment joined, question by question
 
 
