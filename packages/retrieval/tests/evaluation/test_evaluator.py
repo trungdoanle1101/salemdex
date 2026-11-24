@@ -407,6 +407,15 @@ def test_chunks_below_the_depth_are_left_unjudged() -> None:
     assert assessment.judgment_of("q-01", answers) is None
 
 
+def test_the_assessment_records_the_depth_it_was_judged_to() -> None:
+    evaluator, [home, writing, answers] = evaluator_with_ids(question("q-01"))
+    run = run_of(evaluator, {"q-01": [home, writing, answers]})
+
+    assessment = evaluator.judge_top_chunks([run], depth=2, judge=QuoteJudge())
+
+    assert assessment.judged_depth == 2
+
+
 def test_every_question_is_judged_gradable_or_not() -> None:
     evaluator, [home, *_] = evaluator_with_ids(
         question("q-01", key_point(FOUND)),
@@ -517,3 +526,97 @@ def test_judging_refuses_a_judge_that_doesnt_judge_each_chunk_given_once(
 
     with pytest.raises(ValueError, match=message):
         evaluator.judge_top_chunks([run], depth=2, judge=BrokenJudge(spoil))
+
+
+# Scoring: a run and an assessment joined, question by question
+
+
+def test_scoring_leaves_out_questions_with_a_quote_not_found_and_keeps_them() -> None:
+    evaluator, [home, *_] = evaluator_with_ids(
+        question("q-01", key_point(FOUND)),
+        question("q-02", key_point(NOT_FOUND)),
+        question("q-03"),
+    )
+    run = run_of(evaluator, {"q-01": [home], "q-02": [home], "q-03": [home]})
+    assessment = evaluator.judge_top_chunks([run], depth=1, judge=QuoteJudge())
+
+    card = evaluator.score(run, assessment=assessment)
+
+    # An unanswerable question is gradable: abstention scores it
+    assert [row.question.id for row in card.questions] == ["q-01", "q-03"]
+    assert [question.id for question in card.questions_left_out] == ["q-02"]
+
+
+def test_scoring_keeps_each_questions_top_chunks_to_the_judged_depth() -> None:
+    evaluator, [home, writing, answers] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    run = run_of(evaluator, {"q-01": [writing, home, answers]})
+    assessment = evaluator.judge_top_chunks([run], depth=2, judge=QuoteJudge())
+
+    card = evaluator.score(run, assessment=assessment)
+
+    [row] = card.questions
+    assert [chunk.returned.chunk_id for chunk in row.chunks] == [writing, home]
+    assert row.first_answered_rank == 2
+
+
+def test_a_question_with_fewer_chunks_than_the_judged_depth_keeps_them_all() -> None:
+    evaluator, [home, *_] = evaluator_with_ids(question("q-01", key_point(FOUND)))
+    run = run_of(evaluator, {"q-01": [home]})
+    assessment = evaluator.judge_top_chunks([run], depth=3, judge=QuoteJudge())
+
+    [row] = evaluator.score(run, assessment=assessment).questions
+
+    assert [chunk.returned.chunk_id for chunk in row.chunks] == [home]
+
+
+def test_a_runs_score_doesnt_depend_on_the_runs_that_shared_its_pool() -> None:
+    evaluator, [home, writing, answers] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    # `home` holds the quote: third in this run, so below the depth, but first in
+    # the other, so judged when the two are pooled
+    run = run_of(evaluator, {"q-01": [writing, answers, home]})
+    other = run_of(evaluator, {"q-01": [home, writing, answers]})
+
+    alone = evaluator.judge_top_chunks([run], depth=2, judge=QuoteJudge())
+    pooled = evaluator.judge_top_chunks([run, other], depth=2, judge=QuoteJudge())
+
+    card_alone = evaluator.score(run, assessment=alone)
+    card_pooled = evaluator.score(run, assessment=pooled)
+    assert card_alone.questions == card_pooled.questions
+    assert card_pooled.hit_rate_at(2) == 0.0
+
+
+def test_the_scorecard_carries_the_runs_statement_and_the_judged_depth() -> None:
+    evaluator, [home, *_] = evaluator_with_ids(question("q-01", key_point(FOUND)))
+    run = run_of(evaluator, {"q-01": [home]})
+    assessment = evaluator.judge_top_chunks([run], depth=4, judge=QuoteJudge())
+
+    card = evaluator.score(run, assessment=assessment)
+
+    assert card.statement == STATEMENT
+    assert card.judged_depth == 4
+
+
+def test_scoring_refuses_a_run_that_wasnt_judged_in_the_assessment() -> None:
+    evaluator, [home, writing, _] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    judged = run_of(evaluator, {"q-01": [home]})
+    never_judged = run_of(evaluator, {"q-01": [writing]})
+    assessment = evaluator.judge_top_chunks([judged], depth=1, judge=QuoteJudge())
+
+    with pytest.raises(ValueError, match="wasn't judged in this assessment"):
+        evaluator.score(never_judged, assessment=assessment)
+
+
+def test_scoring_refuses_a_run_from_another_evaluator() -> None:
+    evaluator, [home, *_] = evaluator_with_ids(question("q-01", key_point(FOUND)))
+    run = run_of(evaluator, {"q-01": [home]})
+    other = run_of(evaluator, {"q-01": [home]}, fingerprint=uuid.uuid4())
+    assessment = evaluator.judge_top_chunks([run], depth=1, judge=QuoteJudge())
+
+    with pytest.raises(ValueError, match="another evaluator"):
+        evaluator.score(other, assessment=assessment)

@@ -27,6 +27,11 @@ from salemdex_retrieval.evaluation.occurrences import (
 )
 from salemdex_retrieval.evaluation.questions import Question
 from salemdex_retrieval.evaluation.runs import Run, run_statement
+from salemdex_retrieval.evaluation.scorecard import (
+    RankedChunk,
+    Scorecard,
+    ScoredQuestion,
+)
 from salemdex_retrieval.filters import Everything, Filter
 from salemdex_retrieval.index import Index
 from salemdex_retrieval.index.protocol import check_filter_matches_schema
@@ -137,9 +142,10 @@ class Evaluator:
         one judgment. Every question is judged, gradable or not; scoring decides what to
         leave out.
 
-        `depth` bounds what's judged, and so the cost; it isn't a metric's cut-off. A
-        metric at k up to `depth` finds every chunk judged; past it, a scorecard reports
-        the share judged instead of counting the rest as misses.
+        `depth` bounds what's judged, and so the cost, and it caps every metric's
+        cut-off: the assessment records it as `judged_depth`. Below it, a run's chunk
+        may be judged only because another run ranked it higher, so a score read there
+        would depend on which runs shared the pool. To score deeper, judge deeper.
 
         Args:
             runs: The runs to judge, all made by this evaluator; at least one.
@@ -147,7 +153,8 @@ class Evaluator:
             judge: Grades the chunks: by quotes, an LLM, or people.
 
         Returns:
-            The assessment: one judgment per pooled chunk and question, by `judge`.
+            The assessment: one judgment per pooled chunk and question, by `judge`,
+            judged to `depth`.
 
         Raises:
             ValueError: `depth` isn't a positive `int`; there are no runs, or one was
@@ -170,7 +177,9 @@ class Evaluator:
             for judgment in judged:
                 judgments[(judgment.question_id, judgment.chunk_id)] = judgment
 
-        return Assessment(judge=judge.name, judgments=MappingProxyType(judgments))
+        return Assessment(
+            judge=judge.name, judgments=MappingProxyType(judgments), judged_depth=depth
+        )
 
     def run_statement(
         self, prepared: PreparedStatement, *, where: Filter = _EVERYTHING
@@ -200,7 +209,26 @@ class Evaluator:
             where=where,
         )
 
-    def _check_runs(self, runs: tuple[Run, ...]) -> None:
+    def score(self, run: Run, *, assessment: Assessment) -> Scorecard:
+        self._check_runs([run])
+        rows: list[ScoredQuestion] = []
+        left_out: list[Question] = []
+        gradable_ids = {question.id for question in self.gradable_questions}
+        for question in self.questions:
+            if question.id not in gradable_ids:
+                left_out.append(question)
+                continue
+
+            rows.append(_score_question(question, run=run, assessment=assessment))
+
+        return Scorecard(
+            statement=run.statement,
+            questions=tuple(rows),
+            questions_left_out=tuple(left_out),
+            judged_depth=assessment.judged_depth,
+        )
+
+    def _check_runs(self, runs: Sequence[Run]) -> None:
         """Check there's a run, and every one was made by this evaluator.
 
         Raises:
@@ -307,3 +335,19 @@ def _check_judged(
             f"{len(seen - set(pool))} chunks it wasn't given and left "
             f"{len(set(pool) - seen)} of the {len(pool)} given unjudged"
         )
+
+
+def _score_question(
+    question: Question, *, run: Run, assessment: Assessment
+) -> ScoredQuestion:
+    ranked_chunks: list[RankedChunk] = []
+    chunks = run.chunks_by_question[question.id][: assessment.judged_depth]
+    for returned in chunks:
+        judgment = assessment.judgment_of(question.id, returned.chunk_id)
+        if judgment is None:
+            raise ValueError(
+                "this run wasn't judged in this assessment: pass it to judge_top_chunks"
+            )
+        ranked = RankedChunk(returned=returned, judgment=judgment)
+        ranked_chunks.append(ranked)
+    return ScoredQuestion(question=question, chunks=tuple(ranked_chunks))

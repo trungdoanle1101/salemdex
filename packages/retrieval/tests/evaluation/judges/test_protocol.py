@@ -107,10 +107,13 @@ def test_the_quote_judge_is_a_judge() -> None:
     assert judge.name == "quote"
 
 
-def assessment_of(*judgments: Judgment, judge: str = "quote") -> Assessment:
+def assessment_of(
+    *judgments: Judgment, judge: str = "quote", judged_depth: int = 10
+) -> Assessment:
     return Assessment(
         judge=judge,
         judgments={(j.question_id, j.chunk_id): j for j in judgments},
+        judged_depth=judged_depth,
     )
 
 
@@ -146,7 +149,17 @@ def test_an_assessment_refuses_a_judgment_filed_under_another_key() -> None:
     judged = judgment(question_id="q-07")
 
     with pytest.raises(ValueError, match="filed under"):
-        Assessment(judge="quote", judgments={("q-08", CHUNK_ID): judged})
+        Assessment(
+            judge="quote", judgments={("q-08", CHUNK_ID): judged}, judged_depth=10
+        )
+
+
+@pytest.mark.parametrize("judged_depth", [0, -1, True])
+def test_an_assessment_refuses_a_judged_depth_that_isnt_a_positive_int(
+    judged_depth: int,
+) -> None:
+    with pytest.raises(ValueError, match="judged_depth"):
+        assessment_of(judged_depth=judged_depth)
 
 
 def test_an_assessment_cannot_be_changed() -> None:

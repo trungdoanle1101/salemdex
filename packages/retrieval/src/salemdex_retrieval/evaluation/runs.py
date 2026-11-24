@@ -57,7 +57,7 @@ class Run:
 
     Example:
         for returned in run.chunks_by_question["kt-07"]:
-            judgments.is_answered("kt-07", returned.chunk_id)
+            assessment.judgment_of("kt-07", returned.chunk_id)
     """
 
     statement: Statement

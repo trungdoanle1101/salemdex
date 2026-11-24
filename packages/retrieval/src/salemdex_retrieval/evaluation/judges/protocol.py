@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from salemdex_retrieval.checks import to_stripped_str
+from salemdex_retrieval.checks import check_positive_int, to_stripped_str
 from salemdex_retrieval.chunks import Chunk
 from salemdex_retrieval.evaluation.questions import Question
 
@@ -107,6 +107,10 @@ class Assessment:
             of whitespace at either end.
         judgments: Each judgment, keyed by its question id and chunk id. Read-only
             when built by the evaluator.
+        judged_depth: How many of each judged run's top chunks, per question, have a
+            judgment. A metric's cut-off can't exceed it: within it, every chunk of a
+            judged run is judged whatever other runs shared the pool, so pooling
+            never changes a run's score.
 
     Example:
         assessment = evaluator.judge_top_chunks(runs, depth=10, judge=QuoteJudge())
@@ -115,18 +119,20 @@ class Assessment:
 
     judge: str
     judgments: Mapping[tuple[str, uuid.UUID], Judgment]
+    judged_depth: int
 
     def __post_init__(self) -> None:
-        """Strip the judge's name, and check every judgment is its and under its key.
+        """Strip the judge's name, and check the depth and every judgment's key and judge.
 
         Raises:
             TypeError: The judge's name isn't a `str`.
-            ValueError: The judge's name is empty or only whitespace, a judgment came
-                from another judge, or a judgment is keyed by another question or
-                chunk than its own.
+            ValueError: The judge's name is empty or only whitespace, the judged depth
+                isn't a positive `int`, a judgment came from another judge, or a
+                judgment is keyed by another question or chunk than its own.
         """
         # The dataclass is frozen; this is the one place its judge is set
         object.__setattr__(self, "judge", to_stripped_str(self.judge, name="judge"))
+        check_positive_int(self.judged_depth, name="judged_depth")
 
         for key, judgment in self.judgments.items():
             if judgment.judge != self.judge:
@@ -144,7 +150,8 @@ class Assessment:
         """Return the judgment of `chunk_id` for `question_id`, or None if never judged.
 
         None isn't "unrelated": the chunk was never read, e.g. it ranked below the
-        judged depth, so a metric counts it as unjudged, not as a miss.
+        judged depth, or its run wasn't judged in this assessment. Metrics read only
+        within the judged depth of a judged run, where every chunk has a judgment.
 
         Args:
             question_id: The question's id, as `Question.id` gives it.
