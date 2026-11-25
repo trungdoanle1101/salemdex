@@ -3,10 +3,10 @@ from collections.abc import Sequence
 
 import pytest
 
-from salemdex_retrieval.chunks import Chunk
+from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.embedders.protocol import DenseBinding, embed_chunks
 from salemdex_retrieval.schema import One, Schema
-from salemdex_retrieval.vectors import Dense
+from salemdex_retrieval.vectors import Dense, DenseValue
 
 
 class Chunks(Schema):
@@ -65,7 +65,7 @@ def test_each_chunk_gets_the_embedding_of_its_embedded_text() -> None:
     )
 
     assert [item.chunk for item in embedded] == chunks
-    assert [item.vector_values[Chunks.body].numbers for item in embedded] == [
+    assert [numbers_of(item, Chunks.body) for item in embedded] == [
         (float(len(chunk.embedded_text)), 1.0) for chunk in chunks
     ]
 
@@ -91,8 +91,8 @@ def test_each_binding_fills_its_own_vector() -> None:
     )
 
     for item in embedded:
-        assert item.vector_values[Chunks.body].numbers[1] == 1.0
-        assert item.vector_values[Chunks.title].numbers[1] == 2.0
+        assert numbers_of(item, Chunks.body)[1] == 1.0
+        assert numbers_of(item, Chunks.title)[1] == 2.0
         item.check_fits(Chunks)
 
 
@@ -162,3 +162,10 @@ def test_a_row_of_the_wrong_size_is_refused() -> None:
             build_chunks(2),
             bindings=[DenseBinding(vector=Chunks.body, embedder=WrongSize())],
         )
+
+
+def numbers_of(embedded: EmbeddedChunk, vector: Dense) -> tuple[float, ...]:
+    """Return the numbers of `embedded`'s value for the dense `vector`."""
+    value = embedded.vector_values[vector]
+    assert isinstance(value, DenseValue)
+    return value.numbers

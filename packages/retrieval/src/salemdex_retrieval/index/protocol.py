@@ -109,6 +109,12 @@ class Index(Protocol):
         no place among the hits, so `limit` is filled by matching chunks whenever there
         are enough. Hits with equal scores come in no promised order.
 
+        How the score is read depends on the query's vector. A dense one compares by its
+        `distance`. A sparse one is the dot product over the ids the query and the chunk
+        share, so a chunk sharing none isn't a hit, and `limit` may go unfilled; with
+        `modifier="idf"`, each query weight is first multiplied by its id's IDF over
+        every stored chunk, whatever `where` matches.
+
         Like `find`, this applies no asker's filter of its own. The engine passes the
         run's filter in `where`; anything serving a user searches through a prepared
         statement.
@@ -199,7 +205,8 @@ def check_query_matches_schema(query: VectorQuery, *, schema: type[Schema]) -> N
 
     Every backend calls it before reading anything. Vectors are compared as objects,
     not by name, as fields are in `check_filter`. The numbers aren't checked again:
-    `Dense.query` checked them against their vector when the query was built.
+    `Dense.query` or `Sparse.query` checked them against their vector when the query was
+    built.
 
     Args:
         query: The query about to be run.
