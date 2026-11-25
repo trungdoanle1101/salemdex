@@ -1,11 +1,12 @@
 """Searching a sparse vector, run against each backend in turn.
 
-What Qdrant does is the reference: scores are the dot product over the ids the query
-and the chunk share, a chunk sharing none isn't a hit, and with `modifier="idf"` each
-query weight is first multiplied by its id's IDF over every stored chunk.
+What a Qdrant server does is the reference: scores are the dot product over the ids the
+query and the chunk share, a chunk sharing none isn't a hit, and with `modifier="idf"`
+each query weight is first multiplied by its id's IDF over every stored chunk with at
+least one weight.
 
-Until `QdrantIndex` stores sparse vectors, its backends are expected to fail here
-(strictly, so the marks go when it does).
+No test reads IDF after a delete or an overwrite: the server goes on counting the old
+points until it cleans its segments up, which no other backend can mirror.
 """
 
 import math
@@ -33,20 +34,12 @@ type Rows = Sequence[Mapping[int, float]]
 
 
 @pytest.fixture
-def index_of(
-    new_index: Callable[[type[Schema]], Index], request: pytest.FixtureRequest
-) -> Callable[[Rows], Index]:
+def index_of(new_index: Callable[[type[Schema]], Index]) -> Callable[[Rows], Index]:
     """Return a function opening an index of Terms, one chunk per row, at its position.
 
     Each chunk has the row as its value for both vectors, so a test picks the modifier
     by the vector it searches.
     """
-    if str(request.node.callspec.params["new_index"]).startswith("qdrant"):
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True, reason="QdrantIndex doesn't store sparse vectors yet"
-            )
-        )
 
     def open_with(rows: Rows) -> Index:
         index = new_index(Terms)
@@ -156,12 +149,20 @@ def test_idf_counts_every_stored_chunk_not_only_those_where_matches(
     assert only_first[0].score == pytest.approx(everywhere[0].score)
 
 
-def test_a_chunk_with_no_weights_still_counts_towards_the_number_of_chunks(
-    index_of: Callable[[Rows], Index],
+def test_a_chunk_with_no_weights_does_not_count_towards_the_number_of_chunks(
+    index_of: Callable[[Rows], Index], request: pytest.FixtureRequest
 ) -> None:
+    if request.node.callspec.params["new_index"] == "qdrant-local":
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="the client's local mode counts it; the server, the reference, "
+                "doesn't",
+            )
+        )
     index = index_of([{1: 1.0}, {}])
 
     found = scores(index, {1: 1.0}, vector=Terms.counted)
 
     assert list(found) == [0]
-    assert found[0] == pytest.approx(idf(1, chunk_count=2))
+    assert found[0] == pytest.approx(idf(1, chunk_count=1))

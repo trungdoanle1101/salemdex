@@ -43,6 +43,10 @@ from salemdex_retrieval.vectors import (
     DenseDistance,
     DenseQuery,
     DenseValue,
+    Sparse,
+    SparseModifier,
+    SparseQuery,
+    SparseValue,
     VectorQuery,
     VectorValue,
 )
@@ -55,12 +59,15 @@ _QDRANT_DISTANCES: dict[DenseDistance, models.Distance] = {
     "cosine": models.Distance.COSINE,
     "dot": models.Distance.DOT,
 }
+_QDRANT_SPARSE_MODIFIERS: dict[SparseModifier, models.Modifier] = {
+    "none": models.Modifier.NONE,
+    "idf": models.Modifier.IDF,
+}
 
 
 # What Qdrant stores under a vector's name, and takes as a query for it. Widens with
-# each kind of vector: list[list[float]] for multi-dense, models.SparseVector for
-# sparse.
-type _QdrantVectorData = list[float]
+# each kind of vector: list[list[float]] for multi-dense.
+type _QdrantVectorData = list[float] | models.SparseVector
 
 
 class QdrantIndex:
@@ -383,6 +390,10 @@ def _qdrant_vector_configs(schema: type[Schema]) -> _VectorConfigs:
             dense[name] = models.VectorParams(
                 size=vector.size, distance=_QDRANT_DISTANCES[vector.distance]
             )
+        elif isinstance(vector, Sparse):
+            sparse[name] = models.SparseVectorParams(
+                modifier=_QDRANT_SPARSE_MODIFIERS[vector.modifier]
+            )
         else:
             raise TypeError(f"unknown vector type {type(vector).__name__}")
     return _VectorConfigs(dense=dense, sparse=sparse)
@@ -531,6 +542,10 @@ def _to_qdrant_query(query: VectorQuery) -> _QdrantVectorData:
     match query:
         case DenseQuery(numbers=numbers):
             return list(numbers)
+        case SparseQuery(weights=weights):
+            return models.SparseVector(
+                indices=list(weights), values=list(weights.values())
+            )
         case _:
             assert_never(query)
 
@@ -540,5 +555,9 @@ def _to_qdrant_value(value: VectorValue) -> _QdrantVectorData:
     match value:
         case DenseValue(numbers=numbers):
             return list(numbers)
+        case SparseValue(weights=weights):
+            return models.SparseVector(
+                indices=list(weights), values=list(weights.values())
+            )
         case _:
             assert_never(value)

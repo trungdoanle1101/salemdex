@@ -7,8 +7,17 @@ from their own module.
 from salemdex_retrieval.embedders.protocol import (
     DenseBinding,
     DenseEmbedder,
+    SparseBinding,
+    SparseEmbedder,
     VectorBinding,
     embed_chunks,
 )
 
-__all__ = ["DenseBinding", "DenseEmbedder", "VectorBinding", "embed_chunks"]
+__all__ = [
+    "DenseBinding",
+    "DenseEmbedder",
+    "SparseBinding",
+    "SparseEmbedder",
+    "VectorBinding",
+    "embed_chunks",
+]

@@ -17,6 +17,7 @@ TOP_LEVEL = [
     "One",
     "Rrf",
     "Schema",
+    "Sparse",
     "VectorSource",
     "and_",
     "not_",

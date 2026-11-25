@@ -4,9 +4,13 @@ from collections.abc import Sequence
 import pytest
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
-from salemdex_retrieval.embedders.protocol import DenseBinding, embed_chunks
+from salemdex_retrieval.embedders.protocol import (
+    DenseBinding,
+    SparseBinding,
+    embed_chunks,
+)
 from salemdex_retrieval.schema import One, Schema
-from salemdex_retrieval.vectors import Dense, DenseValue
+from salemdex_retrieval.vectors import Dense, DenseValue, Sparse, SparseValue
 
 
 class Chunks(Schema):
@@ -18,6 +22,12 @@ class Chunks(Schema):
 class Entries(Schema):
     position = One(int)
     body = Dense(size=2, distance="cosine")
+
+
+class Hybrid(Schema):
+    position = One(int)
+    body = Dense(size=2, distance="cosine")
+    terms = Sparse(modifier="idf")
 
 
 class RecordingEmbedder:
@@ -40,6 +50,29 @@ class RecordingEmbedder:
         rows = [[float(len(text)), self.marker] for text in texts]
         if self.extra_rows >= 0:
             return rows + [[0.0, self.marker]] * self.extra_rows
+        return rows[: self.extra_rows]
+
+
+class RecordingSparseEmbedder:
+    """A sparse embedder that records every batch it is given.
+
+    A text's weights are `{its length: marker}`, so each mapping can be traced to its
+    text.
+    """
+
+    def __init__(self, *, marker: float = 1.0, extra_rows: int = 0) -> None:
+        self.marker = marker
+        self.extra_rows = extra_rows
+        self.passage_batches: list[list[str]] = []
+
+    def embed_queries(self, texts: Sequence[str]) -> list[dict[int, float]]:
+        return [{len(text): self.marker} for text in texts]
+
+    def embed_passages(self, texts: Sequence[str]) -> list[dict[int, float]]:
+        self.passage_batches.append(list(texts))
+        rows = [{len(text): self.marker} for text in texts]
+        if self.extra_rows >= 0:
+            return rows + [{}] * self.extra_rows
         return rows[: self.extra_rows]
 
 
@@ -169,3 +202,57 @@ def numbers_of(embedded: EmbeddedChunk, vector: Dense) -> tuple[float, ...]:
     value = embedded.vector_values[vector]
     assert isinstance(value, DenseValue)
     return value.numbers
+
+
+# Sparse bindings
+
+
+def test_a_sparse_binding_fills_its_vector_with_each_texts_weights() -> None:
+    chunks = build_chunks(3)
+    embedder = RecordingSparseEmbedder(marker=0.5)
+
+    embedded = embed_chunks(
+        chunks,
+        bindings=[
+            DenseBinding(vector=Hybrid.body, embedder=RecordingEmbedder()),
+            SparseBinding(vector=Hybrid.terms, embedder=embedder),
+        ],
+    )
+
+    assert [weights_of(item, Hybrid.terms) for item in embedded] == [
+        {len(chunk.embedded_text): 0.5} for chunk in chunks
+    ]
+    assert embedder.passage_batches == [[chunk.embedded_text for chunk in chunks]]
+
+
+@pytest.mark.parametrize("extra_rows", [-1, 1], ids=["too few", "too many"])
+def test_a_sparse_embedder_returning_the_wrong_number_of_rows_is_refused(
+    extra_rows: int,
+) -> None:
+    embedder = RecordingSparseEmbedder(extra_rows=extra_rows)
+
+    with pytest.raises(ValueError, match="terms"):
+        embed_chunks(
+            build_chunks(3),
+            bindings=[SparseBinding(vector=Hybrid.terms, embedder=embedder)],
+        )
+
+
+def test_a_sparse_row_with_an_id_that_is_not_an_int_is_refused() -> None:
+    class StringIds(RecordingSparseEmbedder):
+        def embed_passages(self, texts: Sequence[str]) -> list[dict[int, float]]:
+            # Some libraries give ids as strings; the adapter must convert them
+            return [{"4865": 1.0} for _ in texts]  # type: ignore[dict-item]
+
+    with pytest.raises(TypeError, match="'4865'"):
+        embed_chunks(
+            build_chunks(2),
+            bindings=[SparseBinding(vector=Hybrid.terms, embedder=StringIds())],
+        )
+
+
+def weights_of(embedded: EmbeddedChunk, vector: Sparse) -> dict[int, float]:
+    """Return the weights of `embedded`'s value for the sparse `vector`."""
+    value = embedded.vector_values[vector]
+    assert isinstance(value, SparseValue)
+    return dict(value.weights)

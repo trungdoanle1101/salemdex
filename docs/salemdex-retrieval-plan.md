@@ -12,15 +12,18 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   - `filters.py`: `Equals` (`eq`), `In` (`in_`, on a `One`), `AnyOf` (`any_of`, on a
     `Many`), `and_` / `or_` / `not_`, and `Everything`, matching every chunk;
     `check_is_filter`, for filters arriving untyped;
-  - `vectors.py`: `Dense` vectors, declared on the schema beside its fields, with checked
-    values (`Dense.value`) and queries (`Dense.query`); the closed unions `VectorValue` and
-    `VectorQuery`;
+  - `vectors.py`: `Dense` and `Sparse` vectors, declared on the schema beside its fields,
+    with checked values (`Dense.value`, `Sparse.value`) and queries (`Dense.query`,
+    `Sparse.query`); the closed unions `VectorValue` and `VectorQuery` (section 6,
+    "Sparse vectors");
   - `chunks.py`: `Chunk`, with typed reads (`chunk[field]`), and
     `Chunk.check_fits(schema)` raising `SchemaMismatchError`;
     `EmbeddedChunk`, a chunk with its vector values, which every write takes; `Hit`, a chunk
     with its score, which search returns;
   - `index/in_memory.py`: `InMemoryIndex` with `put`, `find`, `delete`, `replace` and
-    `search` (exact cosine and dot, in plain Python: the core has no dependencies);
+    `search` (exact cosine and dot, in plain Python: the core has no dependencies; sparse
+    by the dot product over shared ids, with IDF as a Qdrant server computes it), the
+    sparse rules tested on every backend in `tests/index/test_sparse_search.py`;
   - `index/protocol.py`: the `Index` protocol, `check_batch`, `check_filter`, `check_query`
     and `check_limit`, shared by every backend; `tests/index/test_contract.py` runs the
     behaviour tests, search included, against each backend: in memory, Qdrant's local mode,
@@ -34,9 +37,12 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
     schema's, on an index of the wrong type, or on points that don't fit the schema
     (section 6, "The schema"); `tests/index/test_qdrant_open.py` tests it, the payload
     indexes against a server only;
-  - `embedders/protocol.py`: the `DenseEmbedder` protocol, `DenseBinding` and the closed
-    union `VectorBinding`, and `embed_chunks(chunks, *, bindings)` (section 6,
-    "Embedders"), tested in `tests/embedders/test_embed_chunks.py`;
+  - `embedders/protocol.py`: the `DenseEmbedder` and `SparseEmbedder` protocols,
+    `DenseBinding`, `SparseBinding` and the closed union `VectorBinding`, and
+    `embed_chunks(chunks, *, bindings)` (section 6, "Embedders"), tested in
+    `tests/embedders/test_embed_chunks.py`; the engine embeds questions through either
+    binding, and `tests/engine/test_engine.py` runs a hybrid statement (dense and sparse,
+    fused by RRF) on an in-memory index;
   - `embedders/fake.py`: `FakeDenseEmbedder(size=…)`, a deterministic embedder by feature
     hashing (signed, NFC and case-folded words), so texts sharing words score higher;
     tested in `tests/embedders/test_fake.py`.
@@ -76,6 +82,18 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
     `tests/test_huggingface.py` (no model), `tests/rerankers/test_huggingface.py` (a tiny
     model built in the test) and, with a real model set, the embedder's and reranker's
     tests; `tests/test_extras.py` checks no core import loads an extra's library.
+- **In progress** (as of 2026-11-25): **hybrid search** (section 6, "Sparse vectors"),
+  with evaluation paused at the old/new gate (step 5 below). Built: the `Sparse` vector,
+  both indexes, `SparseEmbedder` and `SparseBinding`, and the engine's sparse sources, all
+  general, with no model's details. Next:
+  1. a fake sparse embedder in `embedders/fake.py`, so the server's tests can run a hybrid
+     statement without torch;
+  2. the adapters: BM25 in the core, taking a `tokenize` function from the app, and
+     `HuggingFaceSparseEmbedder` over sentence-transformers' `SparseEncoder` (SPLADE,
+     inference-free models), behind the `huggingface` extra. A bge-m3 adapter only if the
+     question set shows it beats them;
+  3. in the server: a sparse vector on `KbChunks` (a new collection), a hybrid statement,
+     then `evaluator.compare(hybrid, baseline=dense, …)` on the real question set.
 - **Pick up here** (as of 2026-11-18): replace the old retrieval in the server, then delete
   it (expand, migrate, contract; section 10, "Migration"). Nothing else in the framework
   imports `document_processor.retrieval` or `integrations.{huggingface,qdrant}`: only the
@@ -750,10 +768,8 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
   - `update_fields(*, where, values)` (Qdrant's `set_payload`) for `sync_attributes` (server
     build step 7), so a changed group isn't re-embedded;
   - later perhaps `export(where)`, for copying a collection.
-- **Kinds:** only `Dense` exists. More kinds become further `Vector` subclasses when a source
-  needs them:
-  - `Sparse`: `Mapping[int, float]`, with a `modifier` (`"idf"` for BM25-style weights,
-    `"none"` for learned ones such as bge-m3's);
+- **Kinds:** `Dense` and `Sparse` (built; "Sparse vectors" below). More kinds become further
+  `Vector` subclasses when a source needs them:
   - `MultiDense`: many rows per chunk, one per token, compared by max-sim.
 
   Each is a sibling of `Dense`, not a subclass. Why: `isinstance(vector, Dense)` would
@@ -772,7 +788,7 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
 |---|---|---|
 | `Dense` | `vectors_config` | size, distance, one row |
 | `MultiDense` (later) | `vectors_config`, with `multivector_config` | size, distance, many rows (max-sim) |
-| `Sparse` (later) | `sparse_vectors_config` | modifier (none read back as `none`) |
+| `Sparse` (built) | `sparse_vectors_config` | modifier (none read back as `none`) |
 
 - **`open` refuses a collection whose vectors differ from the schema's.** It lists every
   difference in one `SchemaMismatchError`, whose header gives the fix: re-index into a new
@@ -797,6 +813,62 @@ hits = index.search(KbChunks.dense.query(question_numbers), where=access, limit=
 - **What `open` doesn't check:** points that lack a vector. The index's own writes can't
   produce them, since `check_fits` demands every vector, and a missing vector costs recall,
   not access. If that's ever needed, Qdrant's `HasVectorCondition` can count them.
+
+**Known about IDF (`modifier="idf"`), not worth handling.** Both were found while matching
+the in-memory index to a Qdrant server. Neither changes rankings in a way that matters, so
+neither needs work. They're written down only so they aren't rediscovered as bugs.
+
+- **IDF counts chunks the asker can't see.** It's computed over the whole collection
+  (Qdrant's default, `IdfScope.GLOBAL`), so a rare term in hidden documents slightly
+  lowers its weight for everyone. In principle that's a side channel, but no sparse score
+  leaves the engine: RRF keeps only ranks, and the reranker sets the final scores. Only
+  an API returning raw sparse scores would make it worth a look; Qdrant's
+  `IdfCorpusParams` can then count only the chunks the asker's filter matches.
+- **The server counts deleted points until it cleans its segments up,** so right after a
+  delete or an overwrite (every index job) IDF is slightly off. It's transient, and one
+  document's chunks barely move a logarithm over the collection. The only consequence is
+  for tests: none reads IDF after a delete (`tests/index/test_sparse_search.py`).
+
+### Sparse vectors (built)
+
+```python
+class KbChunks(Guarded):
+    dense = Dense(size=1024, distance="cosine")
+    sparse = Sparse(modifier="none")  # learned weights; "idf" for BM25-style counts
+
+KbChunks.sparse.value({4865: 0.21, 12: 0.08})  # an id → its weight
+```
+
+Sparse search scores chunks by the terms they share with the question, so it catches what
+dense search blurs: exact numbers ("Điều 12"), abbreviations, rare terms. **Nothing in it
+belongs to one model:** BM25, SPLADE, inference-free models and bge-m3's lexical weights
+all fit.
+
+- **A value is `Mapping[int, float]`: an id to its weight.** An id is a dimension of the
+  embedder's own space (a vocabulary token, a word's hash); turning terms into ids is the
+  embedder's job, so the framework never owns a vocabulary. Ints, not strings: Qdrant
+  stores ids, not terms.
+- **`Sparse.value` and `Sparse.query` check what every model must meet:** each id an
+  integer (numpy's too; a `bool` or a `str` refused, as some libraries give ids as
+  strings), from 0 to 2**32 - 1 (Qdrant stores u32); each weight finite. They store a
+  read-only copy with plain `int` ids and `float` weights. Negative and zero weights and
+  an empty mapping are kept: they're a model's business, and harmless.
+- **No `size`:** a hashed vocabulary has no fixed width.
+- **`modifier` is declared on the vector,** like `Dense.distance`: it's how a backend
+  compares, and `open` compares it. `"none"` takes the weights as they are; `"idf"`
+  multiplies each query weight by its id's IDF over the index, so an embedder giving BM25's
+  term-frequency part gets BM25. Why the index and not the embedder: corpus statistics
+  change with every write.
+- **The score is the dot product over the ids the query and the chunk share.** A chunk
+  sharing none isn't a hit, so `limit` may go unfilled: Qdrant finds sparse hits through an
+  inverted index. One sharing an id with weight 0 is a hit scoring 0.
+- **IDF is Qdrant's:** `ln((N - n + 0.5) / (n + 0.5) + 1)`, with N the chunks with at least
+  one weight and n those holding the id (IR's document frequency: a document there is a
+  chunk here), counted over the whole collection, whatever `where` matches. A Qdrant server
+  is the reference: the client's local mode also counts chunks with no weights, and one
+  test marks it.
+- **Scores have no fixed range** (no cosine; they grow with shared terms and with the
+  model's scale), so a sparse and a dense score can't be compared: the engine fuses by rank.
 
 ### Embedders
 
@@ -840,9 +912,11 @@ index.put(embedded)
   - a binding ties the kinds together: a `Dense` vector only takes a `DenseEmbedder`. A
     `Mapping[Vector, Embedder]` couldn't, since a mapping can't tie each key's type to its
     value's.
-- **`type VectorBinding = DenseBinding` is a closed union** (later `| SparseBinding`), matched
-  with `assert_never` like `VectorValue`. The signatures take the whole union now, and each
-  `match` handles the kinds that exist. Why not a union of embedder protocols: protocols are
+- **`type VectorBinding = DenseBinding | SparseBinding` is a closed union,** matched
+  with `assert_never` like `VectorValue`. Each kind has its own `case`, never an
+  or-pattern: one `case` for both would type `vector` and the rows as unions, losing which
+  rows belong to which vector (and a variable assigned in both cases needs a name per
+  kind, as mypy gives it one type in the whole function). Why not a union of embedder protocols: protocols are
   matched by structure, so `isinstance` (even with `@runtime_checkable`) checks method names
   only. A dense and a sparse embedder share their method names, so a `match` couldn't tell
   them apart, and each branch would need a `cast`. The vector classes are nominal, so the
@@ -868,12 +942,25 @@ index.put(embedded)
   in order. Why: with a remote model a round trip costs more than the work. The worker sends a
   document's chunks in one call, and query transforms (multi-query, decomposition) produce
   several questions at once.
-- **One protocol per vector kind, named after it:** `DenseEmbedder` now, a sparse one
-  (`Mapping[int, float]` per text) when a source needs it. Why:
+- **One protocol per vector kind, named after it:** `DenseEmbedder` and `SparseEmbedder`
+  (`Mapping[int, float]` per text, built). Why:
   - each kind's output has its own shape, so a sparse embedder could never implement the dense
     protocol, and a plain `Embedder` would claim a generality it lacks;
   - services serve the kinds from separate endpoints (TEI's `/embed` and `/embed_sparse`);
   - adapters live in apps, so renaming `Embedder` once sparse arrives would break them all.
+- **A sparse embedder's two sides matter more than a dense one's:** BM25 weighs a passage by
+  its term counts and length but a question only by its terms, and inference-free models
+  run only on passages.
+- **Nothing checks that the vector's `modifier` suits the embedder.** BM25 needs `"idf"`
+  (without it, no IDF); a learned model needs `"none"` (with it, its weights are scaled
+  twice). As with the model itself, the app chooses the pairing; `SparseEmbedder`'s
+  docstring says which suits which, and a wrong one shows in `evaluator.compare`. Why not a
+  `modifier` on the protocol: a general adapter (`HuggingFaceSparseEmbedder`) can't know
+  which its model needs, and dense has no such check either.
+- **One model call filling two vectors stays out of the protocols.** bge-m3 gives dense and
+  sparse weights from one forward pass; an adapter can share the work (one object exposing
+  a dense and a sparse view over a shared result). A protocol question only if measuring
+  shows the double call costs too much.
 - **No identity in the protocol.** Why:
   - the framework can't verify it: for a hosted model, it's a string the adapter reports about
     itself, so a check on it would look like a guarantee without being one;
@@ -1348,22 +1435,23 @@ src/salemdex_retrieval/
   __init__.py              the top level's names ("Import paths" below)
   declarations.py  errors.py  schema.py  filters.py                       core
   checks.py                checks on plain values: check_positive_int, to_finite_float
-  vectors.py               Dense, VectorValue, VectorQuery (closed unions)
+  vectors.py               Dense, Sparse, VectorValue, VectorQuery (closed unions)
   chunks.py                Chunk, EmbeddedChunk, Hit (chunk, score)
 
   index/                   storing and finding chunks
     __init__.py            Index, InMemoryIndex
     protocol.py            Index, check_batch, check_filter, check_query, check_limit
-    in_memory.py           search: filter first, then score every stored value
+    in_memory.py           search: filter first, then score every stored value; sparse
+                           IDF counted over every stored chunk
     qdrant/
       index.py             search: query_points(using=…, query_filter=…, limit=…)
       filters.py  payload.py
-      vector_config.py     when Sparse arrives: _VectorConfigs and the describers
+      (index.py also holds _VectorConfigs and the describers; vector_config.py if it grows)
 
   embedders/               used by both writes and searches
     __init__.py
-    protocol.py            DenseEmbedder, DenseBinding, VectorBinding, and
-                           embed_chunks(chunks, *, bindings)
+    protocol.py            DenseEmbedder, SparseEmbedder, DenseBinding, SparseBinding,
+                           VectorBinding, and embed_chunks(chunks, *, bindings)
     fake.py                a deterministic embedder for tests, the server's too
     huggingface.py         HuggingFaceDenseEmbedder: any sentence-transformers model, as
                            Hugging Face names it, behind the `huggingface` extra
@@ -1425,8 +1513,8 @@ question isn't what's public, but which path is the one to use:
 
 | Tier | Holds | Names |
 |---|---|---|
-| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource` |
-| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
+| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource` |
+| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.SparseEmbedder`, `embedders.DenseBinding`, `embedders.SparseBinding`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
 | a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
 | not exported | what only the package uses | `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
 
@@ -1451,9 +1539,9 @@ question isn't what's public, but which path is the one to use:
 **`Index.search` (built):**
 `index.search(query, *, where, limit) -> list[Hit]`.
 
-- **`query` is a `VectorQuery`:** `DenseQuery` now, later `| SparseQuery | MultiDenseQuery`.
+- **`query` is a `VectorQuery`:** `DenseQuery | SparseQuery`, later `| MultiDenseQuery`.
   - It carries its vector, so the backend knows which named vector to search.
-  - Its numbers were checked where they entered (`Dense.query`).
+  - Its numbers were checked where they entered (`Dense.query`, `Sparse.query`).
   - The union is closed, so each backend `match`es on it and ends with `assert_never`. mypy
     then points at every backend that hasn't learned a new kind.
 - **One query per call.** Several sources are the engine's job: it calls `search` once per
@@ -1478,9 +1566,9 @@ question isn't what's public, but which path is the one to use:
   scores 0.0 under cosine, as it does in Qdrant.
 - **Qdrant converts by kind in two helpers,** `_to_qdrant_value` (writes) and
   `_to_qdrant_query` (searches), each a `match` ending in `assert_never`, returning
-  `_QdrantVectorData`. That alias is `list[float]` for now and widens with each kind
-  (`list[list[float]]` for multi-dense, `models.SparseVector` for sparse), so mypy catches a
-  case returning the wrong shape.
+  `_QdrantVectorData`. That alias is `list[float] | models.SparseVector` and widens with
+  each kind (`list[list[float]]` for multi-dense), so mypy catches a case returning the
+  wrong shape. A plain `dict` isn't a sparse vector to Qdrant: pydantic refuses it.
 - **Qdrant's search is exact only while the collection is small.** Below its indexing
   threshold, Qdrant compares every vector, as the in-memory index does, which is why the
   small contract tests can demand exact ranking. Once it builds the HNSW graph, ranking is
@@ -1547,7 +1635,7 @@ in its trace (planned, section 5).
   `SLF001` (private member access) would flag reaching for it outside the engine.
 - **Still to design:** score scales for thresholds (a prune needs to know whose score it
   cuts on), multi-vector bindings for bge-m3's dense, sparse and multi-vector outputs from
-  one model call, adapter error types, and deadlines between stages.
+  one model call (for now an adapter's concern: "Embedders"), adapter error types, and deadlines between stages.
 
 ## 12. Techniques to come, and where they belong
 
@@ -1568,7 +1656,7 @@ manuals instead? If not, it's the app's.
 
 | Technique | Framework piece | The app supplies |
 |---|---|---|
-| Hybrid dense + sparse | a `Sparse` vector on the schema, a sparse embedder protocol, Qdrant sparse vectors (`vector_config.py` already expects them), RRF merge (built) | the model, e.g. bge-m3's lexical weights |
+| Hybrid dense + sparse | a `Sparse` vector on the schema, `SparseEmbedder` and `SparseBinding`, Qdrant sparse vectors, RRF merge (all built); BM25 and `SparseEncoder` adapters (next) | the model, e.g. a SPLADE model or bge-m3's lexical weights; BM25's tokenizer |
 | Lookup by field | a source that turns the question into a filter on declared fields and fetches with `find` | the parser, e.g. "Điều 12 Nghị định 145" → headings |
 | Normalizing and expanding the question | a query transform taking a function or a glossary | diacritics restoration, abbreviations (NLĐ → người lao động), the domain's terms |
 | Rewrite, multi-query, HyDE, decomposition | query transforms over an LLM protocol | prompts in the domain's language |

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Sized
 from collections.abc import Set as AbstractSet
 from dataclasses import InitVar, dataclass, field
 from functools import partial
@@ -36,7 +36,7 @@ from typing import assert_never
 
 from salemdex_retrieval.checks import check_positive_int, to_stripped_str
 from salemdex_retrieval.chunks import Chunk, Hit
-from salemdex_retrieval.embedders import DenseBinding, VectorBinding
+from salemdex_retrieval.embedders import DenseBinding, SparseBinding, VectorBinding
 from salemdex_retrieval.engine.results import Candidate, Found, Fused, Passage, Reranked
 from salemdex_retrieval.engine.sources import VectorSource
 from salemdex_retrieval.engine.stages import (
@@ -384,16 +384,19 @@ def _embed_question(question: str, *, binding: VectorBinding) -> VectorQuery:
     Raises:
         ValueError: The embedder returned other than one row, or the row doesn't fit
             the vector.
+        TypeError: A number or weight isn't a real number, or a sparse id isn't an
+            integer.
     """
     match binding:
+        # One name per kind: mypy gives a variable one type in the whole function
         case DenseBinding(vector=vector, embedder=embedder):
-            rows = embedder.embed_queries([question])
-            if len(rows) != 1:
-                raise ValueError(
-                    f"the embedder for vector {vector.name!r} "
-                    f"returned {len(rows)} rows for one question"
-                )
-            return vector.query(rows[0])
+            numbers = embedder.embed_queries([question])
+            _check_one_row(numbers, vector=vector)
+            return vector.query(numbers[0])
+        case SparseBinding(vector=vector, embedder=embedder):
+            weights = embedder.embed_queries([question])
+            _check_one_row(weights, vector=vector)
+            return vector.query(weights[0])
         case _:
             assert_never(binding)
 
@@ -491,3 +494,17 @@ def _valid_ids(
     if not unique:
         return frozenset()
     return validity.valid_ids(unique)
+
+
+def _check_one_row(rows: Sized, *, vector: Vector) -> None:
+    """Check the embedder for `vector` returned exactly one row for the question.
+
+    Raises:
+        ValueError: It returned none or several; the message names the vector, to find
+            the embedder among several.
+    """
+    if len(rows) != 1:
+        raise ValueError(
+            f"the embedder for vector {vector.name!r} "
+            f"returned {len(rows)} rows for one question"
+        )

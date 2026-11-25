@@ -89,7 +89,8 @@ class InMemoryIndex:
 
         For a sparse query, a chunk sharing no id with it isn't scored, as in Qdrant.
         With `modifier="idf"`, the query's weights are first multiplied by each id's IDF
-        over every stored chunk, not only those `where` matches: Qdrant's default.
+        over every stored chunk with at least one weight, not only those `where`
+        matches: what a Qdrant server counts by default.
         """
         check_positive_int(limit, name="limit")
         check_query_matches_schema(query, schema=self.schema)
@@ -111,6 +112,67 @@ class InMemoryIndex:
             for chunk_id, embedded in self._embedded_chunks.items()
             if not matches(embedded.chunk)
         }
+
+
+def _weighted_by_idf(
+    query: SparseQuery, *, stored: Iterable[EmbeddedChunk]
+) -> SparseQuery:
+    """Return `query` with each weight multiplied by its id's IDF over `stored`.
+
+    As a Qdrant server does it: the query is weighted, the stored values are left as
+    they are, and every stored chunk with at least one weight counts. Qdrant's local
+    mode also counts chunks with no weights; the server is the reference.
+
+    Raises:
+        TypeError: A stored value isn't sparse, which can't happen: values are keyed
+            by their own vector.
+    """
+    values: list[SparseValue] = []
+    for chunk in stored:
+        value = chunk.vector_values[query.vector]
+        if not isinstance(value, SparseValue):
+            raise TypeError(
+                f"vector {query.vector.name!r} holds a {type(value).__name__}, "
+                f"not a value for {type(query).__name__}"
+            )
+        if value.weights:
+            values.append(value)
+    document_frequencies = Counter(
+        sparse_id
+        for sparse_id in query.weights
+        for value in values
+        if sparse_id in value.weights
+    )
+    new_weights = {
+        sparse_id: weight
+        * _idf(document_frequencies[sparse_id], chunk_count=len(values))
+        for sparse_id, weight in query.weights.items()
+    }
+
+    return SparseQuery(vector=query.vector, weights=MappingProxyType(new_weights))
+
+
+def _shares_an_id(embedded: EmbeddedChunk, *, query: VectorQuery) -> bool:
+    """Return whether the chunk can be a hit for `query`.
+
+    A sparse value can only when it shares an id with the query, whatever its weight,
+    as Qdrant finds sparse hits through the ids; a dense one always can.
+
+    Raises:
+        TypeError: The chunk's value and `query` are of different kinds, which can't
+            happen: values are keyed by their own vector.
+    """
+    value = embedded.vector_values[query.vector]
+    match value, query:
+        case DenseValue(), DenseQuery():
+            return True
+        case SparseValue(weights=stored), SparseQuery(weights=asked):
+            return not asked.keys().isdisjoint(stored)
+        case _:
+            raise TypeError(
+                f"vector {query.vector.name!r} holds a {type(value).__name__}, "
+                f"not a value for {type(query).__name__}"
+            )
 
 
 def _score(embedded: EmbeddedChunk, *, query: VectorQuery) -> float:
@@ -155,34 +217,6 @@ def _sparse_score(stored: Mapping[int, float], asked: Mapping[int, float]) -> fl
     )
 
 
-def _weighted_by_idf(
-    query: SparseQuery, *, stored: Iterable[EmbeddedChunk]
-) -> SparseQuery:
-    """Return `query` with each weight multiplied by its id's IDF over `stored`.
-
-    As Qdrant does it: the query is weighted, the stored values are left as they are,
-    and every stored chunk counts, one with no weights too.
-    """
-    values: list[SparseValue] = []
-    for chunk in stored:
-        value = chunk.vector_values[query.vector]
-        if isinstance(value, SparseValue):
-            values.append(value)
-    document_frequencies = Counter(
-        sparse_id
-        for sparse_id in query.weights
-        for value in values
-        if sparse_id in value.weights
-    )
-    new_weights = {
-        sparse_id: weight
-        * _idf(document_frequencies[sparse_id], chunk_count=len(values))
-        for sparse_id, weight in query.weights.items()
-    }
-
-    return SparseQuery(vector=query.vector, weights=MappingProxyType(new_weights))
-
-
 def _idf(document_frequency: int, *, chunk_count: int) -> float:
     """Return BM25's IDF for an id held by `document_frequency` of `chunk_count` chunks.
 
@@ -193,26 +227,3 @@ def _idf(document_frequency: int, *, chunk_count: int) -> float:
     return math.log(
         1 + (chunk_count - document_frequency + 0.5) / (document_frequency + 0.5)
     )
-
-
-def _shares_an_id(embedded: EmbeddedChunk, *, query: VectorQuery) -> bool:
-    """Return whether the chunk can be a hit for `query`.
-
-    A sparse value can only when it shares an id with the query, whatever its weight,
-    as Qdrant finds sparse hits through the ids; a dense one always can.
-
-    Raises:
-        TypeError: The chunk's value and `query` are of different kinds, which can't
-            happen: values are keyed by their own vector.
-    """
-    value = embedded.vector_values[query.vector]
-    match value, query:
-        case DenseValue(), DenseQuery():
-            return True
-        case SparseValue(weights=stored), SparseQuery(weights=asked):
-            return not asked.keys().isdisjoint(stored)
-        case _:
-            raise TypeError(
-                f"vector {query.vector.name!r} holds a {type(value).__name__}, "
-                f"not a value for {type(query).__name__}"
-            )

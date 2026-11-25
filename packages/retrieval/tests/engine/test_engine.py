@@ -3,13 +3,17 @@ import math
 import re
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk, Hit
 from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
-from salemdex_retrieval.embedders.protocol import DenseBinding, embed_chunks
+from salemdex_retrieval.embedders.protocol import (
+    DenseBinding,
+    SparseBinding,
+    embed_chunks,
+)
 from salemdex_retrieval.engine.engine import Engine, PreparedStatement
 from salemdex_retrieval.engine.results import Found, Fused, Passage, Reranked
 from salemdex_retrieval.engine.sources import VectorSource
@@ -22,7 +26,7 @@ from salemdex_retrieval.index.in_memory import InMemoryIndex
 from salemdex_retrieval.index.protocol import Index
 from salemdex_retrieval.rerankers.protocol import Reranker
 from salemdex_retrieval.schema import One, Schema
-from salemdex_retrieval.vectors import Dense, Vector, VectorQuery
+from salemdex_retrieval.vectors import Dense, Sparse, Vector, VectorQuery
 
 SIZE = 16
 
@@ -787,3 +791,144 @@ def test_take_fills_its_limit_past_a_chunk_the_final_gate_drops() -> None:
     )
 
     assert ids(passages) == [B.id, C.id]
+
+
+# Sparse sources: the same frame, a sparse binding
+
+
+class Hybrid(Schema):
+    group = One(str, indexed=True)
+    dense = Dense(size=256, distance="cosine")
+    terms = Sparse(modifier="none")
+
+
+class WordCounter:
+    """A sparse embedder counting words: a passage weighs each word by its count, a
+    question by 1, and a word's id is its place in a fixed vocabulary.
+
+    "fee" counts as "interest", as a learned model's expansion would, so a question can
+    reach a chunk that dense search, reading words only, ranks lower.
+    """
+
+    VOCABULARY = ("annual", "leave", "days", "late", "payment", "interest", "scope")
+    SYNONYMS: ClassVar[dict[str, str]] = {"fee": "interest"}
+
+    def __init__(self) -> None:
+        self.query_batches: list[list[str]] = []
+
+    def embed_queries(self, texts: Sequence[str]) -> list[dict[int, float]]:
+        self.query_batches.append(list(texts))
+        return [dict.fromkeys(self._ids(text), 1.0) for text in texts]
+
+    def embed_passages(self, texts: Sequence[str]) -> list[dict[int, float]]:
+        counts: list[dict[int, float]] = []
+        for text in texts:
+            weights: dict[int, float] = {}
+            for word_id in self._ids(text):
+                weights[word_id] = weights.get(word_id, 0.0) + 1.0
+            counts.append(weights)
+        return counts
+
+    def _ids(self, text: str) -> list[int]:
+        words = [
+            self.SYNONYMS.get(word, word) for word in re.findall(r"\w+", text.lower())
+        ]
+        return [
+            self.VOCABULARY.index(word) for word in words if word in self.VOCABULARY
+        ]
+
+
+LEAVE = "Annual leave is twelve days, and leave days carry over"
+LATE = "Late payment is charged interest"
+SCOPE = "Scope of application"
+
+
+def hybrid_engine(*, counter: WordCounter | None = None) -> tuple[Engine, list[Chunk]]:
+    """Return an engine registering "dense" and "terms" over one in-memory index of
+    the three texts, and the chunks in it."""
+    dense = DenseBinding(vector=Hybrid.dense, embedder=FakeDenseEmbedder(size=256))
+    terms = SparseBinding(vector=Hybrid.terms, embedder=counter or WordCounter())
+    chunks = [
+        Chunk(id=uuid.uuid4(), text=text, field_values=[Hybrid.group.value("public")])
+        for text in [LEAVE, LATE, SCOPE]
+    ]
+    index = InMemoryIndex(schema=Hybrid)
+    index.put(embed_chunks(chunks, bindings=[dense, terms]))
+    engine = Engine(
+        validity=AlwaysValid(),
+        sources={
+            "dense": VectorSource(index=index, binding=dense),
+            "terms": VectorSource(index=index, binding=terms),
+        },
+        rerankers={},
+    )
+    return engine, chunks
+
+
+TERMS = source("terms", depth=10)
+
+
+def test_a_sparse_source_embeds_the_question_as_a_query_through_its_binding() -> None:
+    counter = WordCounter()
+    engine, _ = hybrid_engine(counter=counter)
+
+    run(
+        search().retrieve(TERMS).take(),
+        engine=engine,
+        question="late payment",
+        where=Hybrid.group.eq("public"),
+    )
+
+    assert counter.query_batches == [["late payment"]]
+
+
+def test_a_sparse_source_finds_only_the_chunks_sharing_the_questions_terms() -> None:
+    engine, [leave, _, _] = hybrid_engine()
+
+    passages = run(
+        search().retrieve(TERMS).take(),
+        engine=engine,
+        question="How many leave days do I get?",
+        where=Hybrid.group.eq("public"),
+    )
+
+    assert ids(passages) == [leave.id]
+
+
+def test_a_hybrid_statement_fuses_dense_and_sparse_hits_by_rank() -> None:
+    engine, [leave, late, scope] = hybrid_engine()
+    statement = search().retrieve(DENSE, TERMS).merge(Rrf()).take()
+
+    question = "twelve fee"
+    where = Hybrid.group.eq("public")
+
+    dense_only = run(
+        search().retrieve(DENSE).take(), engine=engine, question=question, where=where
+    )
+    fused = run(statement, engine=engine, question=question, where=where)
+
+    # Dense reads "twelve" and ranks `leave` first; only the sparse source finds `late`
+    # (fee counts as interest), and a chunk in both lists outranks one in a single list
+    assert ids(dense_only)[0] == leave.id
+    assert set(ids(fused)) == {leave.id, late.id, scope.id}
+    assert ids(fused)[0] == late.id
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_a_sparse_embedder_giving_other_than_one_mapping_for_the_question_is_refused(
+    rows: int,
+) -> None:
+    class Miscounting(WordCounter):
+        def embed_queries(self, texts: Sequence[str]) -> list[dict[int, float]]:
+            return [{0: 1.0}] * rows
+
+    engine, _ = hybrid_engine(counter=Miscounting())
+
+    with pytest.raises(
+        ValueError, match=f"vector 'terms' returned {rows} rows for one question"
+    ):
+        run(
+            search().retrieve(TERMS).take(),
+            engine=engine,
+            where=Hybrid.group.eq("public"),
+        )

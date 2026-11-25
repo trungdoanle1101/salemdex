@@ -34,7 +34,7 @@ from salemdex_retrieval.engine.stages import Rrf, source
 from salemdex_retrieval.engine.statements import search
 from salemdex_retrieval.filters import Everything, and_, not_, or_
 from salemdex_retrieval.schema import Many, One, Schema
-from salemdex_retrieval.vectors import Dense
+from salemdex_retrieval.vectors import Dense, Sparse
 
 __all__ = [
     "Chunk",
@@ -46,6 +46,7 @@ __all__ = [
     "One",
     "Rrf",
     "Schema",
+    "Sparse",
     "VectorSource",
     "and_",
     "not_",

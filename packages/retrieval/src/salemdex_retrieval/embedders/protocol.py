@@ -3,18 +3,20 @@
 An embedder turns texts into numbers. The app supplies it as an adapter, a client for a
 hosted model or a wrapper around a local one, speaking plain data only, so it never
 needs to know the schema. A binding pairs a schema vector with the embedder that fills
-it, and the framework checks every row through that vector (`Dense.value`).
+it, and the framework checks every row through that vector (`Dense.value`,
+`Sparse.value`).
 
-Only dense embedders exist yet. Other kinds become further protocols and bindings when
+Two kinds exist: dense embedders (`DenseEmbedder`, `DenseBinding`) and sparse ones
+(`SparseEmbedder`, `SparseBinding`). Others become further protocols and bindings when
 a source needs them, each binding added to `VectorBinding`.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass
 from typing import Protocol, assert_never
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
-from salemdex_retrieval.vectors import Dense, VectorValue
+from salemdex_retrieval.vectors import Dense, Sparse, Vector, VectorValue
 
 
 class DenseEmbedder(Protocol):
@@ -56,9 +58,54 @@ class DenseEmbedder(Protocol):
         ...
 
 
+class SparseEmbedder(Protocol):
+    """A model turning texts into weights for a few ids out of many, one mapping a text.
+
+    The app implements it: a learned model (SPLADE, bge-m3's lexical weights) or a
+    counter such as BM25. An id stands for a dimension of the embedder's own space, a
+    token of its vocabulary or a word's hash; turning terms into ids is the embedder's
+    job, so the framework never owns a vocabulary. It speaks plain data only: the
+    framework pairs it with a vector through `SparseBinding` and checks every mapping
+    there, so an adapter needn't check ids or weights itself.
+
+    Questions and passages go through separate methods because the two sides often
+    differ: BM25 weighs a passage by its term counts and length but a question only by
+    its terms, and some models run only on passages. Both take batches.
+
+    The vector's `modifier` must suit the embedder, and nothing checks it: an embedder
+    giving BM25's term-frequency part needs `"idf"`, or its weights lack IDF; a learned
+    model needs `"none"`, or its weights are scaled twice. As with the model itself, the
+    app chooses the pairing and records it.
+    """
+
+    def embed_queries(self, texts: Sequence[str]) -> Sequence[Mapping[int, float]]:
+        """Return one mapping of id to weight per question in `texts`, in order.
+
+        Args:
+            texts: The questions, as asked.
+
+        Returns:
+            One mapping per text, holding only the ids that weigh something; an id
+            left out weighs nothing.
+        """
+        ...
+
+    def embed_passages(self, texts: Sequence[str]) -> Sequence[Mapping[int, float]]:
+        """Return one mapping of id to weight per passage in `texts`, in order.
+
+        Args:
+            texts: The passages: each chunk's `embedded_text`.
+
+        Returns:
+            One mapping per text, in the same space of ids as the questions'; an id
+            left out weighs nothing.
+        """
+        ...
+
+
 # Every kind of binding. A closed union: each `match` over it ends in `assert_never`,
 # so mypy points at every place that hasn't learned a new kind.
-type VectorBinding = DenseBinding
+type VectorBinding = DenseBinding | SparseBinding
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -76,6 +123,22 @@ class DenseBinding:
 
     vector: Dense
     embedder: DenseEmbedder
+
+
+@dataclass(frozen=True, kw_only=True)
+class SparseBinding:
+    """A sparse vector of a schema, paired with the embedder that fills it.
+
+    As `DenseBinding` does for dense ones: a `Sparse` vector can only be bound to a
+    sparse embedder, and the retrieve stage uses the same binding to embed questions.
+
+    Attributes:
+        vector: The schema vector the mappings are for.
+        embedder: The model producing them, for passages and questions alike.
+    """
+
+    vector: Sparse
+    embedder: SparseEmbedder
 
 
 def embed_chunks(
@@ -97,8 +160,9 @@ def embed_chunks(
     Raises:
         ValueError: Two bindings are for vectors with one name (checked before anything
             is embedded), an embedder returned a different number of rows than texts,
-            or a row doesn't fit its vector (see `Dense.value`).
-        TypeError: A row holds something that isn't a real number.
+            or a row doesn't fit its vector (see `Dense.value` and `Sparse.value`).
+        TypeError: A number or weight isn't a real number, or a sparse id isn't an
+            integer.
 
     Example:
         embedded = embed_chunks(
@@ -138,16 +202,32 @@ def _embed_passages(texts: Sequence[str], binding: VectorBinding) -> list[Vector
     Raises:
         ValueError: The embedder returned a different number of rows than texts, or a
             row doesn't fit the vector.
-        TypeError: A row holds something that isn't a real number.
+        TypeError: A number or weight isn't a real number, or a sparse id isn't an
+            integer.
     """
     match binding:
+        # One name per kind: mypy gives a variable one type in the whole function
         case DenseBinding(vector=vector, embedder=embedder):
-            rows = embedder.embed_passages(texts)
-            if len(texts) != len(rows):
-                raise ValueError(
-                    f"the embedder for vector {vector.name!r} "
-                    f"returned {len(rows)} rows for {len(texts)} texts"
-                )
-            return [vector.value(row) for row in rows]
+            numbers = embedder.embed_passages(texts)
+            _check_row_count(numbers, texts=texts, vector=vector)
+            return [vector.value(row) for row in numbers]
+        case SparseBinding(vector=vector, embedder=embedder):
+            weights = embedder.embed_passages(texts)
+            _check_row_count(weights, texts=texts, vector=vector)
+            return [vector.value(row) for row in weights]
         case _:
             assert_never(binding)
+
+
+def _check_row_count(rows: Sized, *, texts: Sequence[str], vector: Vector) -> None:
+    """Check the embedder for `vector` returned one row for each of `texts`.
+
+    Raises:
+        ValueError: It returned another number, which would pair rows with the wrong
+            chunks; the message names the vector, to find the embedder among several.
+    """
+    if len(texts) != len(rows):
+        raise ValueError(
+            f"the embedder for vector {vector.name!r} "
+            f"returned {len(rows)} rows for {len(texts)} texts"
+        )

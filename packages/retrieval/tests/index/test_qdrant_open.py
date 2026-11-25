@@ -17,7 +17,7 @@ from salemdex_retrieval.errors import SchemaMismatchError
 from salemdex_retrieval.index.qdrant import QdrantIndex
 from salemdex_retrieval.index.qdrant.payload import encode_payload
 from salemdex_retrieval.schema import Many, One, Schema
-from salemdex_retrieval.vectors import Dense
+from salemdex_retrieval.vectors import Dense, Sparse
 
 from .conftest import QDRANT_TIMEOUT_SECONDS, QDRANT_URL
 
@@ -31,6 +31,18 @@ class Docs(Schema):
 
 # The vectors a collection of Docs is created with.
 DOCS_VECTORS = {"dense": models.VectorParams(size=2, distance=models.Distance.COSINE)}
+
+
+class Hybrid(Schema):
+    position = One(int)
+    dense = Dense(size=2, distance="cosine")
+    counted = Sparse(modifier="idf")
+    learned = Sparse(modifier="none")
+
+
+def open_hybrid(client: QdrantClient, collection: str) -> QdrantIndex:
+    return QdrantIndex.open(schema=Hybrid, client=client, collection=collection)
+
 
 DOCUMENT = uuid.UUID("00000000-0000-0000-0000-000000000001")
 HR = uuid.UUID("00000000-0000-0000-0000-00000000000a")
@@ -171,6 +183,59 @@ def test_opening_a_missing_collection_creates_the_schemas_vectors(
     assert not params.sparse_vectors
 
 
+def test_opening_a_missing_collection_creates_each_sparse_vector_with_its_modifier(
+    client: QdrantClient, collection: str
+) -> None:
+    open_hybrid(client, collection)
+
+    params = client.get_collection(collection).config.params
+    assert params.vectors == DOCS_VECTORS
+    sparse = params.sparse_vectors or {}
+    assert {name: settings.modifier for name, settings in sparse.items()} == {
+        "counted": models.Modifier.IDF,
+        "learned": models.Modifier.NONE,
+    }
+
+
+def test_sparse_values_written_by_the_index_open_again(
+    client: QdrantClient, collection: str
+) -> None:
+    index = open_hybrid(client, collection)
+    index.put(
+        [
+            EmbeddedChunk(
+                chunk=Chunk(
+                    id=uuid.uuid4(),
+                    text="Article 1. Scope",
+                    field_values=[Hybrid.position.value(0)],
+                ),
+                vector_values=[
+                    Hybrid.dense.value([1.0, 0.0]),
+                    Hybrid.counted.value({3: 1.0}),
+                    Hybrid.learned.value({7: 0.5}),
+                ],
+            )
+        ]
+    )
+
+    open_hybrid(client, collection)
+
+
+def test_a_sparse_vector_made_without_a_modifier_opens_as_none(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection,
+        vectors_config=DOCS_VECTORS,
+        sparse_vectors_config={
+            "counted": models.SparseVectorParams(modifier=models.Modifier.IDF),
+            "learned": models.SparseVectorParams(),
+        },
+    )
+
+    open_hybrid(client, collection)
+
+
 # Refusing vectors that don't match the schema
 
 
@@ -258,6 +323,45 @@ def test_a_sparse_vector_the_schema_does_not_declare_refuses_to_open(
         match="keywords: the collection has it; the schema doesn't declare it",
     ):
         open_docs(client, collection)
+
+
+def test_a_sparse_vector_with_another_modifier_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection,
+        vectors_config=DOCS_VECTORS,
+        sparse_vectors_config={
+            "counted": models.SparseVectorParams(modifier=models.Modifier.NONE),
+            "learned": models.SparseVectorParams(modifier=models.Modifier.NONE),
+        },
+    )
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match=re.escape(
+            "counted: schema has modifier idf; collection has modifier none"
+        ),
+    ):
+        open_hybrid(client, collection)
+
+
+def test_a_sparse_vector_the_collection_lacks_refuses_to_open(
+    client: QdrantClient, collection: str
+) -> None:
+    client.create_collection(
+        collection,
+        vectors_config=DOCS_VECTORS,
+        sparse_vectors_config={
+            "counted": models.SparseVectorParams(modifier=models.Modifier.IDF)
+        },
+    )
+
+    with pytest.raises(
+        SchemaMismatchError,
+        match="learned: the schema declares it; the collection lacks it",
+    ):
+        open_hybrid(client, collection)
 
 
 def test_a_collection_with_one_unnamed_vector_refuses_to_open(
