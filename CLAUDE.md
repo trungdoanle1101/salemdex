@@ -37,7 +37,8 @@ cd packages/retrieval && uv run pytest        # retrieval tests: its tests/ pack
 #   KB_TEST_RERANKER_MODEL=BAAI/bge-reranker-v2-m3              a real reranker, hub id or folder
 #   HF_HUB_OFFLINE=1 uses only models already in the Hugging Face cache
 uv run ruff check . && uv run ruff format --check .
-uv run mypy src apps/server/src apps/server/tests packages/retrieval/src packages/retrieval/tests
+uv run mypy src apps/server/src apps/server/tests     # two runs: both tests/ folders are
+uv run mypy packages/retrieval/src packages/retrieval/tests   #   packages named `tests`
 
 cd apps/server && uv run alembic upgrade head # migrations (settings from apps/server/.env)
 uv run kb-server create-admin --email … --name …

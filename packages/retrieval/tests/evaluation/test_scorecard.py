@@ -1,69 +1,17 @@
-import uuid
 from collections.abc import Callable
 
 import pytest
 
-from salemdex_retrieval.engine.results import Found
-from salemdex_retrieval.engine.stages import source
-from salemdex_retrieval.engine.statements import search
-from salemdex_retrieval.evaluation.judges.protocol import Grade, Judgment
-from salemdex_retrieval.evaluation.questions import KeyPoint, Question, Quote
-from salemdex_retrieval.evaluation.runs import ReturnedChunk
-from salemdex_retrieval.evaluation.scorecard import (
-    RankedChunk,
-    Scorecard,
-    ScoredQuestion,
+from salemdex_retrieval.evaluation.scorecard import Scorecard, ScoredQuestion
+from tests.evaluation.support import (
+    JUDGED_DEPTH,
+    question_of,
+    ranked,
+    scorecard_of,
+    scored,
 )
-from salemdex_retrieval.filters import Everything
 
 # Invented text only: the real question sets are restricted and never appear in tests
-
-STATEMENT = search().retrieve(source("body", depth=10)).take()
-JUDGED_DEPTH = 10
-
-# One letter per returned chunk, best first: A answered, R related, U unrelated
-type Grades = str
-
-GRADE_OF_LETTER: dict[str, Grade] = {"A": "answered", "R": "related", "U": "unrelated"}
-
-
-def question_of(
-    question_id: str, *, key_point_count: int = 1, tags: tuple[str, ...] = ()
-) -> Question:
-    """Return a question with `key_point_count` key points; none is unanswerable."""
-    return Question(
-        id=question_id,
-        text="Can staff work from home?",
-        tags=tags,
-        key_points=tuple(
-            KeyPoint(quotes=(Quote(text=f"key point {n}", where=Everything()),))
-            for n in range(key_point_count)
-        ),
-    )
-
-
-def scored(
-    question_id: str,
-    grades: Grades,
-    *,
-    answerable: bool = True,
-    tags: tuple[str, ...] = (),
-) -> ScoredQuestion:
-    """Return a row for a one-key-point question whose chunks carry `grades`."""
-    return ScoredQuestion(
-        question=question_of(
-            question_id, key_point_count=1 if answerable else 0, tags=tags
-        ),
-        chunks=tuple(
-            ranked(
-                question_id,
-                grade=GRADE_OF_LETTER[letter],
-                key_points=(0,) if letter == "A" else (),
-                rank=rank,
-            )
-            for rank, letter in enumerate(grades, start=1)
-        ),
-    )
 
 
 def covering(
@@ -88,35 +36,6 @@ def covering(
     )
 
 
-def ranked(
-    question_id: str, *, grade: Grade, key_points: tuple[int, ...], rank: int
-) -> RankedChunk:
-    chunk_id = uuid.uuid4()
-    return RankedChunk(
-        returned=ReturnedChunk(
-            chunk_id=chunk_id, trail=(Found(source="body", rank=rank, score=0.5),)
-        ),
-        judgment=Judgment(
-            question_id=question_id,
-            chunk_id=chunk_id,
-            grade=grade,
-            key_points=key_points,
-            judge="quote",
-        ),
-    )
-
-
-def scorecard_of(
-    *questions: ScoredQuestion, left_out: tuple[Question, ...] = ()
-) -> Scorecard:
-    return Scorecard(
-        statement=STATEMENT,
-        questions=questions,
-        questions_left_out=left_out,
-        judged_depth=JUDGED_DEPTH,
-    )
-
-
 # q1 answered at rank 2, q2 at rank 8, q3 not in the judged depth
 EXAMPLE = scorecard_of(
     scored("q1", "UAUUAUUUUU"),
@@ -130,6 +49,7 @@ CUT_OFF_METRICS: list[Callable[[Scorecard, int], object]] = [
     Scorecard.mean_reciprocal_rank_at,
     Scorecard.all_key_points_rate_at,
     Scorecard.questions_missed_at,
+    Scorecard.first_answered_ranks_within,
 ]
 
 
@@ -145,6 +65,21 @@ def test_a_question_with_no_answered_chunk_has_no_rank() -> None:
 
 def test_a_related_chunk_doesnt_answer() -> None:
     assert scored("q1", "RRA").first_answered_rank == 3
+
+
+def test_a_rank_within_k_is_the_first_answered_rank_when_its_in_the_top_k() -> None:
+    row = scored("q1", "UUA")
+
+    assert row.first_answered_rank_within(3) == 3
+    assert row.first_answered_rank_within(5) == 3
+
+
+def test_a_rank_below_k_counts_as_no_rank_within_k() -> None:
+    assert scored("q1", "UUA").first_answered_rank_within(2) is None
+
+
+def test_a_question_with_no_answered_chunk_has_no_rank_within_any_k() -> None:
+    assert scored("q1", "UUU").first_answered_rank_within(3) is None
 
 
 def test_the_hit_rate_is_the_share_of_questions_answered_within_k() -> None:
@@ -338,6 +273,23 @@ def test_the_questions_missed_are_the_ones_the_hit_rate_doesnt_count(k: int) -> 
     assert len(EXAMPLE.questions_missed_at(k)) == pytest.approx(
         answerable * (1 - EXAMPLE.hit_rate_at(k))
     )
+
+
+# Ranks within k: each question's rank, by id, for comparing two cards
+
+
+def test_the_ranks_within_k_give_each_questions_rank_by_its_id() -> None:
+    assert EXAMPLE.first_answered_ranks_within(10) == {"q1": 2, "q2": 8, "q3": None}
+
+
+def test_the_ranks_within_k_count_a_rank_below_k_as_none() -> None:
+    assert EXAMPLE.first_answered_ranks_within(5) == {"q1": 2, "q2": None, "q3": None}
+
+
+def test_the_ranks_within_k_leave_unanswerable_questions_out() -> None:
+    card = scorecard_of(scored("q1", "A"), scored("q4", "A", answerable=False))
+
+    assert card.first_answered_ranks_within(1) == {"q1": 1}
 
 
 # Tags: a card over one kind of question

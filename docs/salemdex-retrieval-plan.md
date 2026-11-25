@@ -122,10 +122,10 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
      (`evaluation/questions.py`), the filter matcher (`filters.build_chunk_matcher`), the
      quote judge (`evaluation/judges/`), the quote occurrences
      (`evaluation/occurrences.py`), the runs (`evaluation/runs.py`), `Assessment` and the
-     evaluator's pooling (`judge_top_chunks`), and the scorecard (`evaluator.score`, its
-     metrics with a cut-off, `for_tag` and `tags`) are built; next, the old/new gate on
-     the real question set, the comparison and `compare`, abstention, then the stage
-     metrics.
+     evaluator's pooling (`judge_top_chunks`), the scorecard (`evaluator.score`, its
+     metrics with a cut-off, `for_tag` and `tags`) and the comparison
+     (`evaluator.compare`) are built; next, the old/new gate on the real question set,
+     abstention, then the stage metrics.
   6. **Delete** `document_processor.retrieval`, `integrations/huggingface`,
      `integrations/qdrant`, their tests (`tests/retrieval`,
      `tests/integrations/{huggingface,qdrant}`) and extras, `scripts/try_search.py` (or
@@ -1630,7 +1630,7 @@ compare statements on the developer's own questions (depths, rerank or not, late
 |---|---|---|---|---|
 | quote occurrences (facts) | is each gold quote whole inside some chunk, in its place? | questions, the corpus; no model | per quote: chunks in place, chunks elsewhere | now; first, since a quote no chunk holds makes that question's score meaningless |
 | retrieval | did the key points reach the results, at what rank, at each stage? | questions, a prepared statement, a limit | hit@k, MRR, all-key-points rate@k, found by each source, rerank moves; per tag; misses | now |
-| comparison | is statement B better than A, on which questions? | two runs, one set of judgments | questions improved, worsened, unchanged | now |
+| comparison | is statement B better than A, on which questions? | two runs scored on one assessment, a cut-off k | questions improved, worsened, unchanged at k, each with both ranks | built |
 | abstention | can a score tell answerable from unanswerable? | a run | top scores of each | now; a threshold holds for one reranker only |
 | cost | what does each stage cost? | the trace (planned, section 5) | duration and candidates read, per stage | with the trace |
 | reasoning, agents | is the answer right, with the real context and with the gold passages? supported claims, citations? | answers, agent runs | a judge or labelled answers | with the answers and agents packages |
@@ -1794,17 +1794,18 @@ scorecard.questions_missed_at(10)  # the rows to look into
 scorecard.questions_left_out  # a quote not found: not counted by any metric
 scorecard.for_tag("paraphrase").hit_rate_at(5)  # any metric, one kind
 
-comparison = evaluator.compare(dense, reranked, assessment=assessment)
-comparison.questions_improved
-comparison.questions_worsened
-comparison.questions_unchanged
+comparison = evaluator.compare(reranked, baseline=dense, assessment=assessment)
+comparison.questions_improved_at(5)  # RankChanges: the question and both ranks
+comparison.questions_worsened_at(5)
+comparison.questions_unchanged_at(5)  # missed by both included
+comparison.for_tag("paraphrase").questions_worsened_at(5)
 ```
 
 | Class | Holds | Offers |
 |---|---|---|
 | `Evaluator` | questions, the corpus (every chunk, by id, read once from the index), where each quote occurs, the fingerprint | `quotes_not_found`, `gradable_questions`, `run_statement`, `judge_top_chunks`, `score`, `compare` |
 | `Scorecard` | one run's top chunks joined with their judgments, question by question; the questions left out; the judged depth | `hit_rate_at`, `mean_reciprocal_rank_at`, `all_key_points_rate_at`, `found_by_source_rate`, `count_rerank_moves`, `top_scores_by_answerability`, `questions_missed_at`, `questions_left_out`, `tags`, `for_tag` |
-| `Comparison` | two runs, their judgments | `questions_improved`, `questions_worsened`, `questions_unchanged` |
+| `Comparison` | two runs' scorecards, from one assessment: the candidate and its baseline | `questions_improved_at`, `questions_worsened_at`, `questions_unchanged_at`, `for_tag` |
 | `Run`, `Assessment` | plain data | saved, loaded, passed around |
 
 - **Three classes, not one:** the evaluator holds what every step shares; a scorecard holds
@@ -1836,6 +1837,7 @@ Scorecard        statement, questions: tuple[ScoredQuestion, ...],
 ScoredQuestion   question, chunks: tuple[RankedChunk, ...]
                    (best first, at most judged_depth)
                  first_answered_rank, all_key_points_rank: from 1, or None
+                 first_answered_rank_within(k): the same, None below k
                  is_answered_within(k), has_all_key_points_within(k)
 RankedChunk      returned: ReturnedChunk, judgment: Judgment; is_answered
 ```
@@ -1844,8 +1846,9 @@ RankedChunk      returned: ReturnedChunk, judgment: Judgment; is_answered
 so every metric reads one row per question. It refuses a run from another evaluator, and a
 run whose top `judged_depth` chunks aren't all judged: one that wasn't passed to
 `judge_top_chunks`. Built in `evaluation/scorecard.py` (`hit_rate_at`,
-`mean_reciprocal_rank_at`, `all_key_points_rate_at`, `questions_missed_at`, `for_tag`,
-`tags`) and `evaluation/evaluator.py` (`score`), tested in
+`mean_reciprocal_rank_at`, `all_key_points_rate_at`, `questions_missed_at`,
+`first_answered_ranks_within`, `answerable_questions`, `for_tag`, `tags`) and
+`evaluation/evaluator.py` (`score`), tested in
 `tests/evaluation/test_scorecard.py` and `tests/evaluation/test_evaluator.py`.
 
 - **A join, but each unit kept whole:** a row holds its `Question`, and each chunk its
@@ -1876,6 +1879,45 @@ run whose top `judged_depth` chunks aren't all judged: one that wasn't passed to
   chunks the rerank left below the depth. Each run then pools the top `depth` of each of
   its own stages, so those chunks are judged because of the run itself, never because of
   the runs pooled with it.
+
+### The comparison
+
+```text
+Comparison   candidate: Scorecard, baseline: Scorecard
+             questions_improved_at(k), questions_worsened_at(k), questions_unchanged_at(k)
+               → tuple[RankChange, ...], answerable questions only, in question order
+             for_tag(tag) → Comparison
+RankChange   question, baseline_rank, candidate_rank: from 1, or None (missed within k)
+             is_improvement, is_regression
+```
+
+`evaluator.compare(candidate, *, baseline, assessment)` checks both runs are its own and
+scores both on the one assessment. Built in `evaluation/comparison.py` and
+`evaluation/evaluator.py` (`compare`), tested in `tests/evaluation/test_comparison.py` and
+`tests/evaluation/test_evaluator.py`.
+
+- **A question's outcome is its first answered rank within k,** the rank the scorecard's
+  metrics read; past k it counts as missed, the worst rank. Any rank move and crossing a
+  cut-off are then one rule: at the judged depth every move counts, at a small k (the
+  passages an answer reads) only the moves that matter there. 3 → 2 is unchanged at
+  `k=1`, improved at `k=3`.
+- **The changes account for the scorecards' difference:** the questions improved and
+  worsened at k are exactly those whose 1/rank changed, so they make up the difference in
+  `mean_reciprocal_rank_at(k)`, and those that crossed k make up the difference in
+  `hit_rate_at(k)`. A test checks the first at every k.
+- **Lists of `RankChange`, not counts:** the comparison is for finding which questions to
+  look into, and "3 → 1" says more than "improved". A count is `len(…)`.
+- **Unchanged includes missed by both,** so the three lists hold every answerable question
+  once.
+- **Built on two scorecards, checked by `compare`:** the comparison reads ranks through
+  `Scorecard.first_answered_ranks_within`, so the cut-off is checked as every metric checks
+  it, and `for_tag` is each card's. `compare` scores both runs on one assessment, which
+  gives them the same judge, judged depth and questions; built directly, nothing checks
+  that, as with `Scorecard`. Ranks are paired by question id, never by position.
+- **Direction at the call site:** `compare(reranked, baseline=dense, …)`: the run tried is
+  positional, the one it's measured against is named.
+- **Small sets are noisy:** with about 50 questions, one 2 → 1 flip is weak evidence. The
+  lists say what to look into; paired tests come later ("Later").
 
 ### Rules
 
@@ -1917,7 +1959,7 @@ evaluation/
   __init__.py       the public names
   questions.py      Question, KeyPoint, Quote, and their checks (built)
   evaluator.py      Evaluator: from_index, quotes_not_found, gradable_questions,
-                    run_statement, judge_top_chunks, score (built); compare
+                    run_statement, judge_top_chunks, score, compare (built)
   runs.py           Run, ReturnedChunk, run_statement: running a prepared statement
                     (no grading) (built)
   judges/
@@ -1930,14 +1972,15 @@ evaluation/
   scorecard.py      Scorecard, ScoredQuestion, RankedChunk: the metrics over one run and
                     its judgments (built: hit_rate_at, mean_reciprocal_rank_at,
                     all_key_points_rate_at, questions_missed_at, for_tag, tags)
-  comparison.py     Comparison: two runs, question by question
+  comparison.py     Comparison, RankChange: two runs, question by question (built)
 ```
 
 Dependencies point down: `runs` alone uses the engine (`PreparedStatement`, `Passage`);
 `scorecard` and `comparison` read runs and judgments, so they're tested without an engine.
 Nothing in `engine/` imports `evaluation/`. Tests mirror the layout under
 `tests/evaluation/`, with invented questions and text only (`FakeDenseEmbedder`,
-`FakeReranker`, `InMemoryIndex`): the real question set never appears in a test.
+`FakeReranker`, `InMemoryIndex`): the real question set never appears in a test. The
+scorecard and comparison tests build their rows by hand with `tests/evaluation/support.py`.
 
 ### Security
 

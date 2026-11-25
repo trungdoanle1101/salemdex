@@ -20,6 +20,7 @@ from typing import Self
 from salemdex_retrieval.checks import check_positive_int
 from salemdex_retrieval.chunks import Chunk
 from salemdex_retrieval.engine import PreparedStatement
+from salemdex_retrieval.evaluation.comparison import Comparison
 from salemdex_retrieval.evaluation.judges.protocol import Assessment, Judge, Judgment
 from salemdex_retrieval.evaluation.occurrences import (
     QuoteOccurrences,
@@ -246,6 +247,41 @@ class Evaluator:
             judged_depth=assessment.judged_depth,
         )
 
+    def compare(
+        self, candidate: Run, *, baseline: Run, assessment: Assessment
+    ) -> Comparison:
+        """Return `candidate` compared with `baseline`, question by question.
+
+        Both runs are scored on the one assessment, so they're graded alike: the same
+        judge, judged depth and questions.
+
+        Args:
+            candidate: The run being tried, made by this evaluator.
+            baseline: The run it's measured against, made by this evaluator.
+            assessment: Judgments of both runs' top chunks: both were among the runs
+                passed to `judge_top_chunks`.
+
+        Returns:
+            The comparison of the two runs' scorecards.
+
+        Raises:
+            ValueError: A run was made by another evaluator, or one of its chunks within
+                the judged depth has no judgment in `assessment`.
+
+        Example:
+            assessment = evaluator.judge_top_chunks(
+                [dense, reranked], depth=10, judge=QuoteJudge()
+            )
+            comparison = evaluator.compare(
+                reranked, baseline=dense, assessment=assessment
+            )
+        """
+        self._check_runs([candidate, baseline])
+        return Comparison(
+            candidate=self.score(candidate, assessment=assessment),
+            baseline=self.score(baseline, assessment=assessment),
+        )
+
     def _check_runs(self, runs: Sequence[Run]) -> None:
         """Check there's a run, and every one was made by this evaluator.
 
@@ -380,6 +416,7 @@ def _score_question(
         judgment = assessment.judgment_of(question.id, returned.chunk_id)
         if judgment is None:
             raise ValueError(
+                f"question {question.id!r}, chunk {returned.chunk_id}: "
                 "this run wasn't judged in this assessment: pass it to judge_top_chunks"
             )
         ranked = RankedChunk(returned=returned, judgment=judgment)

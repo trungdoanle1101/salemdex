@@ -2,8 +2,9 @@
 is set. Its settings and loading are tested with the embedder's, in
 tests/test_huggingface.py.
 
-The tiny models have random weights, so their scores mean nothing; they show the shape
-of what comes back and the refusal of a classifier, with no download. The ranking tests
+The tiny models have random weights from a fixed seed, so their scores mean nothing
+but are the same on every run; they show the shape of what comes back and the refusal
+of a classifier, with no download. The ranking tests
 run only when KB_TEST_RERANKER_MODEL names a model, as a hub id or a local folder, e.g.
 `BAAI/bge-reranker-v2-m3`. They use English text, so any model can run them.
 """
@@ -13,6 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
+import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import (
     BertConfig,
@@ -183,7 +185,15 @@ def _build_cross_encoder(folder: Path, *, labels: int) -> None:
         num_attention_heads=1,
         intermediate_size=16,
         max_position_embeddings=TINY_MODEL_LIMIT,
+        # BERT's default (0.02) leaves one token's effect on the score so small that
+        # texts differing by a word tied in about 1 model in 5, and 1.0 ties too (in
+        # about 1 in 12); from 0.2 to 0.5, none of 300 seeds tied
+        initializer_range=0.3,
     )
     config.num_labels = labels
-    model = BertForSequenceClassification(config)  # type: ignore[no-untyped-call]
+    # A fixed seed, so every run builds the same model; forked, so the seed doesn't
+    # leak into other tests
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = BertForSequenceClassification(config)  # type: ignore[no-untyped-call]
     model.save_pretrained(folder)

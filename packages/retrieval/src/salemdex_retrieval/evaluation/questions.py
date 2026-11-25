@@ -107,7 +107,7 @@ class KeyPoint:
             ValueError: There are no quotes, so the key point could never be found.
         """
         if not self.quotes:
-            raise ValueError("KeyPoint must have at least once Quote")
+            raise ValueError("KeyPoint must have at least one Quote")
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -9,6 +9,7 @@ it higher, so a score read there would depend on which runs were judged together
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -81,6 +82,11 @@ class ScoredQuestion:
         """Return whether an answered chunk is among the top `k`."""
         return self.first_answered_rank is not None and self.first_answered_rank <= k
 
+    def first_answered_rank_within(self, k: int) -> int | None:
+        """Return the rank of the first answered chunk in the top `k`, or None."""
+        rank = self.first_answered_rank
+        return rank if rank is not None and rank <= k else None
+
     def has_all_key_points_within(self, k: int) -> bool:
         """Return whether the top `k` chunks together supply every key point."""
         return self.all_key_points_rank is not None and self.all_key_points_rank <= k
@@ -124,8 +130,8 @@ class Scorecard:
         """
         self._check_for_rank_metrics(k)
         return sum(
-            question.is_answered_within(k) for question in self._answerable_questions
-        ) / len(self._answerable_questions)
+            question.is_answered_within(k) for question in self.answerable_questions
+        ) / len(self.answerable_questions)
 
     def all_key_points_rate_at(self, k: int) -> float:
         """Return the share of answerable questions with every key point in the top `k`.
@@ -142,8 +148,8 @@ class Scorecard:
         self._check_key_points_named()
         return sum(
             question.has_all_key_points_within(k)
-            for question in self._answerable_questions
-        ) / len(self._answerable_questions)
+            for question in self.answerable_questions
+        ) / len(self.answerable_questions)
 
     def mean_reciprocal_rank_at(self, k: int) -> float:
         """Return the mean of 1 / the first answered rank, over answerable questions.
@@ -156,14 +162,12 @@ class Scorecard:
         """
         self._check_for_rank_metrics(k)
         score = 0.0
-        for question in self._answerable_questions:
-            if (
-                question.first_answered_rank is not None
-                and question.first_answered_rank <= k
-            ):
-                score += 1.0 / question.first_answered_rank
+        for question in self.answerable_questions:
+            rank = question.first_answered_rank_within(k)
+            if rank is not None:
+                score += 1.0 / rank
 
-        return score / len(self._answerable_questions)
+        return score / len(self.answerable_questions)
 
     def questions_missed_at(self, k: int) -> tuple[ScoredQuestion, ...]:
         """Return the answerable rows with no answered chunk in the top `k`.
@@ -178,9 +182,25 @@ class Scorecard:
         self._check_for_rank_metrics(k)
         return tuple(
             question
-            for question in self._answerable_questions
+            for question in self.answerable_questions
             if not question.is_answered_within(k)
         )
+
+    def first_answered_ranks_within(self, k: int) -> Mapping[str, int | None]:
+        """Return each answerable question's first answered rank in the top `k`, by id.
+
+        Keyed by question id, so two cards' ranks pair up by question rather than by
+        position; None where no answered chunk is in the top `k`.
+
+        Raises:
+            ValueError: `k` isn't a positive `int` or is past the judged depth, or the
+                card has no answerable question.
+        """
+        self._check_for_rank_metrics(k)
+        return {
+            row.question.id: row.first_answered_rank_within(k)
+            for row in self.answerable_questions
+        }
 
     def for_tag(self, tag: str) -> Scorecard:
         """Return the card over only the questions tagged `tag`, left out ones too.
@@ -218,7 +238,7 @@ class Scorecard:
         return tuple(sorted({tag for question in questions for tag in question.tags}))
 
     @cached_property
-    def _answerable_questions(self) -> tuple[ScoredQuestion, ...]:
+    def answerable_questions(self) -> tuple[ScoredQuestion, ...]:
         """The rows the metrics with a cut-off count."""
         return tuple(row for row in self.questions if row.question.is_answerable)
 
@@ -234,7 +254,7 @@ class Scorecard:
             raise ValueError(
                 f"k can only be at most {self.judged_depth} (judged_depth), got {k}"
             )
-        if not self._answerable_questions:
+        if not self.answerable_questions:
             raise ValueError("this card has no answerable questions to rank")
 
     def _check_key_points_named(self) -> None:
@@ -246,7 +266,7 @@ class Scorecard:
         Raises:
             ValueError: An answered chunk of an answerable question names none.
         """
-        for row in self._answerable_questions:
+        for row in self.answerable_questions:
             for chunk in row.chunks:
                 if chunk.is_answered and not chunk.judgment.key_points:
                     raise ValueError(

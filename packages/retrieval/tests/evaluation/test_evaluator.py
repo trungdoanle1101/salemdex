@@ -639,3 +639,66 @@ def test_scoring_refuses_a_run_from_another_evaluator() -> None:
 
     with pytest.raises(ValueError, match="another evaluator"):
         evaluator.score(other, assessment=assessment)
+
+
+# Comparing: two runs scored on one assessment
+
+
+def test_comparing_scores_both_runs_on_the_one_assessment() -> None:
+    evaluator, [home, writing, answers] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    candidate = run_of(evaluator, {"q-01": [home, writing]})
+    baseline = run_of(evaluator, {"q-01": [writing, answers]})
+    assessment = evaluator.judge_top_chunks(
+        [candidate, baseline], depth=2, judge=QuoteJudge()
+    )
+
+    comparison = evaluator.compare(candidate, baseline=baseline, assessment=assessment)
+
+    assert comparison.candidate == evaluator.score(candidate, assessment=assessment)
+    assert comparison.baseline == evaluator.score(baseline, assessment=assessment)
+
+
+def test_comparing_finds_a_question_the_candidate_answers_and_the_baseline_misses() -> (
+    None
+):
+    evaluator, [home, writing, answers] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    candidate = run_of(evaluator, {"q-01": [home, writing]})
+    baseline = run_of(evaluator, {"q-01": [writing, answers]})
+    assessment = evaluator.judge_top_chunks(
+        [candidate, baseline], depth=2, judge=QuoteJudge()
+    )
+
+    comparison = evaluator.compare(candidate, baseline=baseline, assessment=assessment)
+
+    [change] = comparison.questions_improved_at(2)
+    assert (change.question.id, change.baseline_rank, change.candidate_rank) == (
+        "q-01",
+        None,
+        1,
+    )
+
+
+def test_comparing_refuses_a_baseline_that_wasnt_judged_in_the_assessment() -> None:
+    evaluator, [home, writing, _] = evaluator_with_ids(
+        question("q-01", key_point(FOUND))
+    )
+    candidate = run_of(evaluator, {"q-01": [home]})
+    baseline = run_of(evaluator, {"q-01": [writing]})
+    assessment = evaluator.judge_top_chunks([candidate], depth=1, judge=QuoteJudge())
+
+    with pytest.raises(ValueError, match="wasn't judged in this assessment"):
+        evaluator.compare(candidate, baseline=baseline, assessment=assessment)
+
+
+def test_comparing_refuses_a_run_from_another_evaluator() -> None:
+    evaluator, [home, *_] = evaluator_with_ids(question("q-01", key_point(FOUND)))
+    candidate = run_of(evaluator, {"q-01": [home]})
+    other = run_of(evaluator, {"q-01": [home]}, fingerprint=uuid.uuid4())
+    assessment = evaluator.judge_top_chunks([candidate], depth=1, judge=QuoteJudge())
+
+    with pytest.raises(ValueError, match="another evaluator"):
+        evaluator.compare(candidate, baseline=other, assessment=assessment)
