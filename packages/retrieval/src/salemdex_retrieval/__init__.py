@@ -15,7 +15,8 @@ search and validity checked before passages are returned:
 Each public name has one import path:
 
 - here: what callers build or call to use the package, the vocabulary at many call
-  sites: schemas, chunks, filters, statements, the `Engine` and its `VectorSource`;
+  sites: schemas, chunks, filters, statements, the `Engine` and its sources
+  (`VectorSource`, `LookupSource`);
 - its own module or subpackage: what callers receive, annotate, catch or implement,
   where the path tells the reader what it is: `errors.SchemaMismatchError`,
   `filters.Filter`, `engine.PreparedStatement`, `embedders.DenseEmbedder`,
@@ -29,7 +30,7 @@ to run a statement, so none runs unchecked, and none without a filter.
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.engine.engine import Engine
-from salemdex_retrieval.engine.sources import VectorSource
+from salemdex_retrieval.engine.sources import LookupSource, VectorSource
 from salemdex_retrieval.engine.stages import Rrf, source
 from salemdex_retrieval.engine.statements import search
 from salemdex_retrieval.filters import Everything, and_, not_, or_
@@ -42,6 +43,7 @@ __all__ = [
     "EmbeddedChunk",
     "Engine",
     "Everything",
+    "LookupSource",
     "Many",
     "One",
     "Rrf",

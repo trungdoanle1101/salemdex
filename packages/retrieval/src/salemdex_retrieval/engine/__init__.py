@@ -1,6 +1,6 @@
 """The engine: running search statements, and what they give back.
 
-`Engine`, `VectorSource`, `search`, `source` and the stages callers build are exported
+`Engine`, `VectorSource`, `LookupSource`, `search`, `source` and the stages callers build are exported
 from the package's top level. Here are the names callers receive, annotate or
 implement: the `Statement` a statement ends as, the `PreparedStatement` that
 `Engine.prepare` returns, the `Passage` results with their trail entries, and the

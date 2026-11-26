@@ -60,7 +60,10 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   - `engine/statements.py`: `search()`, the type-state steps ending in `Statement`, and
     `replay`;
   - `engine/sources.py`: `VectorSource(index=…, binding=…)`, what a registered source
-    name stands for, refusing a vector its index's schema doesn't declare;
+    name stands for, refusing a vector its index's schema doesn't declare; and
+    `LookupSource(index=…, parse_filter=…)`, fetching the chunks a filter read from the
+    question matches (section 6, "Lookup sources"), with the closed union
+    `RegisteredSource`. Tested in `tests/engine/test_lookup.py` on an in-memory index;
   - `engine/results.py`: the trail entries (`Found`, `Fused`, `Reranked`), `Candidate`
     and `Passage`;
   - `engine/validity.py`: the `Validity` port (`valid_ids(chunks) -> ids to keep`) and
@@ -102,6 +105,13 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
      slow download);
   2. in the server: a sparse vector on `KbChunks` (a new collection), a hybrid statement,
      then `evaluator.compare(hybrid, baseline=dense, …)` on the real question set.
+     Deferred until a machine where re-indexing is practical; done with the lookup's
+     field (below), so the collection changes once.
+- **Built** (2026-11-26): **lookup sources** (section 6, "Lookup sources"), in the
+  framework only. Next, in the server: a field of reference keys on `KbChunks`, filled at
+  preparation, and the app's parser building the same keys (which settles "Reference
+  keys" below), then a lookup source in the hybrid statement, measured on the questions
+  that name a provision (`scorecard.for_tag`).
 - **Pick up here** (as of 2026-11-18): replace the old retrieval in the server, then delete
   it (expand, migrate, contract; section 10, "Migration"). Nothing else in the framework
   imports `document_processor.retrieval` or `integrations.{huggingface,qdrant}`: only the
@@ -167,10 +177,11 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   - **How to re-index into the new collection** (step 3): a one-off command now, or
     server build step 8's re-index early.
   - **Reference keys:** the old index stored `reference_keys` (`address_keys` in
-    `retrieval/reference.py`), and `ChunkFilter` could filter by them; no server caller
-    searches by them, and evaluation grades by quote, so it doesn't need them either
-    (section 13). Drop them, or add a `Many(str)` field to `KbChunks` and move
-    `address_keys` out of the old package first.
+    `retrieval/reference.py`), and `ChunkFilter` could filter by them; evaluation grades
+    by quote, so it doesn't need them (section 13). Leaning: keep them, since the lookup
+    source (section 6, "Lookup sources") needs normalized keys to match exactly; add a
+    `Many(str, indexed=True)` field to `KbChunks` and move `address_keys` into the app
+    (its key format is the domain's), not the framework.
 - Decided: evaluation lives in salemdex, and the app supplies the questions and the
   corpus (section 13).
 - Decided, built when needed: a limit on `merge` (when fusing deep lists leaves too many to
@@ -1157,6 +1168,73 @@ several, and the reranker reads every chunk too.
   nothing, so a manager of no collection sees only what their groups allow.
 - Not yet: filtering by chunk ids (first caller: re-checking earlier candidates).
 
+### Lookup sources (built)
+
+```python
+engine = Engine(
+    validity=validity,
+    sources={
+        "dense": VectorSource(index=index, binding=dense_binding),
+        "lookup": LookupSource(index=index, parse_filter=parse_reference),  # the app's
+    },
+    rerankers={"bge": bge},
+)
+statement = (
+    search()
+    .retrieve(source("dense", depth=50), source("lookup", depth=20))
+    .merge(Rrf())
+    .rerank("bge")
+    .take()
+)
+
+parse_reference("Điều 12 Nghị định 145/2020 quy định gì?")   # the app's parser
+# → KbChunks.references.any_of(["nd-145/2020:dieu-12"])
+parse_reference("Thời giờ làm việc tối đa là bao nhiêu?")     # → None
+```
+
+A question naming what it asks about by an identifier (an article number, an error code, a
+product number) wants the chunks that identifier names, exactly. Dense search blurs numbers
+("Điều 12" and "Điều 21" embed alike), and BM25 only partly helps ("12" is in dates and
+amounts too). A lookup fetches those chunks by a filter instead, and joins the fusion as one
+source among the others.
+
+- **The framework knows only a function from question to filter:**
+  `parse_filter: Callable[[str], Filter | None]` (`FilterParser`). Which fields it filters and
+  what their values mean are the app's: no idea of a "reference" is in the framework. The
+  same source serves a recipe corpus ("step 3 of the lasagna recipe"). A parser may be a
+  grammar (regex) for identifiers with a rigid form, a list of known values (a gazetteer)
+  for names such as titles, a model, or a mix; any of them fits the type, stateful ones
+  included. Its input is the question alone: a follow-up's "nghị định đó" is resolved before
+  search, by condensing the conversation.
+- **`None` finds nothing and reads no index.** Why: most questions name nothing, so the
+  lookup must fall away cleanly. An empty list leaves RRF's result exactly what the other
+  sources give, keeps one list per source, and costs no round trip. Never `Everything()`:
+  "nothing to look up" must not become "match all".
+- **The parsed filter is ANDed with the run's `where`,** and checked against the index's
+  schema on every run (it's built from each question): not a filter → `TypeError` naming the
+  source, another schema's field → `SchemaMismatchError`. Why: a lookup is the easiest place
+  to bypass access control by accident; this way any parser, a model's included, can only
+  narrow what the asker sees. Validity gates its hits as it does every source's. The
+  parser's own errors pass through.
+- **Every hit scores 1.0:** a chunk matches or it doesn't. Why not `float | None`: every
+  `score` read (`Candidate.score`, `Passage.score`) would become optional for one kind of
+  source. A score here reads, vaguely, as how certain the retrieval is; only RRF and the
+  reranker compare across sources, and both ignore it.
+- **Hits come in chunk-id order, cut at the source's depth.** The order means nothing, and
+  doesn't need to: exact matches have no natural order ("Điều 1" across 300 documents has no
+  first), and with RRF's `k = 60` rank 1 adds 1/61 and rank 20 1/80, so the reranker decides.
+  It's stable, which evaluation needs, exists for every schema, and is the order Qdrant's
+  `scroll` gives for free. Rejected: an `order_by` field, which not every schema has, and
+  which asks the app a question with no good answer. When more chunks match than the depth,
+  the ones kept are arbitrary: a filter that broad isn't exact, so the fix is a narrower
+  parser or a deeper source.
+- **Every match is read before the cut,** since `Index.find` has no limit. Fine at this
+  scale with precise parsers. When a trace shows a lookup reading too much, add `limit` to
+  `find`: Qdrant's `scroll` already returns id order, so callers see no change.
+- **Its domain parts live in the app:** the parser, and a field of normalized keys filled at
+  preparation (e.g. `nd-145/2020:dieu-12`), since display text such as headings would match
+  fragilely ("Pick up here", "Reference keys").
+
 ### Generated entries
 
 An entry's text isn't the source's words, so it can't be a chunk's `text`. Entries get their
@@ -1534,7 +1612,8 @@ src/salemdex_retrieval/
                            name), take, as plain data
     statements.py          search() and the type-state steps:
                            Question → CandidateLists → Candidates → Statement; replay
-    sources.py             VectorSource: what a registered source name stands for
+    sources.py             VectorSource, LookupSource: what a registered source name
+                           stands for (RegisteredSource, a closed union)
     results.py             Candidate, the trail entries (Found, Fused, Reranked),
                            Passage
     validity.py            the Validity port, AlwaysValid
@@ -1586,7 +1665,7 @@ question isn't what's public, but which path is the one to use:
 
 | Tier | Holds | Names |
 |---|---|---|
-| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource` |
+| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource`, `LookupSource` |
 | a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.SparseEmbedder`, `embedders.DenseBinding`, `embedders.SparseBinding`, `embedders.VectorBinding`, `embedders.BM25Embedder`, `embedders.measure_average_length`, `embedders.split_words`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
 | a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.huggingface.HuggingFaceDenseEmbedder`, `embedders.huggingface.HuggingFaceSparseEmbedder`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
 | not exported | what only the package uses | `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
@@ -1730,7 +1809,7 @@ manuals instead? If not, it's the app's.
 | Technique | Framework piece | The app supplies |
 |---|---|---|
 | Hybrid dense + sparse | a `Sparse` vector on the schema, `SparseEmbedder` and `SparseBinding`, Qdrant sparse vectors, RRF merge, the BM25 and `SparseEncoder` adapters (all built) | the model, e.g. a SPLADE model or bge-m3's lexical weights; BM25's tokenizer |
-| Lookup by field | a source that turns the question into a filter on declared fields and fetches with `find` | the parser, e.g. "Điều 12 Nghị định 145" → headings |
+| Lookup by field | `LookupSource`: a filter read from the question, ANDed with the run's, fetched with `find` (built) | the parser, e.g. "Điều 12 Nghị định 145" → a filter on reference keys; the keys, filled at preparation |
 | Normalizing and expanding the question | a query transform taking a function or a glossary | diacritics restoration, abbreviations (NLĐ → người lao động), the domain's terms |
 | Rewrite, multi-query, HyDE, decomposition | query transforms over an LLM protocol | prompts in the domain's language |
 | Generated entries | the resolving source (section 6), an entries schema, a generator protocol | what to generate, the prompts |

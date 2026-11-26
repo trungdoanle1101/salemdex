@@ -38,7 +38,11 @@ from salemdex_retrieval.checks import check_positive_int, to_stripped_str
 from salemdex_retrieval.chunks import Chunk, Hit
 from salemdex_retrieval.embedders import DenseBinding, SparseBinding, VectorBinding
 from salemdex_retrieval.engine.results import Candidate, Found, Fused, Passage, Reranked
-from salemdex_retrieval.engine.sources import VectorSource
+from salemdex_retrieval.engine.sources import (
+    LookupSource,
+    RegisteredSource,
+    VectorSource,
+)
 from salemdex_retrieval.engine.stages import (
     Fusion,
     Merge,
@@ -52,11 +56,14 @@ from salemdex_retrieval.engine.stages import (
 from salemdex_retrieval.engine.statements import Statement, replay
 from salemdex_retrieval.engine.validity import Validity
 from salemdex_retrieval.errors import StatementError
-from salemdex_retrieval.filters import Filter, check_is_filter
+from salemdex_retrieval.filters import Filter, and_, check_is_filter
 from salemdex_retrieval.index.protocol import check_filter_matches_schema
 from salemdex_retrieval.rerankers import Reranker
 from salemdex_retrieval.rerankers.protocol import score_texts
 from salemdex_retrieval.vectors import Vector, VectorQuery
+
+# Every lookup hit's score: a chunk matches the parsed filter or it doesn't
+_LOOKUP_SCORE = 1.0
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -77,22 +84,23 @@ class Engine:
 
     Args:
         validity: Which chunks may be served now, asked at every gate.
-        sources: What each source name a statement may use stands for.
+        sources: What each source name a statement may use stands for: a
+            `VectorSource` or a `LookupSource`.
         rerankers: The reranker each name a statement may use stands for.
     """
 
     validity: InitVar[Validity]
-    sources: InitVar[Mapping[str, VectorSource]]
+    sources: InitVar[Mapping[str, RegisteredSource]]
     rerankers: InitVar[Mapping[str, Reranker]]
 
     _validity: Validity = field(init=False, repr=False)
-    _sources: Mapping[str, VectorSource] = field(init=False, repr=False)
+    _sources: Mapping[str, RegisteredSource] = field(init=False, repr=False)
     _rerankers: Mapping[str, Reranker] = field(init=False, repr=False)
 
     def __post_init__(
         self,
         validity: Validity,
-        sources: Mapping[str, VectorSource],
+        sources: Mapping[str, RegisteredSource],
         rerankers: Mapping[str, Reranker],
     ) -> None:
         """Check the registered names, and keep read-only copies of what's registered.
@@ -161,9 +169,9 @@ class Engine:
                         raise StatementError(
                             f"source {source.name!r} was not registered in the engine"
                         )
-                    vector_source = self._sources[source.name]
+                    registered_source = self._sources[source.name]
                     first_index = self._sources[sources[0].name].index
-                    if vector_source.index is not first_index:
+                    if registered_source.index is not first_index:
                         raise StatementError(
                             "two sources in the same Retrieve stage search different indexes, "
                             "which isn't supported yet; "
@@ -172,13 +180,19 @@ class Engine:
 
                     # One index, so the vector alone says what a source searches; vectors
                     # hash by identity, as they compare
-                    vector = vector_source.binding.vector
-                    if vector in seen_vectors:
-                        raise StatementError(
-                            f"two sources in the same Retrieve stage search vector {vector.name!r}; "
-                            "give it once, with the depth you need"
-                        )
-                    seen_vectors.add(vector)
+                    match registered_source:
+                        case VectorSource(binding=binding):
+                            vector = binding.vector
+                            if vector in seen_vectors:
+                                raise StatementError(
+                                    f"two sources in the same Retrieve stage search vector {vector.name!r}; "
+                                    "give it once, with the depth you need"
+                                )
+                            seen_vectors.add(vector)
+                        case LookupSource():
+                            pass
+                        case _:
+                            assert_never(registered_source)
             case Rerank(reranker=name):
                 if name not in self._rerankers:
                     raise StatementError(
@@ -241,13 +255,15 @@ class PreparedStatement:
             At most `limit` passages, each with its trail.
 
         Raises:
-            TypeError: `question` isn't a `str`, `where` isn't a filter, or a score or
-                a vector number isn't a real number.
+            TypeError: `question` isn't a `str`, `where` isn't a filter, a score or
+                a vector number isn't a real number, or a lookup's parser returned
+                something other than a filter or `None`.
             ValueError: `question` is empty or only whitespace, or `limit` isn't a
                 positive `int`; or an embedder or a reranker returned the wrong number
                 of rows or scores, or a number that doesn't fit.
             SchemaMismatchError: `where` uses a field that isn't in the schema of an
-                index the statement searches.
+                index the statement searches, or a lookup's parsed filter does. An
+                error from a lookup's parser passes through.
         """
         question = to_stripped_str(question, name="question")
         check_positive_int(limit, name="limit")
@@ -304,8 +320,8 @@ class PreparedStatement:
                     assert_never(stage)
 
         for source in all_sources:
-            vector_source = self._engine._sources[source.name]
-            check_filter_matches_schema(where, schema=vector_source.index.schema)
+            registered_source = self._engine._sources[source.name]
+            check_filter_matches_schema(where, schema=registered_source.index.schema)
 
     @classmethod
     def _create(cls, statement: Statement, *, engine: Engine) -> PreparedStatement:
@@ -330,7 +346,7 @@ def _retrieve(
     sources: Sequence[Source],
     *,
     where: Filter,
-    registered: Mapping[str, VectorSource],
+    registered: Mapping[str, RegisteredSource],
     validity: Validity,
 ) -> list[list[Candidate]]:
     """Return one ranked list of valid candidates per source, each found by it.
@@ -367,15 +383,38 @@ def _retrieve(
 
 
 def _search(
-    question: str, source: Source, *, where: Filter, registered: VectorSource
+    question: str, source: Source, *, where: Filter, registered: RegisteredSource
 ) -> list[Hit]:
     """Return what `source`'s index finds for `question`, at most its depth.
 
+    A vector source embeds the question and searches; a lookup source parses it into
+    a filter and fetches what that and `where` both match (`LookupSource`).
+
     Raises:
         ValueError: The embedder returned other than one row for the question.
+        TypeError: A lookup's parser returned something other than a filter or `None`.
+        SchemaMismatchError: A lookup's parser filtered by a field its index's schema
+            doesn't declare.
     """
-    query = _embed_question(question, binding=registered.binding)
-    return registered.index.search(query, where=where, limit=source.depth)
+    match registered:
+        case VectorSource(index=index, binding=binding):
+            query = _embed_question(question, binding=binding)
+            return index.search(query, where=where, limit=source.depth)
+        case LookupSource(index=index, parse_filter=parse_filter):
+            lookup_filter = parse_filter(question)
+            if lookup_filter is None:
+                return []
+            # Checked on every run: the filter is built from each question
+            check_is_filter(
+                lookup_filter, owner=f"the parse_filter of source {source.name!r}"
+            )
+            check_filter_matches_schema(lookup_filter, schema=index.schema)
+            found = index.find(where=and_(lookup_filter, where))
+            # find promises no order; ids give one that's the same on every run
+            kept = sorted(found, key=lambda chunk: chunk.id)[: source.depth]
+            return [Hit(chunk=chunk, score=_LOOKUP_SCORE) for chunk in kept]
+        case _:
+            assert_never(registered)
 
 
 def _embed_question(question: str, *, binding: VectorBinding) -> VectorQuery:

@@ -13,6 +13,7 @@ TOP_LEVEL = [
     "EmbeddedChunk",
     "Engine",
     "Everything",
+    "LookupSource",
     "Many",
     "One",
     "Rrf",
