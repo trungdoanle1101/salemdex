@@ -8,19 +8,19 @@ way.
 
 import hashlib
 import math
-import re
-import unicodedata
 from collections.abc import Sequence
 from typing import Final
 
 from salemdex_retrieval.checks import check_positive_int
+from salemdex_retrieval.embedders.words import split_words
 
 
 class FakeDenseEmbedder:
     """A dense embedder whose rows are bags of hashed words, for tests.
 
-    Each word, normalised to NFC and case-folded, adds +1 or -1 at a position chosen
-    by its hash; the row is then scaled to unit length. Tests can rely on:
+    Each word, as `split_words` gives it (NFC, case-folded), adds +1 or -1 at a
+    position chosen by its hash; the row is then scaled to unit length. Tests can rely
+    on:
 
     - the same text gets the same row, from any instance and in any process;
     - a question gets the same row as an identical passage;
@@ -76,19 +76,12 @@ class FakeDenseEmbedder:
     def _embed_text(self, text: str) -> list[float]:
         """Return the row for `text`: its hashed words, scaled to unit length."""
         row = [0.0] * self.size
-        for word in _words(text):
+        for word in split_words(text):
             position, sign = _hash_word(word, size=self.size)
             row[position] += sign
         # A text without words has no direction, so its row stays all zeros
         norm = math.hypot(*row)
         return [x / norm for x in row] if norm > 0 else row
-
-
-def _words(text: str) -> list[str]:
-    """Return the words of `text`, normalised to NFC and case-folded."""
-    # NFC first: a Vietnamese letter such as "ạ" can be one character or a letter
-    # plus a combining mark, and both must hash alike
-    return re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold())
 
 
 def _hash_word(word: str, *, size: int) -> tuple[int, float]:
