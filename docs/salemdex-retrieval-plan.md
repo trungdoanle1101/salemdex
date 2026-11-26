@@ -44,8 +44,13 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
     binding, and `tests/engine/test_engine.py` runs a hybrid statement (dense and sparse,
     fused by RRF) on an in-memory index;
   - `embedders/fake.py`: `FakeDenseEmbedder(size=…)`, a deterministic embedder by feature
-    hashing (signed, NFC and case-folded words), so texts sharing words score higher;
-    tested in `tests/embedders/test_fake.py`.
+    hashing (signed words from `split_words`), so texts sharing words score higher;
+    tested in `tests/embedders/test_fake.py`;
+  - `embedders/bm25.py`: `BM25Embedder`, a frozen dataclass of `average_length` (256 by
+    default), `k1` (1.2), `b` (0.75) and `tokenize`, and `measure_average_length` (section
+    6, "Sparse embedders"); `embedders/words.py`: `split_words`, the default tokenizer (NFC,
+    case-folded `\w+`). Tested in `tests/embedders/test_bm25.py`, against the textbook
+    formula end to end with the in-memory index's IDF, with three term ids pinned.
   - `checks.py`: `check_positive_int`, `to_finite_float`, `to_stripped_str`, shared by
     every layer;
   - `rerankers/`: the `Reranker` protocol, `score_texts`, and `FakeReranker`;
@@ -75,24 +80,27 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   - `chunks.py`: typed reads, `chunk[field]`; `filters.py`: `In`, from `One.in_`.
   - Behind the `huggingface` extra: `embedders/huggingface.py`
     (`HuggingFaceDenseEmbedder`, `encode_query` / `encode_document`, so the model's own
-    prompts) and `rerankers/huggingface.py` (`HuggingFaceReranker`, a one-label
+    prompts; `HuggingFaceSparseEmbedder`, a `SparseEncoder` the same way, refusing a model
+    that isn't one at load) and `rerankers/huggingface.py` (`HuggingFaceReranker`, a one-label
     `CrossEncoder`, refusing a classifier at load). Both take the model as Hugging Face
     names it, a hub id or a folder, and keep nothing about it; `_huggingface.py` holds the
     device choice and `load_model`, which raises `errors.ModelLoadError`. Tested in
-    `tests/test_huggingface.py` (no model), `tests/rerankers/test_huggingface.py` (a tiny
-    model built in the test) and, with a real model set, the embedder's and reranker's
-    tests; `tests/test_extras.py` checks no core import loads an extra's library.
-- **In progress** (as of 2026-11-25): **hybrid search** (section 6, "Sparse vectors"),
+    `tests/test_huggingface.py` (no model), `tests/rerankers/test_huggingface.py` and
+    `tests/embedders/test_huggingface_sparse.py` (tiny models built in the test) and,
+    with a real model set, every adapter's tests (`KB_TEST_EMBEDDER_MODEL`,
+    `KB_TEST_SPARSE_EMBEDDER_MODEL`, `KB_TEST_RERANKER_MODEL`); not yet run on a trained
+    SPLADE model; `tests/test_extras.py` checks no core import loads an extra's library.
+- **In progress** (as of 2026-11-26): **hybrid search** (section 6, "Sparse vectors"),
   with evaluation paused at the old/new gate (step 5 below). Built: the `Sparse` vector,
-  both indexes, `SparseEmbedder` and `SparseBinding`, and the engine's sparse sources, all
-  general, with no model's details. Next:
-  1. a fake sparse embedder in `embedders/fake.py`, so the server's tests can run a hybrid
-     statement without torch;
-  2. the adapters: BM25 in the core, taking a `tokenize` function from the app, and
-     `HuggingFaceSparseEmbedder` over sentence-transformers' `SparseEncoder` (SPLADE,
-     inference-free models), behind the `huggingface` extra. A bge-m3 adapter only if the
-     question set shows it beats them;
-  3. in the server: a sparse vector on `KbChunks` (a new collection), a hybrid statement,
+  both indexes, `SparseEmbedder` and `SparseBinding`, the engine's sparse sources, and two
+  adapters, `BM25Embedder` (core) and `HuggingFaceSparseEmbedder` (the `huggingface`
+  extra), all general, with no model's details. No fake sparse embedder is needed:
+  `BM25Embedder` loads no model and gives the same weights in every process, so the
+  server's tests can use it as it is. A bge-m3 adapter only if the question set shows it
+  beats them. Next:
+  1. run `HuggingFaceSparseEmbedder`'s real-model test on `naver/splade-v3` (deferred: a
+     slow download);
+  2. in the server: a sparse vector on `KbChunks` (a new collection), a hybrid statement,
      then `evaluator.compare(hybrid, baseline=dense, …)` on the real question set.
 - **Pick up here** (as of 2026-11-18): replace the old retrieval in the server, then delete
   it (expand, migrate, contract; section 10, "Migration"). Nothing else in the framework
@@ -1001,6 +1009,68 @@ index.put(embedded)
   `AsyncIndex`) and an async `execute` beside the synchronous one. Statements and stages are
   data, so they stay unchanged.
 
+### Sparse embedders (built)
+
+```python
+bm25 = BM25Embedder(average_length=measure_average_length(chunk_texts))
+SparseBinding(vector=KbChunks.terms, embedder=bm25)           # terms = Sparse(modifier="idf")
+
+splade = HuggingFaceSparseEmbedder("naver/splade-v3", device="auto", batch_size=16)
+SparseBinding(vector=KbChunks.lexical, embedder=splade)       # lexical = Sparse(modifier="none")
+```
+
+**`BM25Embedder`** (`embedders/bm25.py`, core, no extra):
+
+- **The split with the index:** a passage weighs each distinct term by BM25's
+  term-frequency part, `tf × (k1 + 1) / (tf + k1 × (1 − b + b × length / average_length))`;
+  a question weighs each distinct term 1 (a repeated question term counts once, as in
+  fastembed). The index multiplies in IDF (`modifier="idf"`), so together they score as
+  BM25. A test checks that against the textbook formula, and the weights matched
+  qdrant-client's reference BM25 to the last digit.
+- **The tokenizer is a setting with a default,** `split_words` (NFC, case-folded `\w+`,
+  diacritics kept). Why: someone new to the framework shouldn't have to write one before
+  anything works; an app can do better (stop words, syllable pairs for Vietnamese) by
+  building on `split_words`, which is why it's exported. It doesn't suit languages written
+  without spaces.
+- **A term's id is a 32-bit blake2b hash,** read as an unsigned int: the same in every
+  process (never `hash()`, salted per process), no vocabulary to keep, and collisions
+  only merge two terms (about one pair in 100,000 terms). Not an option: no hash ranks
+  better, and a different one silently leaves every index unsearchable. A `term_id`
+  keyword can be added later without breaking anyone, if ids must match another system.
+  Three ids are pinned in a test.
+- **`average_length` has a default (256, fastembed's)** and a helper,
+  `measure_average_length(texts, *, tokenize)`, to measure it once over the corpus. A
+  float: an average isn't whole. A wrong one shifts every passage's length normalization
+  alike, so it matters little. Not fitted from the passages it embeds: that would make
+  the embedder stateful, shared between the worker and the API.
+- **`k1` and `b` are keyword settings** with the textbook defaults (1.2, 0.75), checked
+  where they enter (`to_finite_float`, then their ranges). They're BM25's only knobs, so
+  tuning them is an `evaluator.compare` experiment.
+- **A frozen dataclass:** it is its settings plus pure functions, so the settings are
+  public, read-only and in its repr, which the app can record (changing one means
+  re-indexing, like a new model). `tokenize` is left out of the repr, since a function's
+  repr changes from run to run.
+
+**`HuggingFaceSparseEmbedder`** (`embedders/huggingface.py`, the `huggingface` extra):
+
+- **Any `SparseEncoder`:** SPLADE and inference-free models (which run the network on
+  passages only), through `encode_query` and `encode_document`. Ids are the model's
+  vocabulary token ids; the weights are learned, so the vector takes `modifier="none"`.
+  bge-m3's lexical weights aren't a `SparseEncoder`: a second adapter behind the same
+  protocol, if ever.
+- **A model that isn't a `SparseEncoder` is refused at load.** Why: sentence-transformers
+  doesn't refuse it. It converts a dense model by adding an untrained sparse head, and
+  builds a default SPLADE stack on a bare checkpoint, logging only a warning; the worker
+  would then index noise and search would quietly get worse. The check reads
+  `config_sentence_transformers.json`'s `model_type` with sentence-transformers' own lookup
+  (`util.load_file_path`) and default (`"SentenceTransformer"`), so the rule is the one it
+  uses to decide whether to convert. It runs after loading, so a name that isn't a model
+  gets `load_model`'s error instead.
+- **The output is one sparse COO tensor for the batch,** uncoalesced; `_weights_by_row`
+  coalesces it and builds one dict per text from its `indices()` and `values()`, starting
+  from one empty dict per text, since a text weighing nothing has no entries. An empty
+  batch returns `[]` before calling the model: its tensor would come back with shape `(0,)`.
+
 ### Chunk length and the models
 
 The old preparation sized chunks in its one embedder's tokens. That assumed one dense
@@ -1453,8 +1523,11 @@ src/salemdex_retrieval/
     protocol.py            DenseEmbedder, SparseEmbedder, DenseBinding, SparseBinding,
                            VectorBinding, and embed_chunks(chunks, *, bindings)
     fake.py                a deterministic embedder for tests, the server's too
-    huggingface.py         HuggingFaceDenseEmbedder: any sentence-transformers model, as
-                           Hugging Face names it, behind the `huggingface` extra
+    words.py               split_words: the default tokenizer
+    bm25.py                BM25Embedder, measure_average_length: no model, no extra
+    huggingface.py         HuggingFaceDenseEmbedder, HuggingFaceSparseEmbedder: any
+                           sentence-transformers model, as Hugging Face names it, behind
+                           the `huggingface` extra
 
   engine/                  retrieval itself (build step 3)
     stages.py              retrieve (sources by name), merge (rrf), rerank (a reranker by
@@ -1514,8 +1587,8 @@ question isn't what's public, but which path is the one to use:
 | Tier | Holds | Names |
 |---|---|---|
 | top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource` |
-| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.SparseEmbedder`, `embedders.DenseBinding`, `embedders.SparseBinding`, `embedders.VectorBinding`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
-| a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
+| a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.SparseEmbedder`, `embedders.DenseBinding`, `embedders.SparseBinding`, `embedders.VectorBinding`, `embedders.BM25Embedder`, `embedders.measure_average_length`, `embedders.split_words`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
+| a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.huggingface.HuggingFaceDenseEmbedder`, `embedders.huggingface.HuggingFaceSparseEmbedder`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
 | not exported | what only the package uses | `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
 
 - **Why not everything at the top:** where a name lives tells the reader what it is.
@@ -1656,7 +1729,7 @@ manuals instead? If not, it's the app's.
 
 | Technique | Framework piece | The app supplies |
 |---|---|---|
-| Hybrid dense + sparse | a `Sparse` vector on the schema, `SparseEmbedder` and `SparseBinding`, Qdrant sparse vectors, RRF merge (all built); BM25 and `SparseEncoder` adapters (next) | the model, e.g. a SPLADE model or bge-m3's lexical weights; BM25's tokenizer |
+| Hybrid dense + sparse | a `Sparse` vector on the schema, `SparseEmbedder` and `SparseBinding`, Qdrant sparse vectors, RRF merge, the BM25 and `SparseEncoder` adapters (all built) | the model, e.g. a SPLADE model or bge-m3's lexical weights; BM25's tokenizer |
 | Lookup by field | a source that turns the question into a filter on declared fields and fetches with `find` | the parser, e.g. "Điều 12 Nghị định 145" → headings |
 | Normalizing and expanding the question | a query transform taking a function or a glossary | diacritics restoration, abbreviations (NLĐ → người lao động), the domain's terms |
 | Rewrite, multi-query, HyDE, decomposition | query transforms over an LLM protocol | prompts in the domain's language |

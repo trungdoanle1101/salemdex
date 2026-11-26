@@ -35,6 +35,7 @@ cd packages/retrieval && uv run pytest        # retrieval tests: its tests/ pack
 #   KB_TEST_QDRANT_URL=http://localhost:6333                    a Qdrant server (compose up qdrant)
 #   KB_TEST_EMBEDDER_MODEL=sentence-transformers/all-MiniLM-L6-v2   a real embedder, hub id or folder
 #   KB_TEST_RERANKER_MODEL=BAAI/bge-reranker-v2-m3              a real reranker, hub id or folder
+#   KB_TEST_SPARSE_EMBEDDER_MODEL=naver/splade-v3
 #   HF_HUB_OFFLINE=1 uses only models already in the Hugging Face cache
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src apps/server/src apps/server/tests     # two runs: both tests/ folders are

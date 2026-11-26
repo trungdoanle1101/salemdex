@@ -1,4 +1,4 @@
-"""What both Hugging Face adapters share: settings checked before loading, the device,
+"""What the Hugging Face adapters share: settings checked before loading, the device,
 and the error for a model that can't be loaded. None of these tests needs a model or the
 network.
 """
@@ -11,12 +11,16 @@ import pytest
 import torch
 
 from salemdex_retrieval._huggingface import Device, ResolvedDevice, resolve_device
-from salemdex_retrieval.embedders.huggingface import HuggingFaceDenseEmbedder
+from salemdex_retrieval.embedders.huggingface import (
+    HuggingFaceDenseEmbedder,
+    HuggingFaceSparseEmbedder,
+)
 from salemdex_retrieval.errors import ModelLoadError
 from salemdex_retrieval.rerankers.huggingface import HuggingFaceReranker
 
 ADAPTERS = [
-    pytest.param(HuggingFaceDenseEmbedder, id="embedder"),
+    pytest.param(HuggingFaceDenseEmbedder, id="dense embedder"),
+    pytest.param(HuggingFaceSparseEmbedder, id="sparse embedder"),
     pytest.param(HuggingFaceReranker, id="reranker"),
 ]
 
