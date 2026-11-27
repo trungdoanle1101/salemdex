@@ -18,7 +18,12 @@ from kb_server.indexing.handlers import (
     ProfileChooser,
 )
 from kb_server.indexing.worker import Worker
-from kb_server.search.statements import CROSS_ENCODER, DENSE, dense_then_rerank
+from kb_server.search.statements import (
+    CHUNKS,
+    CROSS_ENCODER,
+    DENSE,
+    dense_then_rerank,
+)
 from kb_server.search.validity import ServedVersionsOnly
 from kb_server.services.auth import AuthService
 from kb_server.services.collections import CollectionService
@@ -37,7 +42,7 @@ from kb_server.storage.repositories.groups import GroupRepository
 from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
 from salemdex_retrieval import Engine as SalemdexEngine
-from salemdex_retrieval import VectorSource
+from salemdex_retrieval import SearchableIndex, VectorScan
 from salemdex_retrieval.embedders import DenseBinding, DenseEmbedder
 from salemdex_retrieval.engine import PreparedStatement
 from salemdex_retrieval.errors import ModelLoadError, SchemaMismatchError
@@ -228,7 +233,7 @@ def open_search_tools(
 
     Built in this order: the embedder, the index of `KbChunks`, the reranker, then the
     engine registering them with the validity check, which prepares the statement.
-    The source returns `KB_RERANK_DEPTH` candidates, all of which the reranker reads.
+    The dense scan returns `KB_RERANK_DEPTH` candidates, all of which the reranker reads.
 
     A statement the engine refuses raises `StatementError`, not `ToolSetupError`: the
     statement is code, not configuration, so that's a bug, shown with its traceback.
@@ -250,10 +255,16 @@ def open_search_tools(
     try:
         engine = SalemdexEngine(
             validity=ServedVersionsOnly(services.session_factory),
-            sources={
-                DENSE: VectorSource(
+            indexes={
+                CHUNKS: SearchableIndex(
                     index=_open_index(settings, client=qdrant_client),
-                    binding=DenseBinding(vector=KbChunks.dense, embedder=embedder),
+                    scans={
+                        DENSE: VectorScan(
+                            binding=DenseBinding(
+                                vector=KbChunks.dense, embedder=embedder
+                            )
+                        )
+                    },
                 )
             },
             rerankers={CROSS_ENCODER: _build_reranker(settings)},

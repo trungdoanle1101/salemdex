@@ -9,8 +9,8 @@ from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
 from salemdex_retrieval.embedders.protocol import DenseBinding
 from salemdex_retrieval.engine.engine import Engine, PreparedStatement
 from salemdex_retrieval.engine.results import Found
-from salemdex_retrieval.engine.sources import VectorSource
-from salemdex_retrieval.engine.stages import source
+from salemdex_retrieval.engine.sources import SearchableIndex, VectorScan
+from salemdex_retrieval.engine.stages import scan
 from salemdex_retrieval.engine.statements import search
 from salemdex_retrieval.engine.validity import AlwaysValid
 from salemdex_retrieval.errors import SchemaMismatchError
@@ -259,14 +259,19 @@ def test_gradable_questions_keep_the_order_given() -> None:
 def prepare_body_search(index: InMemoryIndex) -> PreparedStatement:
     engine = Engine(
         validity=AlwaysValid(),
-        sources={
-            "body": VectorSource(
-                index=index, binding=DenseBinding(vector=Notes.body, embedder=EMBEDDER)
+        indexes={
+            "chunks": SearchableIndex(
+                index=index,
+                scans={
+                    "body": VectorScan(
+                        binding=DenseBinding(vector=Notes.body, embedder=EMBEDDER)
+                    )
+                },
             )
         },
         rerankers={},
     )
-    return engine.prepare(search().retrieve(source("body", depth=3)).take())
+    return engine.prepare(search("chunks").retrieve(scan("body", depth=3)).take())
 
 
 def test_a_run_asks_every_question_gradable_or_not_and_carries_the_fingerprint() -> (
@@ -319,7 +324,7 @@ def test_gradable_questions_and_quotes_not_found_are_worked_out_once() -> None:
 
 # Judging: runs built by hand, so each pool is exactly what a test says
 
-STATEMENT = search().retrieve(source("body", depth=3)).take()
+STATEMENT = search("chunks").retrieve(scan("body", depth=3)).take()
 
 
 def run_of(
@@ -334,7 +339,7 @@ def run_of(
             question_id: tuple(
                 ReturnedChunk(
                     chunk_id=chunk_id,
-                    trail=(Found(source="body", rank=rank, score=0.5),),
+                    trail=(Found(scan="body", rank=rank, score=0.5),),
                 )
                 for rank, chunk_id in enumerate(chunk_ids, start=1)
             )

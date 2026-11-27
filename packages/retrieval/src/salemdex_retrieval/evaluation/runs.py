@@ -105,9 +105,7 @@ def run_statement(
     every_candidate = _count_candidates(prepared.statement)
     record: dict[str, tuple[ReturnedChunk, ...]] = {}
     for question in questions:
-        passages = prepared.execute(
-            question=question.text, limit=every_candidate, where=where
-        )
+        passages = prepared.execute(question.text, limit=every_candidate, where=where)
         record[question.id] = tuple(
             ReturnedChunk(chunk_id=p.chunk.id, trail=p.trail) for p in passages
         )
@@ -119,13 +117,13 @@ def run_statement(
 
 
 def _count_candidates(statement: Statement) -> int:
-    """Return the most candidates `statement` can find: its sources' depths, summed."""
+    """Return the most candidates `statement` can find: its scans' depths, summed."""
     count = 0
     for stage in statement.stages:
         match stage:
-            case Retrieve(sources=sources):
+            case Retrieve(scans=scans):
                 # A merge's union can exceed any one depth, never their sum
-                count += sum(source.depth for source in sources)
+                count += sum(scan.depth for scan in scans)
             case Merge() | Rerank() | Take():
                 continue
             case _:

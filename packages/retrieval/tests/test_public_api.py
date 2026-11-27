@@ -13,18 +13,20 @@ TOP_LEVEL = [
     "EmbeddedChunk",
     "Engine",
     "Everything",
-    "LookupSource",
+    "LookupScan",
     "Many",
     "One",
     "Rrf",
     "Schema",
+    "SearchableIndex",
     "Sparse",
-    "VectorSource",
+    "VectorScan",
+    "Window",
     "and_",
     "not_",
     "or_",
+    "scan",
     "search",
-    "source",
 ]
 
 

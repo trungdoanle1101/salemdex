@@ -74,13 +74,17 @@ def create_app(
 def _open_search_tools_or_log(
     services: Services,
 ) -> Generator[PreparedStatement, None, None]:
-    """Yield `open_search_tools`, logging in one line why it can't be built.
+    """Yield `open_search_tools`, logging the statement it prepared, or in one line why
+    it can't be built.
 
     Raises:
         ToolSetupError: The search tools can't be built; uvicorn then stops.
     """
     try:
         with open_search_tools(services) as prepared_statement:
+            # Written as its steps: names, depths and field names only, never document
+            # text, so the log says exactly how this server searches
+            logger.info("search runs %s", prepared_statement.statement)
             yield prepared_statement
     except ToolSetupError as error:
         # Uvicorn prints the traceback after this; the line says what to fix

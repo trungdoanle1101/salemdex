@@ -8,7 +8,7 @@ appear in tests.
 import uuid
 
 from salemdex_retrieval.engine.results import Found
-from salemdex_retrieval.engine.stages import source
+from salemdex_retrieval.engine.stages import scan
 from salemdex_retrieval.engine.statements import search
 from salemdex_retrieval.evaluation.judges.protocol import Grade, Judgment
 from salemdex_retrieval.evaluation.questions import KeyPoint, Question, Quote
@@ -20,7 +20,7 @@ from salemdex_retrieval.evaluation.scorecard import (
 )
 from salemdex_retrieval.filters import Everything
 
-STATEMENT = search().retrieve(source("body", depth=10)).take()
+STATEMENT = search("chunks").retrieve(scan("body", depth=10)).take()
 JUDGED_DEPTH = 10
 
 # One letter per returned chunk, best first: A answered, R related, U unrelated
@@ -75,7 +75,7 @@ def ranked(
     chunk_id = uuid.uuid4()
     return RankedChunk(
         returned=ReturnedChunk(
-            chunk_id=chunk_id, trail=(Found(source="body", rank=rank, score=0.5),)
+            chunk_id=chunk_id, trail=(Found(scan="body", rank=rank, score=0.5),)
         ),
         judgment=Judgment(
             question_id=question_id,

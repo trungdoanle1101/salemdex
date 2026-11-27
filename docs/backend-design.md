@@ -59,9 +59,10 @@ apps/server/
 
 - `api` → `services` → `domain` and `storage`; `services` → `search` → `storage` and
   salemdex_retrieval; `indexing` → `storage` and the framework. Nothing imports upward. Why: each layer can be tested without the ones above it.
-- Only the wiring builds the retrieval `Engine`: `open_search_tools` registers the source and
-  the reranker under the names in `search/statements.py` and prepares the statement at
-  startup. Services receive the prepared statement, never the engine or an index. Why: a
+- Only the wiring builds the retrieval `Engine`: `open_search_tools` registers the index,
+  its dense scan and the reranker under the names in `search/statements.py` and prepares
+  the statement at startup; the API logs it, written as its steps
+  (`search('chunks').retrieve(scan('dense', depth=…))…`), so the log says how it searches. Services receive the prepared statement, never the engine or an index. Why: a
   service can then run only that checked statement, with the filter it passes (least
   authority), and a wrong statement stops `serve` before it answers anyone. An
   import-boundary check in CI will enforce it (later).
@@ -689,7 +690,7 @@ Project hygiene alongside: CI (ruff, mypy, pytest with Postgres), a pre-commit g
 | Model dependencies imported inside `open_job_tools` and `open_search_tools` | A top-level import loads torch in every command |
 | `SearchService` lives for the app and reads in short transactions | A request holding a connection through the models can exhaust the pool |
 | The search statement is prepared at startup; `SearchService` holds only the prepared statement | A wrong statement stops `serve` at startup; the service can run that checked statement and nothing else, never an index directly |
-| Sources and rerankers are registered by role (`dense`, `cross_encoder`), not by model | Changing a model's spec leaves the statement, and every log of it, true |
+| Indexes, scans and rerankers are registered by role (`chunks`, `dense`, `cross_encoder`), not by model or collection | Changing a model's spec leaves the statement, and every log of it, true |
 | Models found by reference under one `KB_MODELS_FOLDER` | A folder setting per model drifts from its spec |
 | The claim commits before the handler runs | A rolled-back claim is retried forever and never counts its attempts |
 | A job with no version is never superseded by a new version | It applies to the whole document, not to one version |

@@ -1,22 +1,24 @@
 """The steps a search statement is made of, as plain data: what to do, never with what.
 
-Each stage holds only its own settings, and names the sources and rerankers it uses;
-the engine holds what those names stand for (indexes, embedders, models), and gives
+Each stage holds only its own settings, and names the scans and rerankers it uses;
+the engine holds what those names stand for (embedders, parsers, models), and gives
 the stages meaning when a prepared statement runs them. Holding no objects, a statement
 can be logged, compared and replayed, and one built at run time (from config, by an
 agent) can name only what the app registered.
 
-A stage checks its own settings when it's built. Checks that need the engine (a name
-is registered, the sources of a retrieve search one index) run when the statement is
-prepared, so a wrong statement still fails before any model is called or any index is
-read.
+A stage checks its own settings when it's built. Checks that need the engine (a scan
+is registered on the statement's index, a window's fields are in its schema) run when
+the statement is prepared, so a wrong statement still fails before any model is
+called or any index is read.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from salemdex_retrieval.checks import check_positive_int, to_stripped_str
+from salemdex_retrieval.schema import Field, One
 
 # Every kind of stage. A closed union: the engine's `match` over it ends in
 # `assert_never`, so mypy points at every place that hasn't learned a new kind.
@@ -28,64 +30,64 @@ type Fusion = Rrf
 
 @dataclass(frozen=True, kw_only=True)
 class Retrieve:
-    """A stage finding candidates for the question, one ranked list per source.
+    """A stage finding candidates for the question, one ranked list per scan.
 
-    Each source's question is embedded, and its index searched with the run's filter
-    (`where`). Several sources give several lists, which a `Merge` must fuse before
-    any other stage.
+    Each scan reads the statement's index for the question, with the run's filter
+    (`where`). Several scans give several lists, which a `Merge` must fuse before any
+    other stage. Every scan reads the same index, so a candidate is known by its chunk
+    id, and one filter fits every scan.
 
-    No two sources may share a name: each candidate's trail names the sources that
-    found it. That is checked here; two rules need the registered sources, so they're
-    checked when the statement is prepared:
+    No two scans may share a name: each candidate's trail names the scans that found
+    it. That is checked here; two rules need the registered scans, so they're checked
+    when the statement is prepared:
 
-    - every source searches the same index, for now: a candidate is known by its
-      chunk id, which is unique only within one index, and one index has one schema,
-      so one filter fits every source;
-    - no two sources search the same vector, whatever their depths: the shallower
-      list would be the start of the deeper one, and fusion would count it twice.
+    - every scan is registered on the statement's index;
+    - no two scans search the same vector, whatever their depths: the shallower list
+      would be the start of the deeper one, and fusion would count it twice.
 
     Attributes:
-        sources: Where to look, in order; at least one.
+        scans: What to run, in order; at least one.
     """
 
-    sources: tuple[Source, ...]
+    scans: tuple[Scan, ...]
 
     def __post_init__(self) -> None:
-        """Check the sources.
+        """Check the scans.
 
         Raises:
-            ValueError: There are no sources, or two share a name.
-            TypeError: A source isn't a `Source`.
+            ValueError: There are no scans, or two share a name.
+            TypeError: A scan isn't a `Scan`.
         """
-        if not self.sources:
-            raise ValueError("a retrieve needs at least one source")
+        if not self.scans:
+            raise ValueError("a retrieve needs at least one scan")
 
-        seen_sources: set[str] = set()
-        for position, source in enumerate(self.sources):
-            if type(source) is not Source:
+        seen_scans: set[str] = set()
+        for position, scan in enumerate(self.scans):
+            if type(scan) is not Scan:
                 raise TypeError(
-                    f"sources[{position}] is {type(source).__name__}; expected a Source"
+                    f"scans[{position}] is {type(scan).__name__}; expected a Scan"
                 )
 
-            if source.name in seen_sources:
+            if scan.name in seen_scans:
                 raise ValueError(
-                    f"two sources in one retrieve share a name: {source.name!r}"
+                    f"two scans in one retrieve share a name: {scan.name!r}"
                 )
-            seen_sources.add(source.name)
+            seen_scans.add(scan.name)
 
 
 @dataclass(frozen=True, kw_only=True)
-class Source:
-    """A source a retrieve searches, named as the engine registered it, and how deep.
+class Scan:
+    """A scan a retrieve runs, named as the engine registered it, and how deep.
 
-    Build it with `source`. It holds only data; the engine resolves the name to what
-    the source searches (e.g. a `VectorSource`) when the statement is prepared.
+    Build it with `scan`. It holds only data; when the statement is prepared, the
+    engine resolves the name, on the statement's index, to what the scan reads it
+    with (e.g. a `VectorScan`).
 
     Attributes:
-        name: The source's name in the engine, also what each candidate's trail calls
+        name: The scan's name on the index, also what each candidate's trail calls
             it, e.g. "dense"; unique within a retrieve, and stripped of whitespace at
             either end.
-        depth: The most candidates this source returns.
+        depth: The most candidates this scan returns.
     """
 
     name: str
@@ -104,15 +106,15 @@ class Source:
         check_positive_int(self.depth, name="depth")
 
 
-def source(name: str, *, depth: int) -> Source:
-    """Return the source registered as `name`, searched for at most `depth` candidates.
+def scan(name: str, *, depth: int) -> Scan:
+    """Return the scan registered as `name`, run for at most `depth` candidates.
 
     Args:
-        name: The source's name in the engine, e.g. "dense".
+        name: The scan's name on the statement's index, e.g. "dense".
         depth: The most candidates it returns.
 
     Returns:
-        The source, ready for a retrieve.
+        The scan, ready for a retrieve.
 
     Raises:
         TypeError: `name` isn't a `str`.
@@ -120,14 +122,14 @@ def source(name: str, *, depth: int) -> Source:
             `int`.
 
     Example:
-        search().retrieve(source("dense", depth=50), source("sparse", depth=50))
+        search("chunks").retrieve(scan("dense", depth=50), scan("sparse", depth=50))
     """
-    return Source(name=name, depth=depth)
+    return Scan(name=name, depth=depth)
 
 
 @dataclass(frozen=True, kw_only=True)
 class Merge:
-    """A stage fusing the ranked lists of several sources into one.
+    """A stage fusing the ranked lists of several scans into one.
 
     Attributes:
         fusion: How the lists are fused, e.g. `Rrf()`.
@@ -140,9 +142,9 @@ class Merge:
 class Rrf:
     """Reciprocal rank fusion: each candidate scores `Σ 1 / (k + rank)` over its lists.
 
-    Only ranks count, never the sources' scores, which aren't on one scale (cosine,
-    BM25 and max-sim differ). A candidate several sources rank high beats one a
-    single source ranks first.
+    Only ranks count, never the scans' scores, which aren't on one scale (cosine,
+    BM25 and max-sim differ). A candidate several scans rank high beats one a single
+    scan ranks first.
 
     Attributes:
         k: How much a top rank outweighs a lower one; smaller favours the top. 60 is
@@ -166,8 +168,8 @@ class Rerank:
 
     It scores all the candidates it receives, so its cost is set by the stages before
     it: each bound in a statement limits what a stage keeps, never what it reads.
-    With one source that's the source's `depth`; after a merge, the union of the
-    sources' lists.
+    With one scan that's the scan's `depth`; after a merge, the union of the scans'
+    lists.
 
     Attributes:
         reranker: The name of the reranker, as the engine registered it, that scores
@@ -190,9 +192,101 @@ class Rerank:
 
 
 @dataclass(frozen=True, kw_only=True)
+class Window:
+    """The chunks returned around each hit: its neighbors, in reading order.
+
+    Like a SQL window frame: the chunks of the hit's partition (the same values for
+    every `partition_by` field) whose `order_by` is within `chunks_each_side` of the
+    hit's. Small chunks rank precisely, and their window gives the reader the text
+    around them.
+
+    A `Take` finds the windows after the final gate and the cut, for the hits it
+    returns only, in one read of the index. The run's filter and validity apply to
+    every neighbor, so a window shows nothing a search couldn't; a neighbor either
+    hides leaves a gap. Windows of nearby hits may overlap, and each holds all of its
+    chunks.
+
+    `order_by` should number each partition's chunks with unique, consecutive
+    integers, such as their position in a document's version: a window then holds at
+    most `2 * chunks_each_side + 1` chunks. Gaps in the numbering only shorten
+    windows. Repeated values are allowed, ordered by chunk id, but then the bound
+    doesn't hold. Every field must be one of the schema of the statement's index,
+    checked when the statement is prepared.
+
+    Attributes:
+        partition_by: The fields whose values every chunk of a window shares with
+            its hit, e.g. `(KbChunks.document_id, KbChunks.document_version)`; empty
+            when the whole index is one sequence. It has no default, so a window that
+            runs across documents is always asked for.
+        order_by: The field numbering the chunks of a partition, e.g.
+            `KbChunks.position`.
+        chunks_each_side: The most neighbors before the hit, and after it.
+
+    Example:
+        search("chunks").retrieve(scan("dense", depth=50)).take(
+            window=Window(
+                partition_by=(KbChunks.document_id, KbChunks.document_version),
+                order_by=KbChunks.position,
+                chunks_each_side=1,
+            )
+        )
+    """
+
+    partition_by: tuple[One[Any], ...]
+    order_by: One[int]
+    chunks_each_side: int
+
+    def __post_init__(self) -> None:
+        """Check the fields' kinds, and the number of chunks each side.
+
+        Raises:
+            TypeError: `partition_by` isn't a tuple or holds a field that isn't a
+                `One`, or `order_by` isn't a `One[int]`.
+            ValueError: `chunks_each_side` isn't a positive `int`.
+        """
+        if type(self.partition_by) is not tuple:
+            raise TypeError("partition_by must be a tuple")
+
+        for partition_field in self.partition_by:
+            if not isinstance(partition_field, One):
+                raise TypeError(
+                    "partition_by must be fields of type One; "
+                    f"found a {type(partition_field).__name__} instead"
+                )
+
+        if not isinstance(self.order_by, One) or self.order_by.value_type is not int:
+            value_type = (
+                f"[{self.order_by.value_type.__name__}]"
+                if isinstance(self.order_by, Field)
+                else ""
+            )
+            raise TypeError(
+                "order_by must be a field of type One[int], "
+                f"got {type(self.order_by).__name__}{value_type}"
+            )
+        check_positive_int(self.chunks_each_side, name="chunks_each_side")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Take:
     """The last stage: keep the best candidates and return them as passages.
 
     It holds no limit: how many passages to return is given with the question, each
-    time the statement runs.
+    time the statement runs. The limit counts hits: a window adds chunks to each
+    hit's passage, never more passages.
+
+    Attributes:
+        window: The chunks to return around each hit (see `Window`); `None` returns
+            each hit alone.
     """
+
+    window: Window | None = None
+
+    def __post_init__(self) -> None:
+        """Check the window.
+
+        Raises:
+            TypeError: `window` is neither a `Window` nor `None`.
+        """
+        if not (self.window is None or type(self.window) is Window):
+            raise TypeError("window must be of type Window or None")

@@ -11,11 +11,16 @@ from sqlalchemy.orm import Session
 from kb_server.domain.chunks import KbChunks
 from kb_server.domain.credentials import Principal
 from kb_server.domain.documents import Document
-from kb_server.search.statements import CROSS_ENCODER, DENSE, dense_then_rerank
+from kb_server.search.statements import (
+    CHUNKS,
+    CROSS_ENCODER,
+    DENSE,
+    dense_then_rerank,
+)
 from kb_server.services.auth import AuthService
 from kb_server.storage.files import FileStore
 from kb_server.storage.models import StoredFileRow, UserRow
-from salemdex_retrieval import Chunk, Engine, VectorSource
+from salemdex_retrieval import Chunk, Engine, SearchableIndex, VectorScan
 from salemdex_retrieval.embedders import DenseBinding
 from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
 from salemdex_retrieval.engine import PreparedStatement, Validity
@@ -36,7 +41,11 @@ def prepare_search(index: Index, *, validity: Validity) -> PreparedStatement:
     """Return the API's statement prepared on `index`, with the fake models."""
     engine = Engine(
         validity=validity,
-        sources={DENSE: VectorSource(index=index, binding=SEARCH_BINDING)},
+        indexes={
+            CHUNKS: SearchableIndex(
+                index=index, scans={DENSE: VectorScan(binding=SEARCH_BINDING)}
+            )
+        },
         rerankers={CROSS_ENCODER: FakeReranker()},
     )
     return engine.prepare(dense_then_rerank(depth=10))

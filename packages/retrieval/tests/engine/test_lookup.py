@@ -1,4 +1,4 @@
-"""`LookupSource`: fetching the chunks a filter parsed from the question matches.
+"""`LookupScan`: fetching the chunks a filter parsed from the question matches.
 
 Runs on an in-memory index with invented text: articles of two invented rule books,
 and a parser of "article N of book X" standing in for an app's own.
@@ -16,13 +16,14 @@ from salemdex_retrieval import (
     EmbeddedChunk,
     Engine,
     Everything,
-    LookupSource,
+    LookupScan,
     One,
     Rrf,
     Schema,
-    VectorSource,
+    SearchableIndex,
+    VectorScan,
+    scan,
     search,
-    source,
 )
 from salemdex_retrieval.embedders import DenseBinding
 from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
@@ -47,7 +48,7 @@ class Other(Schema):
 
 
 EMBEDDER = FakeDenseEmbedder(size=SIZE)
-LOOKUP = source("lookup", depth=10)
+LOOKUP = scan("lookup", depth=10)
 ARTICLE = re.compile(r"article (\d+) of book (\w+)")
 
 
@@ -118,15 +119,20 @@ def lookup_engine(
     parse_filter: object = parse_article,
     validity: Validity | None = None,
 ) -> Engine:
-    """Return an engine with a lookup and a dense source on `index`."""
+    """Return an engine registering `index` as "chunks", with a lookup and a dense
+    scan on it."""
     return Engine(
         validity=validity if validity is not None else AlwaysValid(),
-        sources={
-            "lookup": LookupSource(index=index, parse_filter=parse_filter),  # type: ignore[arg-type]
-            "dense": VectorSource(
+        indexes={
+            "chunks": SearchableIndex(
                 index=index,
-                binding=DenseBinding(vector=Rules.dense, embedder=EMBEDDER),
-            ),
+                scans={
+                    "lookup": LookupScan(parse_filter=parse_filter),  # type: ignore[arg-type]
+                    "dense": VectorScan(
+                        binding=DenseBinding(vector=Rules.dense, embedder=EMBEDDER)
+                    ),
+                },
+            )
         },
         rerankers={},
     )
@@ -142,9 +148,11 @@ def look_up(
 ) -> list[Passage]:
     """Return what a lookup-only statement finds for `question`."""
     engine = lookup_engine(index, validity=validity)
-    prepared = engine.prepare(search().retrieve(source("lookup", depth=depth)).take())
+    prepared = engine.prepare(
+        search("chunks").retrieve(scan("lookup", depth=depth)).take()
+    )
     return prepared.execute(
-        question=question,
+        question,
         limit=10,
         where=where if where is not None else Everything(),
     )
@@ -174,7 +182,7 @@ def test_a_lookup_hit_is_found_by_the_lookup_in_the_order_of_chunk_ids() -> None
 
     by_id = sorted([LEAVE, LEAVE_MORE], key=lambda embedded: embedded.chunk.id)
     assert [passage.trail for passage in passages] == [
-        (Found(source="lookup", rank=rank, score=1.0),)
+        (Found(scan="lookup", rank=rank, score=1.0),)
         for rank, _ in enumerate(by_id, start=1)
     ]
     assert [passage.chunk.id for passage in passages] == [
@@ -241,54 +249,56 @@ def test_a_filter_the_lookups_index_cannot_read_is_refused_before_parsing() -> N
         return parse_article(question)
 
     engine = lookup_engine(stored_index(), parse_filter=recording)
-    prepared = engine.prepare(search().retrieve(LOOKUP).take())
+    prepared = engine.prepare(search("chunks").retrieve(LOOKUP).take())
 
     with pytest.raises(SchemaMismatchError):
         prepared.execute(
-            question="article 12 of book staff", limit=5, where=Other.article.eq(12)
+            "article 12 of book staff", limit=5, where=Other.article.eq(12)
         )
     assert asked == []
 
 
-# With other sources
+# With other scans
 
 
-def test_an_exact_match_joins_the_fusion_with_the_vector_sources_hits() -> None:
+def test_an_exact_match_joins_the_fusion_with_the_vector_scans_hits() -> None:
     engine = lookup_engine(stored_index())
     prepared = engine.prepare(
-        search()
-        .retrieve(source("dense", depth=10), source("lookup", depth=10))
+        search("chunks")
+        .retrieve(scan("dense", depth=10), scan("lookup", depth=10))
         .merge(Rrf())
         .take()
     )
 
     passages = prepared.execute(
-        question="what does article 12 of book finance say?",
+        "what does article 12 of book finance say?",
         limit=10,
         where=Everything(),
     )
 
     [exact] = [p for p in passages if p.chunk.id == OTHER_BOOK.chunk.id]
-    assert [entry.source for entry in exact.trail if isinstance(entry, Found)] == [
+    assert [entry.scan for entry in exact.trail if isinstance(entry, Found)] == [
         "dense",
         "lookup",
     ]
     assert passages[0].chunk.id == OTHER_BOOK.chunk.id
 
 
-def test_a_question_naming_nothing_leaves_the_fusion_to_the_other_sources() -> None:
+def test_a_question_naming_nothing_leaves_the_fusion_to_the_other_scans() -> None:
     engine = lookup_engine(stored_index())
     question = "how many days of annual leave?"
-    dense_only = engine.prepare(search().retrieve(source("dense", depth=10)).take())
+    dense_only = engine.prepare(
+        search("chunks").retrieve(scan("dense", depth=10)).take()
+    )
     with_lookup = engine.prepare(
-        search()
-        .retrieve(source("dense", depth=10), source("lookup", depth=10))
+        search("chunks")
+        .retrieve(scan("dense", depth=10), scan("lookup", depth=10))
         .merge(Rrf())
         .take()
     )
 
-    alone = dense_only.execute(question=question, limit=10, where=Everything())
-    fused = with_lookup.execute(question=question, limit=10, where=Everything())
+    alone = dense_only.execute(question, limit=10, where=Everything())
+    fused = with_lookup.execute(question, limit=10, where=Everything())
 
     assert [p.chunk.id for p in fused] == [p.chunk.id for p in alone]
 
@@ -297,40 +307,52 @@ def test_two_lookups_in_one_retrieve_are_allowed() -> None:
     index = stored_index()
     engine = Engine(
         validity=AlwaysValid(),
-        sources={
-            "article": LookupSource(index=index, parse_filter=parse_article),
-            "book": LookupSource(
-                index=index, parse_filter=lambda question: Rules.book.eq("finance")
-            ),
+        indexes={
+            "chunks": SearchableIndex(
+                index=index,
+                scans={
+                    "article": LookupScan(parse_filter=parse_article),
+                    "book": LookupScan(
+                        parse_filter=lambda question: Rules.book.eq("finance")
+                    ),
+                },
+            )
         },
         rerankers={},
     )
 
     engine.prepare(
-        search()
-        .retrieve(source("article", depth=5), source("book", depth=5))
+        search("chunks")
+        .retrieve(scan("article", depth=5), scan("book", depth=5))
         .merge(Rrf())
         .take()
     )
 
 
-def test_a_lookup_and_a_source_on_another_index_are_refused_together() -> None:
+def test_a_lookup_registered_on_another_index_is_refused() -> None:
     engine = Engine(
         validity=AlwaysValid(),
-        sources={
-            "lookup": LookupSource(index=stored_index(), parse_filter=parse_article),
-            "dense": VectorSource(
+        indexes={
+            "chunks": SearchableIndex(
                 index=InMemoryIndex(schema=Rules),
-                binding=DenseBinding(vector=Rules.dense, embedder=EMBEDDER),
+                scans={
+                    "dense": VectorScan(
+                        binding=DenseBinding(vector=Rules.dense, embedder=EMBEDDER)
+                    )
+                },
+            ),
+            "rules": SearchableIndex(
+                index=stored_index(),
+                scans={"lookup": LookupScan(parse_filter=parse_article)},
             ),
         },
         rerankers={},
     )
 
-    with pytest.raises(StatementError, match="different indexes"):
+    with pytest.raises(StatementError, match="'lookup' was not registered"):
         engine.prepare(
-            search()
-            .retrieve(source("lookup", depth=5), source("dense", depth=5))
+            search("chunks")
+            .retrieve(scan("lookup", depth=5), scan("dense", depth=5))
             .merge(Rrf())
             .take()
         )
@@ -341,20 +363,20 @@ def test_a_lookup_and_a_source_on_another_index_are_refused_together() -> None:
 
 def test_a_parser_returning_something_other_than_a_filter_is_refused() -> None:
     engine = lookup_engine(stored_index(), parse_filter=lambda question: "article 12")
-    prepared = engine.prepare(search().retrieve(LOOKUP).take())
+    prepared = engine.prepare(search("chunks").retrieve(LOOKUP).take())
 
     with pytest.raises(TypeError):
-        prepared.execute(question="article 12", limit=5, where=Everything())
+        prepared.execute("article 12", limit=5, where=Everything())
 
 
 def test_a_parser_filtering_by_another_schemas_field_is_refused() -> None:
     engine = lookup_engine(
         stored_index(), parse_filter=lambda question: Other.article.eq(12)
     )
-    prepared = engine.prepare(search().retrieve(LOOKUP).take())
+    prepared = engine.prepare(search("chunks").retrieve(LOOKUP).take())
 
     with pytest.raises(SchemaMismatchError):
-        prepared.execute(question="article 12", limit=5, where=Everything())
+        prepared.execute("article 12", limit=5, where=Everything())
 
 
 def test_an_error_in_the_parser_passes_through() -> None:
@@ -362,7 +384,7 @@ def test_an_error_in_the_parser_passes_through() -> None:
         raise RuntimeError("parser broke")
 
     engine = lookup_engine(stored_index(), parse_filter=broken)
-    prepared = engine.prepare(search().retrieve(LOOKUP).take())
+    prepared = engine.prepare(search("chunks").retrieve(LOOKUP).take())
 
     with pytest.raises(RuntimeError, match="parser broke"):
-        prepared.execute(question="article 12", limit=5, where=Everything())
+        prepared.execute("article 12", limit=5, where=Everything())

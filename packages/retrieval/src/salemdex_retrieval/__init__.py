@@ -1,22 +1,27 @@
 """Salemdex retrieval: storing chunks in an index and searching them safely.
 
-The app registers its sources and rerankers on one engine, prepares each statement
-once, then runs it for every question, with a filter applied inside every source's
-search and validity checked before passages are returned:
+The app registers its indexes, each with the scans that read it, and its rerankers
+on one engine, prepares each statement once, then runs it for every question, with a
+filter applied inside every read of the index and validity checked before passages
+are returned:
 
     engine = Engine(
         validity=validity,  # the app's adapter, or engine.AlwaysValid()
-        sources={"dense": VectorSource(index=index, binding=binding)},
+        indexes={
+            "chunks": SearchableIndex(
+                index=index, scans={"dense": VectorScan(binding=binding)}
+            ),
+        },
         rerankers={},
     )
-    prepared = engine.prepare(search().retrieve(source("dense", depth=20)).take())
-    passages = prepared.execute(question=question, limit=10, where=Everything())
+    prepared = engine.prepare(search("chunks").retrieve(scan("dense", depth=20)).take())
+    passages = prepared.execute(question, limit=10, where=Everything())
 
 Each public name has one import path:
 
 - here: what callers build or call to use the package, the vocabulary at many call
-  sites: schemas, chunks, filters, statements, the `Engine` and its sources
-  (`VectorSource`, `LookupSource`);
+  sites: schemas, chunks, filters, statements and their `Window`, the `Engine` and
+  what it registers (`SearchableIndex`, `VectorScan`, `LookupScan`);
 - its own module or subpackage: what callers receive, annotate, catch or implement,
   where the path tells the reader what it is: `errors.SchemaMismatchError`,
   `filters.Filter`, `engine.PreparedStatement`, `embedders.DenseEmbedder`,
@@ -30,8 +35,8 @@ to run a statement, so none runs unchecked, and none without a filter.
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.engine.engine import Engine
-from salemdex_retrieval.engine.sources import LookupSource, VectorSource
-from salemdex_retrieval.engine.stages import Rrf, source
+from salemdex_retrieval.engine.sources import LookupScan, SearchableIndex, VectorScan
+from salemdex_retrieval.engine.stages import Rrf, Window, scan
 from salemdex_retrieval.engine.statements import search
 from salemdex_retrieval.filters import Everything, and_, not_, or_
 from salemdex_retrieval.schema import Many, One, Schema
@@ -43,16 +48,18 @@ __all__ = [
     "EmbeddedChunk",
     "Engine",
     "Everything",
-    "LookupSource",
+    "LookupScan",
     "Many",
     "One",
     "Rrf",
     "Schema",
+    "SearchableIndex",
     "Sparse",
-    "VectorSource",
+    "VectorScan",
+    "Window",
     "and_",
     "not_",
     "or_",
+    "scan",
     "search",
-    "source",
 ]

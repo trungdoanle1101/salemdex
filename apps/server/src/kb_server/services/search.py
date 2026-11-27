@@ -70,7 +70,7 @@ class SearchService:
 
         access_filter = self._read_access_filter(principal)
         found = self._prepared_statement.execute(
-            question=question, limit=limit, where=access_filter
+            question, limit=limit, where=access_filter
         )
         titles = self._read_titles({_document_id(passage) for passage in found})
         # A document deleted or deactivated since the last gate has no title: dropped

@@ -54,27 +54,29 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   - `checks.py`: `check_positive_int`, `to_finite_float`, `to_stripped_str`, shared by
     every layer;
   - `rerankers/`: the `Reranker` protocol, `score_texts`, and `FakeReranker`;
-  - `engine/stages.py`: `Retrieve` (sources by name, `source(name, depth=…)`), `Merge`
-    with `Rrf`, `Rerank` (a reranker by name), `Take` (no limit), as plain data naming
-    what the engine registered;
-  - `engine/statements.py`: `search()`, the type-state steps ending in `Statement`, and
-    `replay`;
-  - `engine/sources.py`: `VectorSource(index=…, binding=…)`, what a registered source
-    name stands for, refusing a vector its index's schema doesn't declare; and
-    `LookupSource(index=…, parse_filter=…)`, fetching the chunks a filter read from the
+  - `engine/stages.py`: `Retrieve` (scans by name, `scan(name, depth=…)`), `Merge`
+    with `Rrf`, `Rerank` (a reranker by name), `Take` (no limit, an optional `Window`),
+    as plain data naming what the engine registered;
+  - `engine/statements.py`: `search(index)`, the type-state steps ending in
+    `Statement`, and `replay`;
+  - `engine/sources.py`: `SearchableIndex(index=…, scans=…)`, an index with the scans
+    that read it, refusing a vector its schema doesn't declare; `VectorScan(binding=…)`;
+    and `LookupScan(parse_filter=…)`, fetching the chunks a filter read from the
     question matches (section 6, "Lookup sources"), with the closed union
-    `RegisteredSource`. Tested in `tests/engine/test_lookup.py` on an in-memory index;
+    `RegisteredScan`. Tested in `tests/engine/test_sources.py` and, on an in-memory
+    index, `tests/engine/test_lookup.py`;
   - `engine/results.py`: the trail entries (`Found`, `Fused`, `Reranked`), `Candidate`
     and `Passage`;
   - `engine/validity.py`: the `Validity` port (`valid_ids(chunks) -> ids to keep`) and
     `AlwaysValid`;
-  - `engine/engine.py`: `Engine(validity=…, sources=…, rerankers=…)`, frozen, keeping
+  - `engine/engine.py`: `Engine(validity=…, indexes=…, rerankers=…)`, frozen, keeping
     read-only copies of what it registers, and `Engine.prepare(statement)`. Preparing
-    replays the statement and checks that every name is registered, each retrieve searches
-    one index, and no vector is searched twice. It returns a `PreparedStatement`, which
-    only `prepare` builds and which can't be changed. `PreparedStatement.execute(*,
-    question, limit, where)` checks its inputs (the filter against every searched schema)
-    before any model is called; then it searches every source with `where`, gates where
+    replays the statement and checks that its index is registered, every scan is
+    registered on it, every reranker is registered, no vector is searched twice, and a
+    window's fields are in the index's schema. It returns a `PreparedStatement`, which
+    only `prepare` builds and which can't be changed. `PreparedStatement.execute(question,
+    *, limit, where)` checks its inputs (the filter against the index's schema) before
+    any model is called; then it runs every scan with `where`, gates where
     candidates enter (one validity call per retrieve) and again inside `Take`, fuses by
     RRF, and reranks every candidate it receives. Tested in `tests/engine/test_engine.py`
     with a scripted index and spies that count embedder, validity and reranker calls.
@@ -112,6 +114,15 @@ engine ("Pick up here" below). Branch: `features/retrieval-redesign`.
   preparation, and the app's parser building the same keys (which settles "Reference
   keys" below), then a lookup source in the hybrid statement, measured on the questions
   that name a provision (`scorecard.for_tag`).
+- **Built** (2026-11-27, not committed yet): **a statement names its index** (section 5,
+  "A statement names its index"): `Engine(indexes={"chunks": SearchableIndex(index=…,
+  scans={…})})` and `search("chunks")`, with sources renamed scans (`VectorScan`,
+  `LookupScan`, `scan(…)`, `Found.scan`). The server registers its index as `CHUNKS`.
+- **Built** (2026-11-27, not committed yet): **windows**, small-to-big (section 6,
+  "Windows"): `.take(window=Window(partition_by=…, order_by=…, chunks_each_side=…))`,
+  each passage carrying the chunks around its hit as `passage.window`. Tested in
+  `tests/engine/test_window.py`. Next: the step arranging passages for display (dedupe
+  and reading order); the server doesn't use windows yet.
 - **Pick up here** (as of 2026-11-18): replace the old retrieval in the server, then delete
   it (expand, migrate, contract; section 10, "Migration"). Nothing else in the framework
   imports `document_processor.retrieval` or `integrations.{huggingface,qdrant}`: only the
@@ -280,11 +291,12 @@ faithful → passages carry source text + origin     reranking, expansion, pruni
 | query transform | question → queries | rewrite, multi-query, HyDE, decomposition |
 | source | query, filter → candidates | dense, sparse, keyword, generated entries |
 | merge | candidate lists → candidates | RRF, union |
-| expand | candidates, filter → candidates | neighbours, parent section, linked chunks |
+| expand | candidates, filter → candidates | linked chunks; neighbours are a `Take`'s window instead (section 6, "Windows") |
 | rerank | question, candidates → candidates | cross-encoder, LLM judge |
 | prune | candidates → candidates | dedupe, threshold, diversity |
 
-Every stage that adds candidates (source, expand) receives the filter. The framework fixes
+Every stage that adds candidates or text (source, expand, a `Take`'s window) receives
+the filter. The framework fixes
 *where* the guarantees apply. The app decides *what* they mean (section 6): to the framework,
 "allow" is a filter each run must be given; that it holds access is the app's meaning.
 
@@ -296,23 +308,24 @@ question, the limit and the filter.
 
 ```text
 engine   = Engine(validity=validity,
-                  sources={"dense": dense, "sparse": sparse},
+                  indexes={"chunks": SearchableIndex(index=index, scans={"dense": dense, "sparse": sparse})},
                   rerankers={"cross_encoder": cross_encoder})
-stmt     = (search()
-            .retrieve(source("dense", depth=50), source("sparse", depth=50))
+stmt     = (search("chunks")
+            .retrieve(scan("dense", depth=50), scan("sparse", depth=50))
             .merge(Rrf()).rerank("cross_encoder").take())
 prepared = engine.prepare(stmt)                                     # once, at startup
-passages = prepared.execute(question=q, limit=10, where=access)    # each search
+passages = prepared.execute(q, limit=10, where=access)    # each search
 ```
 
 - **A statement holds no question and no limit.** They change with every search, while how
   to search doesn't. Why: one statement then serves every question, can be named, logged and
   compared, and isn't rebuilt per request. Anything else that must vary per search is
   another statement, not another slot.
-- **A statement names what it uses; the engine holds it.** The app registers its sources
-  (`VectorSource(index=…, binding=…)`) and rerankers on the engine under names, and stages
-  name them: `source("dense", depth=50)`, `.rerank("cross_encoder")`. Names are stripped,
-  and a source's name is also what each candidate's trail calls it. Why:
+- **A statement names what it uses; the engine holds it.** The app registers its indexes,
+  each with its scans, and its rerankers on the engine under names, and the statement
+  names them: `search("chunks")`, `scan("dense", depth=50)`, `.rerank("cross_encoder")`.
+  Names are stripped, and a scan's name is also what each candidate's trail calls it.
+  Why:
   - a statement holds no objects, so it can be logged, compared and replayed;
   - one built at run time (from config, by an agent) can name only what the app registered;
   - code holding a statement can't reach an index through it (section 11).
@@ -320,9 +333,52 @@ passages = prepared.execute(question=q, limit=10, where=access)    # each search
     leaves every statement, and every log of one, true.
   - Rejected: a resolved twin of each stage holding the objects. It doubles the stage
     classes only to hide what a frozen, private registry already hides.
+- **A statement names its index, as SQL's `FROM` (SQLAlchemy's `select(table)`)**
+  (built 2026-11-27). Scans are registered under the index whose chunks they return,
+  and hold no index themselves:
+
+  ```python
+  engine = Engine(
+      validity=validity,
+      indexes={
+          "chunks": SearchableIndex(
+              index=index,
+              scans={
+                  "dense": VectorScan(binding=dense_binding),
+                  "lookup": LookupScan(parse_filter=parse_reference),
+              },
+          ),
+      },
+      rerankers={"cross_encoder": cross_encoder},
+  )
+  search("chunks").retrieve(scan("dense", depth=50), scan("lookup", depth=20))
+  ```
+
+  - **The rule "a statement's candidates are chunks of one index" (section 6, "Several
+    indexes") is the registry's shape, not a check:** sources on two indexes can't be
+    written in one `Retrieve`. The failure becomes "scan 'dense' was not registered in
+    the engine on index 'chunks'".
+  - **The candidates' index is the statement's `FROM`:** `prepare` reads it, a window's
+    fields are checked against its schema, and nothing derives it from the sources.
+  - **Each index is stated once,** where it's registered, not in every source.
+  - **What's planned has a place:** a resolving source is registered under its target,
+    holding the entries index inside it; a scope step names its own index
+    (`.scope("summaries", …)`); a union combines statements with their own `FROM`.
+  - **Scan names are scoped by their index,** so two indexes may each have a "dense".
+  - **A scan, not a source:** a scan is one way of reading candidates from an index
+    (a vector, or a filter parsed from the question), as in a SQL query plan ("Index
+    Scan"); it holds no index. An index read by one of its scans is a source of
+    candidates. Rejected: keeping `VectorScan` for a part that no longer finds
+    anything alone, and "declaration", which the schema already means (`Dense`,
+    `check_declares`).
+  - Rejected: `search(KbChunks)`, naming the schema. It would let stages check fields as
+    the statement is built, but two indexes can share a schema (the old and new
+    collections in a migration), so a schema doesn't say which to search.
+  - Rejected: keeping the flat `sources={…}`, each source holding its index. The rule
+    is then a check that copies agree, and the statement never says what it searches.
 - **Preparing checks once, against the engine.** `prepare` replays the statement (below),
-  then checks that every source and reranker it names is registered, that each retrieve
-  searches one index, and that no vector is searched twice, even under two names. Every
+  then checks that the index, every source on it and every reranker it names are
+  registered, and that no vector is searched twice, even under two names. Every
   failure is a `StatementError`. Why once: a wrong statement fails at startup, before any
   model is called, and each run then checks only its own inputs.
 - **Only `prepare` builds a `PreparedStatement`** (parse, don't validate: holding one proves
@@ -346,12 +402,12 @@ passages = prepared.execute(question=q, limit=10, where=access)    # each search
   next, so mypy checks the order:
 
   ```text
-  search()                                           → Question
+  search(index)                                      → Question
   Question       → .retrieve(source)                 → Candidates
   Question       → .retrieve(a, b, …)                → CandidateLists
   CandidateLists → .merge(fusion)                    → Candidates
   Candidates     → .rerank(name) (later .expand() .prune()) → Candidates
-  Candidates     → .take()                           → Statement   (complete)
+  Candidates     → .take(window=None)                → Statement   (complete)
 
   later, with query transforms:
   Question       → .rewrite()                        → Question
@@ -371,8 +427,9 @@ passages = prepared.execute(question=q, limit=10, where=access)    # each search
     another would be accepted where the earlier one is expected.
 
 - **A statement built at run time is replayed through the steps.** `replay(statement)`
-  starts again from `search()` and takes one step per stage. Each (state, stage) pair must
-  be a step that state offers, and the last state must be a `Statement`; anything else
+  starts again from `search()` (with the statement's index, once a statement names one:
+  every state then holds it beside its stages) and takes one step per stage. Each (state,
+  stage) pair must be a step that state offers, and the last state must be a `Statement`; anything else
   raises `StatementError` naming the stage's position. `prepare` keeps the replayed
   statement, and that is what runs.
   - Why: the order rules then live once, in the steps. A separate check over the whole
@@ -564,7 +621,7 @@ the operations differ: `eq` and ranges fit one value, `any_of` / `all_of` fit se
 | one of several | `KbChunks.collection_id.in_(ids)` | `in_` on a `Many` |
 | multi-valued | `KbChunks.groups.any_of(ids)` | `eq` on a `Many`, `any_of` on a `One` |
 | read | `chunk[KbChunks.document_id]` → `UUID`, `chunk[KbChunks.headings]` → `tuple[str, ...]` | no `str` or `Any` coming back. Two overloads: `One[T]` gives `T`, `Many[T]` gives `tuple[T, ...]` |
-| stage settings | `expand(order_by=KbChunks.position)` | `order_by` takes only ordered `One` fields |
+| stage settings | `Window(order_by=KbChunks.position, …)` | `order_by` takes only a `One[int]` |
 
 **Writing chunks: typed fields plus a value builder.**
 
@@ -730,7 +787,8 @@ Chunk(
     integer ids, but this index only writes UUIDs, so such a point was written by something
     else.
 - **Stages that need meaning take fields as settings:**
-  `expand(neighbours, order_by=KbChunks.position, within=KbChunks.document_id)`,
+  `Window(partition_by=(KbChunks.document_id, KbChunks.document_version),
+  order_by=KbChunks.position, chunks_each_side=1)`,
   `prune(dedupe, by=KbChunks.document_id)`. Preparing checks that those fields exist
   and have the right types.
 - **The package ships no schema preset.** Why: nothing in it reads a field by its role
@@ -1173,15 +1231,20 @@ several, and the reranker reads every chunk too.
 ```python
 engine = Engine(
     validity=validity,
-    sources={
-        "dense": VectorSource(index=index, binding=dense_binding),
-        "lookup": LookupSource(index=index, parse_filter=parse_reference),  # the app's
+    indexes={
+        "chunks": SearchableIndex(
+            index=index,
+            scans={
+                "dense": VectorScan(binding=dense_binding),
+                "lookup": LookupScan(parse_filter=parse_reference),  # the app's
+            },
+        ),
     },
     rerankers={"bge": bge},
 )
 statement = (
-    search()
-    .retrieve(source("dense", depth=50), source("lookup", depth=20))
+    search("chunks")
+    .retrieve(scan("dense", depth=50), scan("lookup", depth=20))
     .merge(Rrf())
     .rerank("bge")
     .take()
@@ -1235,6 +1298,171 @@ source among the others.
   preparation (e.g. `nd-145/2020:dieu-12`), since display text such as headings would match
   fragilely ("Pick up here", "Reference keys").
 
+### Windows (built)
+
+```python
+statement = (
+    search("chunks")
+    .retrieve(scan("dense", depth=50))
+    .rerank("cross_encoder")
+    .take(
+        window=Window(
+            partition_by=(KbChunks.document_id, KbChunks.document_version),
+            order_by=KbChunks.position,
+            chunks_each_side=1,
+        )
+    )
+)
+passages = prepared.execute(question, limit=5, where=access)
+
+passages[0].chunk    # the hit: what was ranked, what is cited
+passages[0].window   # tuple[Chunk, ...]: the chunks around it in position order, the hit once
+"\n".join(chunk.text for chunk in passages[0].window)   # reads in the document's order
+```
+
+Chunks are cut small so each fits the embedder and the reranker, and a short text ranks
+precisely. Read alone it's often too little: an article over 450 words is split, so the
+clause that matched misses the exception in the next one; a chunk starting "In the cases
+above, …" has its subject in the one before; a lookup finds "article 12" clause by clause.
+Bigger chunks only trade one failure for another, since a long chunk mixes topics and ranks
+worse. A window **ranks by the small piece and reads the big one** (sentence-window
+retrieval in LlamaIndex, the parent document retriever in LangChain). Status: designed
+2026-11-26, not built; the decisions below are settled.
+
+- **Context on each hit, not more candidates.** The ranked list stays the hits', and each
+  passage carries its neighbours. Why: as candidates, neighbours would compete for `limit`
+  (`limit=5` filled with the top two hits' surroundings), could outrank the hit that brought
+  them, and a rerank after them would pay for chunks nobody asked for. More candidates is
+  the right shape for following links, where a cited article is itself an answer: that is a
+  later `expand` on `Candidates`, not this.
+- **A setting of `Take`: `.take(window=Window(…))`,** default `None`. Why: the window runs
+  inside `Take` (below), and `Take` is the one place passages are built, so the statement's
+  order stays the running order. Rejected: `.expand(…).take()`, which reads as if it ran
+  before the cut; `.take().expand(…)`, which makes `Statement` offer a step, so two in a row
+  would need refusing.
+- **It runs on the hits returned, and nothing else:** final gate → cut at `limit` → read
+  the kept hits' neighbours → validity on the neighbours → build passages. So 5 hits are
+  widened, never the 50 a reranker scored.
+- **One `find`, with the run's filter.** Filters have no range, and none is needed:
+  positions are integers, so each hit's window is a short list of them.
+
+  ```python
+  and_(
+      where,
+      or_(*(
+          and_(KbChunks.document_id.eq(hit[KbChunks.document_id]),
+               KbChunks.document_version.eq(hit[KbChunks.document_version]),
+               KbChunks.position.in_(range(p - n, p + n + 1)))   # p = hit[KbChunks.position]
+          for hit in kept
+      )),
+  )
+  ```
+
+  The filter goes in, so a neighbour can't show a chunk the asker can't see; validity
+  checks the neighbours in one call, since they enter after the final gate. A neighbour
+  hidden by either is missing, so a window can have a gap.
+- **The settings, named as SQL's window functions name them** (`OVER (PARTITION BY …
+  ORDER BY … ROWS BETWEEN n PRECEDING AND n FOLLOWING)`), as the API follows SQLAlchemy:
+  - `partition_by`: the fields that together identify one sequence, the run of chunks
+    `order_by` counts through; a window never crosses its edge. Each a `One` equal to
+    the hit's value. It may be empty, when the whole index is one sequence (one book, a
+    log with one global number; SQL's `OVER (ORDER BY …)` with no `PARTITION BY`):
+    the `order_by` contract then holds across the index. It has no default, so an
+    empty one is always written out (`partition_by=()`), seen like `where=Everything()`;
+    a forgotten field is the duplicate case below. Several, since a sequence is often a composite key: the server
+    numbers chunks per version, so `(document_id, document_version)`, or with only
+    `document_id` a window would also read the other version's chunks while both are
+    indexed, left for validity to drop. Existing fields, not one key field the app
+    would add and fill for each way of grouping. Not `Many`: "the same group" would be
+    ambiguous, and sharing any value would cross sections. Rejected names: `within`
+    (weak), `group_by` (SQL's collapses rows, and it names the arranging step's
+    grouping), `sequence_by`, `same`, `bounded_by`;
+  - `order_by`, a `One[int]` whose values are **unique and consecutive within each
+    partition**: a stored numbering, filled at preparation (`position`). SQL can frame
+    rows over any order because it numbers them while reading the partition; reading the
+    partition is what the window avoids, so the numbering must already be there. mypy
+    checks the `int`; the docstring states the rest. A gap is normal (a neighbour hidden
+    by the filter or validity looks the same) and leaves the window shorter. A duplicate
+    usually means `partition_by` lacks a field (a version): the window stays
+    deterministic (by `order_by`, then chunk id) and doesn't raise mid-search, and the
+    `2n + 1` bound holds only for unique values. Wider types (a timestamp) would need
+    nearest-before/after queries per hit or reading the partition; numbering them at
+    preparation serves instead, and a frame in the field's own units (SQL's `RANGE`) can
+    join later as another kind of frame. Kept as `order_by`, not renamed `position`: the
+    SQL pair reads as one idiom, and the contract lives in the docstring;
+  - `chunks_each_side`, a positive `int`, with its unit in its name (a bare `size`
+    wouldn't say 1 in all, 1 each side or 1 word).
+
+  Preparing checks that the fields belong to the schema of the statement's index, like
+  a source's vector.
+- **The window reads from the statement's index** (`search("chunks")`, section 5), which
+  `_take` passes to the window's helper; the helper takes the index as an argument and
+  never looks one up. Not on each `Candidate`: one fact per run, known before any
+  candidate exists.
+- **The window is the only per-hit bound.** At most `2 × chunks_each_side + 1` chunks per
+  passage, read and returned, both known from the statement: the window is in the filter, so
+  the index reads only what is kept (the lookup's "every match is read before the cut",
+  avoided). A parent field narrows it rather than widening it: `partition_by=(document_id,
+  document_version, section)` keeps the window inside the hit's article. No "whole section" mode: it is the
+  unbounded case; a wider window covers it at a known cost.
+- **`limit` counts hits.** `limit=5` returns at most 5 passages, each one hit with its own
+  trail, and up to `5 × (2n + 1)` chunks of text. Why: `limit` keeps one meaning in every
+  statement, so statements with and without a window return the same hits and are scored
+  alike, and a citation points at the clause that matched.
+- **`passage.window` is `tuple[Chunk, ...]`:** position order, the hit exactly once among
+  them, found by `chunk.id == passage.chunk.id`. Plain chunks: neighbours were never
+  ranked, so they have no trail or score. A tuple, since `Passage` is frozen. Without a
+  `Window` it is `(passage.chunk,)`: the hit alone is its own window, so readers never
+  branch, and the arranging step (below) takes any result. Rejected: `before` / `after`
+  (reading would always take three pieces), `None` (every reader branches, and means "show
+  the hit" like a one-chunk window), `()` (reads as "no text").
+- **Named `window`** (`Window`, `passage.window`), the technique's usual name. Rejected:
+  `context` (reads as an LLM's context, Python's context managers, a request context),
+  `neighbours` and `surroundings` (both read as excluding the hit).
+- **Windows may overlap; arranging them is a separate step (later).** Hits at positions 4
+  and 5 with `chunks_each_side=1` give [3, 4, 5] and [4, 5, 6]. The result stays one passage
+  per hit; a pure function over passages, outside the engine, makes it readable:
+
+  ```python
+  for stretch in arrange(passages, …):   # names to be settled
+      stretch.chunks   # in position order, each once
+      stretch.hits     # which of them matched, best first, with their trails
+  ```
+
+  Groups (the `partition_by` values) come in the order of their best hit, since models use the
+  start of their context best ("lost in the middle", Liu et al., 2023); chunks inside a
+  group come in position order, so "in the cases above" follows the cases; windows that
+  overlap or touch merge, and the hits are marked (a highlight, an LLM's `[match]`). One
+  step thus settles both duplicate text and reading order. Generic, so it belongs in the
+  framework. Rejected: merging passages in `Take` (`limit=5` could return 3 passages, and
+  trails would fold together); dropping shown chunks from later windows (a later hit can sit
+  in an earlier window, leaving its passage a hole where the hit was).
+- **Fitting a small model's context is the answer step's job,** since only it knows the
+  tokenizer and the context size (`KB_CHAT_CONTEXT_SIZE`); the framework counts no tokens.
+  The text grows as `limit × (2n + 1) × chunk size`, so:
+  - shrink chunks when adding a window: 150-word chunks with `chunks_each_side=1` read about
+    as much as 450-word chunks alone, and rank sharper. Chunk size, `limit` and the window
+    are chosen together;
+  - arranging removes the overlap, often the biggest saving, since hits cluster;
+  - fill a budget in rank order: every hit first, best first, then neighbours nearest first
+    while they fit, so the window is the most context a hit gets, not what it always gets;
+  - compare `limit=3, window=1` with `limit=9, none` (the same text) on the question set.
+    The scorecard grades by the quote in `passage.chunk`, so it must look in the window
+    too, or a window holding the answer beside its hit counts as a miss;
+  - later, with agents: small passages and an "expand passage p2" tool (section 12).
+  - Rejected for now: compressing neighbours (picking sentences, an LLM's summary), which
+    costs a model call per passage and weakens "passages carry the source's own words".
+- **In the server:** `KbChunks` already has `document_id`, `document_version` and
+  `position`, so a window within the document needs no re-indexing; one within an
+  article needs a section field, added with the reference keys' collection change ("Pick up here"). `position` isn't
+  indexed: Qdrant filters it after narrowing by the indexed `document_id`; measure before
+  indexing it. Smaller chunks are a preparation change, chosen by evaluation.
+- **Built:** `Window` in `engine/stages.py`, `Take(window=…)` and `take(window=None)`,
+  `Passage.window`; the check against the index's schema in `prepare`; and in
+  `engine.py`, `_windows` (one `find` with `and_(where, or_(_near(hit) …))`, validity on
+  the neighbours only, then each hit's partition cut to its range by `_window_of`).
+  Tested in `tests/engine/test_window.py`.
+
 ### Generated entries
 
 An entry's text isn't the source's words, so it can't be a chunk's `text`. Entries get their
@@ -1243,7 +1471,8 @@ returns the chunks they lead to, recording "found through" in each candidate's h
 become a separate source, not a special case inside the index.
 
 This is a **resolving source**: it searches one index (the entries) and returns chunks of
-another (its *target*, the chunks).
+another (its *target*, the chunks). It is registered under its target, holding the
+entries index inside it, so a statement's `FROM` stays the chunks (section 5).
 
 - **It resolves through the target index's `find`, with the run's filter.** What it returns is
   then checked on the chunks' own schema, whatever the entries hold. Validity runs on the
@@ -1255,27 +1484,86 @@ another (its *target*, the chunks).
 
 ### Several indexes
 
-**A `Retrieve` searches one index, for now.** Its sources may search different vectors of it,
-never different indexes. Why: a candidate is identified by its chunk id, which is only unique
-within one index, and one index means one schema, so one filter fits every source.
-When resolving sources arrive, the rule becomes "every source returns chunks of the same
-target index", and the chunk id stays a sound merge key.
+**A statement's candidates are chunks of one index.** Other indexes may lead to them (a
+join) or narrow them (a semi-join); only a union of complete statements returns rows of
+several indexes. This is a design rule, not a limit for now (decided 2026-11-27). Why:
+everything that assumes one index holds whenever no other index's rows enter the
+candidates: the chunk id as the key of fusion, validity and the trail; one `where` per
+run; one validity port; one kind of passage; one index for the window (and later
+`expand`) to read.
+
+SQL draws the same line. Our `Index` is a SQL **table**, and its vectors and indexed fields
+are the table's **indexes**, its access paths:
+
+| SQL | Rows that come out | Here |
+|---|---|---|
+| `SELECT … FROM table`, the planner combining several of its indexes (a bitmap OR, an index merge) | the table's | a `Retrieve`: several sources (dense, sparse, lookup) reaching one index's chunks, fused by RRF |
+| a join through a side table (`entries JOIN chunks ON entry.chunk_id = chunk.id`) | the chunks, ranked by the side table | a resolving source ("Generated entries"): searches the entries, returns chunks of its target |
+| a semi-join, a subquery in `WHERE` (`document_id IN (SELECT …)`) | the chunks, ranked by their own sources | a scope step before `retrieve` (below) |
+| `UNION` of two complete `SELECT`s | rows of several tables | a union of prepared statements (below, later if ever) |
+
+- **The statement names the index (`search("chunks")`, its `FROM`; section 5),** and
+  sources are registered under the index whose chunks they return, a resolving source
+  under its target. So the rule is the registry's shape, the chunk id stays a sound key,
+  and the window (later `expand`) reads the statement's index. A `Candidate` never
+  carries one.
+
+**A scope step (a semi-join): the preliminary search narrowing the main one.** Coarse to
+fine: search summaries or titles first to shortlist documents, then search chunks only in
+them.
+
+```python
+statement = (
+    search("chunks")
+    .scope("summaries", scan("dense", depth=10), by=(Summaries.document_id, KbChunks.document_id))  # names to settle
+    .retrieve(scan("dense", depth=50))
+    .rerank("cross_encoder")
+    .take()
+)
+# the scope names its own index, with its own sources registered under it
+# runs as: shortlist = the summaries' top 10 → retrieve with
+#          and_(where, KbChunks.document_id.in_(shortlist))
+```
+
+Not designed yet; what it must get right:
+
+- **The scoping search gets `where` too.** The main search has it, so nothing hidden comes
+  out either way; but without it, hidden documents would take shortlist places, so visible
+  ones lose out and fewer results hint that hidden ones matched. The reason the filter
+  goes inside the index, again.
+- **An empty shortlist narrows to nothing:** an empty `in_` matches nothing; never
+  `Everything()`, as with the lookup's `None`.
+- **The two fields share a type,** checked by a generic: `One[T]` on the entries, `One[T]`
+  on the chunks.
+- **The trail records it** ("scoped by summaries, rank 3"), so a passage still answers
+  "why is this here?".
+- **The type-state stays simple:** `Question.scope(…) → Question`, still one question,
+  followed by one `retrieve`.
+- Open: whether validity checks the shortlist. A stale summary could take a place in it;
+  the main search's gates still catch stale chunks.
+
+**A union of statements: how federated search would come, if ever.** Fusing indexes that
+hold different things (regulations and an FAQ) inside one `Retrieve` stays rejected: chunk
+ids would need `(index, id)` in fusion, validity and the trail; one `where` would have to fit
+every schema; validity would mean something different per schema; passages would come with
+different fields, and the window would read several indexes. As a union, each side is a
+prepared statement, run with its own `where`, validity and window, untouched; only the union
+is new: fusing the sides' ranked passages by `(side, chunk id)`, and passages naming their
+side. One combinator, nothing built changes. Until a caller needs it, corpora go in one index
+with a `collection` field, or run as separate statements the app shows separately.
 
 Patterns that use several indexes, and where each belongs:
 
 | Pattern | What it does | Where it goes |
 |---|---|---|
-| Multi-representation indexing (generated entries: questions, summaries, keywords) | Searches another representation of the same chunks, fused with the chunk sources | A resolving source in the same `Retrieve` |
+| Multi-representation indexing (generated entries: questions, summaries, keywords) | Searches another representation of the same chunks, fused with the chunk sources | A resolving source in the same `Retrieve` (a join) |
+| HyPE (questions generated per chunk, matched question to question) | The same, with questions | Several vectors on the chunk (`MultiDense`, max-sim; a plain source), or a resolving source over an entries index when the questions need fields of their own; never federated |
 | Two embedding models side by side (a model migration) | Compares or fuses old and new vectors | Two vectors of one index, as now |
-| Hierarchical, coarse-to-fine retrieval | Finds the top documents (summaries, titles), then searches chunks only within them | A step on `Question` before retrieve, producing a scope (`document_id ∈ top N`), not candidates |
-| Small-to-big, parent document, neighbours | Fetches each candidate's parent section or adjacent chunks | `expand`, with the validity gate after it |
+| Hierarchical, coarse-to-fine retrieval | Finds the top documents (summaries, titles), then searches chunks only within them | A scope step on `Question` before retrieve (a semi-join), producing a filter, not candidates |
+| Small-to-big, parent document, neighbours | Fetches the chunks around each hit returned | A `Take`'s `Window` (section 6, "Windows"), with validity on what it adds |
 | Citation following | Follows a references field to the cited articles ("theo quy định tại Điều 5 …") | An `expand` variant over a field |
 | Pseudo-relevance feedback, iterative retrieval | Reads the top hits and forms a better query | The controller, running two statements (section 8) |
-
-**Rejected: federated search,** fusing indexes that hold different things (regulations and an
-FAQ) in one `Retrieve`. Different schemas mean different access filters, a different meaning
-of validity and different fields on passages. Corpora go in one index with a `collection`
-field, or run as separate statements that the app shows separately.
+| Federated search (corpora with different schemas) | Fuses rows of several indexes | A union of prepared statements (above), later if ever |
 
 ### The guarantee slots
 
@@ -1298,8 +1586,9 @@ stages, the engine, prepared statements, gates
   `where=Everything()`, and one with nothing to check passes `AlwaysValid()`, so each absence
   is visible. Why no separate `AllowEverything`: `Everything` is already a `Filter`, so the
   engine passes it to every source unchanged, and one idea keeps one word.
-- The engine decides *where* the slots apply: the filter goes into every source (later every
-  expand), and the validity gate runs where candidates enter and again before `Take`.
+- The engine decides *where* the slots apply: the filter goes into every source and a `Take`'s
+  window (later every expand), and the validity gate runs where candidates enter, again
+  before `Take`, and on a window's neighbours.
 - **What the filter means is the app's design, not the framework's.** The framework calls the
   slot a filter, not access: the server's holds access, but nothing in the framework depends
   on that, and another app may filter by anything. How the app builds it (which fields,
@@ -1337,7 +1626,7 @@ One word per idea, since all four narrow the results:
 **Validity: a port the engine holds.**
 
 ```text
-engine = Engine(validity=ServedVersionsOnly(session_factory), sources=…, rerankers=…)
+engine = Engine(validity=ServedVersionsOnly(session_factory), indexes=…, rerankers=…)
 # validity's Protocol: chunks → ids to keep
 ```
 
@@ -1369,13 +1658,15 @@ engine = Engine(validity=ServedVersionsOnly(session_factory), sources=…, reran
     could add candidates without its gate. It costs one query, on the candidates left.
     `Take` cuts from what passes, so `limit` still fills when it can, and it is the one place
     passages are built: "only after the final gate" is then true in the code.
+  - **on a window's neighbours** (section 6, "Windows"), designed: they enter after the
+    final gate, so they're checked in one more call, on the neighbours only.
   - An app with nothing to check passes an explicit `AlwaysValid()`.
 
 **The filter: given to each run.**
 
 ```text
 access = self._read_access_filter(principal)   # server service, with its own DB session
-passages = prepared.execute(question=question, limit=limit, where=access)
+passages = prepared.execute(question, limit=limit, where=access)
 ```
 
 - Why each run, over a policy the engine holds (asker → filter): it is simpler. The framework
@@ -1612,8 +1903,8 @@ src/salemdex_retrieval/
                            name), take, as plain data
     statements.py          search() and the type-state steps:
                            Question → CandidateLists → Candidates → Statement; replay
-    sources.py             VectorSource, LookupSource: what a registered source name
-                           stands for (RegisteredSource, a closed union)
+    sources.py             SearchableIndex: an index with the scans that read it;
+                           VectorScan, LookupScan (RegisteredScan, a closed union)
     results.py             Candidate, the trail entries (Found, Fused, Reranked),
                            Passage
     validity.py            the Validity port, AlwaysValid
@@ -1665,7 +1956,7 @@ question isn't what's public, but which path is the one to use:
 
 | Tier | Holds | Names |
 |---|---|---|
-| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `source`, `Rrf`, `Engine`, `VectorSource`, `LookupSource` |
+| top level | what callers build or call: the vocabulary at many call sites | `Schema`, `One`, `Many`, `Dense`, `Sparse`, `Chunk`, `EmbeddedChunk`, `and_`, `or_`, `not_`, `Everything`, `search`, `scan`, `Window`, `Rrf`, `Engine`, `SearchableIndex`, `VectorScan`, `LookupScan` |
 | a core module, or a subpackage's `__init__` | what callers receive, annotate, catch or implement | `errors.SchemaMismatchError`, `errors.StatementError`, `filters.Filter`, `chunks.Hit`, `index.Index`, `index.InMemoryIndex`, `embedders.DenseEmbedder`, `embedders.SparseEmbedder`, `embedders.DenseBinding`, `embedders.SparseBinding`, `embedders.VectorBinding`, `embedders.BM25Embedder`, `embedders.measure_average_length`, `embedders.split_words`, `rerankers.Reranker`, `engine.Statement`, `engine.PreparedStatement`, `engine.Passage`, `engine.TrailEntry`, `engine.Validity`, `engine.AlwaysValid` |
 | a module of its own | what needs an extra, or is only for tests | `index.qdrant.QdrantIndex`, `embedders.huggingface.HuggingFaceDenseEmbedder`, `embedders.huggingface.HuggingFaceSparseEmbedder`, `embedders.fake.FakeDenseEmbedder`, `rerankers.fake.FakeReranker` |
 | not exported | what only the package uses | `replay`, `Candidate`, the stage classes, the intermediate states, `score_texts`, the `check_*` helpers |
@@ -1809,11 +2100,11 @@ manuals instead? If not, it's the app's.
 | Technique | Framework piece | The app supplies |
 |---|---|---|
 | Hybrid dense + sparse | a `Sparse` vector on the schema, `SparseEmbedder` and `SparseBinding`, Qdrant sparse vectors, RRF merge, the BM25 and `SparseEncoder` adapters (all built) | the model, e.g. a SPLADE model or bge-m3's lexical weights; BM25's tokenizer |
-| Lookup by field | `LookupSource`: a filter read from the question, ANDed with the run's, fetched with `find` (built) | the parser, e.g. "Điều 12 Nghị định 145" → a filter on reference keys; the keys, filled at preparation |
+| Lookup by field | `LookupScan`: a filter read from the question, ANDed with the run's, fetched with `find` (built) | the parser, e.g. "Điều 12 Nghị định 145" → a filter on reference keys; the keys, filled at preparation |
 | Normalizing and expanding the question | a query transform taking a function or a glossary | diacritics restoration, abbreviations (NLĐ → người lao động), the domain's terms |
 | Rewrite, multi-query, HyDE, decomposition | query transforms over an LLM protocol | prompts in the domain's language |
 | Generated entries | the resolving source (section 6), an entries schema, a generator protocol | what to generate, the prompts |
-| Small-to-big | expand to the chunks sharing a parent field, or to neighbours by position | which field is the parent (Điều, a recipe's step list) |
+| Small-to-big | a `Take`'s `Window`: the chunks around each hit by position, in the partition of fields the hit shares (designed); a step arranging passages for display (later) | the fields (document, Điều, a recipe's step list), the window's size, set from evaluation |
 | Following links | expand over a field of ids, with the kinds of link as data | extracting references from text; the kinds (amends, replaces) |
 | Coarse to fine | a step on `Question` producing a scope from a coarse index (section 6, "Several indexes") | what the coarse entries are |
 | Prune | dedupe near-identical text, MMR diversity, cut at a score gap or threshold | the thresholds, set from evaluation |

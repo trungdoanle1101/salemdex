@@ -16,8 +16,12 @@ from salemdex_retrieval.embedders.protocol import (
 )
 from salemdex_retrieval.engine.engine import Engine, PreparedStatement
 from salemdex_retrieval.engine.results import Found, Fused, Passage, Reranked
-from salemdex_retrieval.engine.sources import VectorSource
-from salemdex_retrieval.engine.stages import Retrieve, Rrf, Take, source
+from salemdex_retrieval.engine.sources import (
+    RegisteredScan,
+    SearchableIndex,
+    VectorScan,
+)
+from salemdex_retrieval.engine.stages import Retrieve, Rrf, Take, scan
 from salemdex_retrieval.engine.statements import Statement, search
 from salemdex_retrieval.engine.validity import AlwaysValid, Validity
 from salemdex_retrieval.errors import SchemaMismatchError, StatementError
@@ -43,8 +47,8 @@ class Other(Schema):
 
 
 PUBLIC = Chunks.group.eq("public")
-DENSE = source("dense", depth=10)
-TITLE = source("title", depth=10)
+DENSE = scan("dense", depth=10)
+TITLE = scan("title", depth=10)
 
 
 def build_chunk(text: str, *, group: str = "public") -> Chunk:
@@ -151,18 +155,29 @@ def scripted(**hits_by_vector: list[Chunk]) -> ScriptedIndex:
     )
 
 
-def vector_source(
-    index: Index,
-    vector: Dense = Chunks.dense,
-    *,
-    embedder: FakeDenseEmbedder | None = None,
-) -> VectorSource:
-    """Return a registered source searching `vector` in `index`."""
-    return VectorSource(
-        index=index,
+def vector_scan(
+    vector: Dense = Chunks.dense, *, embedder: FakeDenseEmbedder | None = None
+) -> VectorScan:
+    """Return a registered scan searching `vector`."""
+    return VectorScan(
         binding=DenseBinding(
             vector=vector, embedder=embedder or FakeDenseEmbedder(size=SIZE)
         ),
+    )
+
+
+def engine_on(
+    index: Index,
+    scans: Mapping[str, RegisteredScan],
+    *,
+    validity: Validity | None = None,
+    rerankers: Mapping[str, Reranker] | None = None,
+) -> Engine:
+    """Return an engine registering `index` as "chunks", with `scans` on it."""
+    return Engine(
+        validity=validity or AlwaysValid(),
+        indexes={"chunks": SearchableIndex(index=index, scans=scans)},
+        rerankers=rerankers or {},
     )
 
 
@@ -173,14 +188,15 @@ def build_engine(
     rerankers: Mapping[str, Reranker] | None = None,
     embedder: FakeDenseEmbedder | None = None,
 ) -> Engine:
-    """Return an engine registering "dense" and "title", both searching `index`."""
-    return Engine(
-        validity=validity or AlwaysValid(),
-        sources={
-            "dense": vector_source(index, Chunks.dense, embedder=embedder),
-            "title": vector_source(index, Chunks.title, embedder=embedder),
+    """Return an engine registering `index` as "chunks", with "dense" and "title"."""
+    return engine_on(
+        index,
+        {
+            "dense": vector_scan(Chunks.dense, embedder=embedder),
+            "title": vector_scan(Chunks.title, embedder=embedder),
         },
-        rerankers=rerankers or {},
+        validity=validity,
+        rerankers=rerankers,
     )
 
 
@@ -193,9 +209,7 @@ def run(
     where: Filter = PUBLIC,
 ) -> list[Passage]:
     """Prepare `statement` on `engine`, and run it once."""
-    return engine.prepare(statement).execute(
-        question=question, limit=limit, where=where
-    )
+    return engine.prepare(statement).execute(question, limit=limit, where=where)
 
 
 def ids(passages: Iterable[Passage]) -> list[uuid.UUID]:
@@ -206,13 +220,18 @@ def ids(passages: Iterable[Passage]) -> list[uuid.UUID]:
 # Building an engine
 
 
-@pytest.mark.parametrize("name", ["", "  ", " dense", "dense\n"])
-def test_an_engine_refuses_a_source_name_no_statement_could_give(name: str) -> None:
+def chunks_index(index: Index) -> SearchableIndex:
+    """Return `index` with the scan "dense" on it."""
+    return SearchableIndex(index=index, scans={"dense": vector_scan()})
+
+
+@pytest.mark.parametrize("name", ["", "  ", " chunks", "chunks\n"])
+def test_an_engine_refuses_an_index_name_no_statement_could_give(name: str) -> None:
     # Statements strip their names, so an unstripped one could never be matched
-    with pytest.raises(ValueError, match="source's name"):
+    with pytest.raises(ValueError, match="index's name"):
         Engine(
             validity=AlwaysValid(),
-            sources={name: vector_source(scripted())},
+            indexes={name: chunks_index(scripted())},
             rerankers={},
         )
 
@@ -220,26 +239,26 @@ def test_an_engine_refuses_a_source_name_no_statement_could_give(name: str) -> N
 @pytest.mark.parametrize("name", ["", "  ", " bge", "bge\n"])
 def test_an_engine_refuses_a_reranker_name_no_statement_could_give(name: str) -> None:
     with pytest.raises(ValueError, match="reranker's name"):
-        Engine(validity=AlwaysValid(), sources={}, rerankers={name: SpyReranker()})
+        Engine(validity=AlwaysValid(), indexes={}, rerankers={name: SpyReranker()})
 
 
 def test_an_engine_refuses_a_name_that_isnt_a_str() -> None:
-    with pytest.raises(TypeError, match="source's name"):
+    with pytest.raises(TypeError, match="index's name"):
         Engine(
             validity=AlwaysValid(),
-            sources={None: vector_source(scripted())},  # type: ignore[dict-item]
+            indexes={None: chunks_index(scripted())},  # type: ignore[dict-item]
             rerankers={},
         )
 
 
 def test_changing_the_mappings_given_doesnt_change_what_the_engine_registered() -> None:
     first, second = scripted(dense=[A]), scripted(dense=[B])
-    sources = {"dense": vector_source(first)}
-    engine = Engine(validity=AlwaysValid(), sources=sources, rerankers={})
+    indexes = {"chunks": chunks_index(first)}
+    engine = Engine(validity=AlwaysValid(), indexes=indexes, rerankers={})
 
-    sources["dense"] = vector_source(second)
+    indexes["chunks"] = chunks_index(second)
 
-    assert ids(run(search().retrieve(DENSE).take(), engine=engine)) == [A.id]
+    assert ids(run(search("chunks").retrieve(DENSE).take(), engine=engine)) == [A.id]
     assert second.searches == []
 
 
@@ -254,7 +273,7 @@ def test_an_engine_exposes_none_of_what_it_registered() -> None:
     # Indexes are reached only through a prepared statement, which adds the filter
     engine = build_engine(scripted())
 
-    for name in ["validity", "sources", "rerankers"]:
+    for name in ["validity", "indexes", "rerankers"]:
         assert not hasattr(engine, name), name
 
 
@@ -262,7 +281,7 @@ def test_an_engine_exposes_none_of_what_it_registered() -> None:
 
 
 def test_preparing_gives_a_prepared_statement_holding_the_statement() -> None:
-    statement = search().retrieve(DENSE).take()
+    statement = search("chunks").retrieve(DENSE).take()
 
     prepared = build_engine(scripted()).prepare(statement)
 
@@ -272,15 +291,15 @@ def test_preparing_gives_a_prepared_statement_holding_the_statement() -> None:
 
 def test_preparing_a_statement_built_by_hand_holds_it_as_the_steps_would() -> None:
     # As config might give it: a list, not a tuple
-    by_hand = Statement(stages=[Retrieve(sources=(DENSE,)), Take()])  # type: ignore[arg-type]
+    by_hand = Statement(index="chunks", stages=[Retrieve(scans=(DENSE,)), Take()])  # type: ignore[arg-type]
 
     prepared = build_engine(scripted()).prepare(by_hand)
 
-    assert prepared.statement == search().retrieve(DENSE).take()
+    assert prepared.statement == search("chunks").retrieve(DENSE).take()
 
 
 def test_a_statement_out_of_order_is_refused_when_prepared() -> None:
-    statement = Statement(stages=(Take(), Retrieve(sources=(DENSE,))))
+    statement = Statement(index="chunks", stages=(Take(), Retrieve(scans=(DENSE,))))
 
     with pytest.raises(StatementError, match="can't follow Question"):
         build_engine(scripted()).prepare(statement)
@@ -290,61 +309,133 @@ def test_a_statement_out_of_order_is_refused_when_prepared() -> None:
     "statement",
     [
         pytest.param(
-            search().retrieve(source("sparse", depth=10)).take(), id="the only source"
+            search("chunks").retrieve(scan("sparse", depth=10)).take(),
+            id="the only scan",
         ),
         pytest.param(
-            search().retrieve(source("sparse", depth=10), DENSE).merge(Rrf()).take(),
+            search("chunks")
+            .retrieve(scan("sparse", depth=10), DENSE)
+            .merge(Rrf())
+            .take(),
             id="the first of several",
         ),
         pytest.param(
-            search().retrieve(DENSE, source("sparse", depth=10)).merge(Rrf()).take(),
+            search("chunks")
+            .retrieve(DENSE, scan("sparse", depth=10))
+            .merge(Rrf())
+            .take(),
             id="a later one",
         ),
     ],
 )
-def test_a_source_the_engine_didnt_register_is_refused(statement: Statement) -> None:
-    with pytest.raises(StatementError, match="source 'sparse' was not registered"):
+def test_a_scan_the_engine_didnt_register_is_refused(statement: Statement) -> None:
+    # The message lists what is registered there, so a typo is a one-glance fix
+    with pytest.raises(
+        StatementError,
+        match="scan 'sparse' was not registered on index 'chunks'; "
+        "registered there: 'dense', 'title'$",
+    ):
         build_engine(scripted()).prepare(statement)
 
 
 def test_a_reranker_the_engine_didnt_register_is_refused() -> None:
-    engine = build_engine(scripted(), rerankers={"bge": SpyReranker()})
+    engine = build_engine(
+        scripted(), rerankers={"bge": SpyReranker(), "minilm": SpyReranker()}
+    )
 
-    with pytest.raises(StatementError, match="reranker 'other' was not registered"):
-        engine.prepare(search().retrieve(DENSE).rerank("other").take())
+    with pytest.raises(
+        StatementError,
+        match="reranker 'other' was not registered in the engine; "
+        "registered: 'bge', 'minilm'$",
+    ):
+        engine.prepare(search("chunks").retrieve(DENSE).rerank("other").take())
 
 
-def test_a_retrieve_whose_sources_search_different_indexes_is_refused() -> None:
-    # Chunk ids are unique only within one index, so fusion couldn't tell chunks apart
+def test_a_reranker_refused_when_none_is_registered_says_so() -> None:
+    with pytest.raises(StatementError, match="registered: none$"):
+        build_engine(scripted()).prepare(
+            search("chunks").retrieve(DENSE).rerank("bge").take()
+        )
+
+
+def test_an_index_the_engine_didnt_register_is_refused() -> None:
+    with pytest.raises(
+        StatementError,
+        match="index 'entries' was not registered in the engine; registered: 'chunks'$",
+    ):
+        build_engine(scripted()).prepare(search("entries").retrieve(DENSE).take())
+
+
+def test_a_scan_registered_on_another_index_is_refused() -> None:
+    # A statement's candidates are chunks of its one index, so only that index's
+    # scans may find them
     engine = Engine(
         validity=AlwaysValid(),
-        sources={
-            "dense": vector_source(scripted()),
-            "elsewhere": vector_source(scripted(), Chunks.title),
+        indexes={
+            "chunks": chunks_index(scripted()),
+            "entries": SearchableIndex(
+                index=scripted(), scans={"elsewhere": vector_scan(Chunks.title)}
+            ),
         },
         rerankers={},
     )
     statement = (
-        search().retrieve(DENSE, source("elsewhere", depth=10)).merge(Rrf()).take()
+        search("chunks")
+        .retrieve(DENSE, scan("elsewhere", depth=10))
+        .merge(Rrf())
+        .take()
     )
 
-    with pytest.raises(StatementError, match="different indexes"):
+    with pytest.raises(
+        StatementError,
+        match="'elsewhere' was not registered on index 'chunks'; "
+        "registered there: 'dense'$",
+    ):
         engine.prepare(statement)
+
+
+def test_a_statement_reads_only_the_index_it_names() -> None:
+    chunks, entries = scripted(dense=[A]), scripted(dense=[B])
+    engine = Engine(
+        validity=AlwaysValid(),
+        indexes={"chunks": chunks_index(chunks), "entries": chunks_index(entries)},
+        rerankers={},
+    )
+
+    passages = run(search("entries").retrieve(DENSE).take(), engine=engine)
+
+    assert ids(passages) == [B.id]
+    assert chunks.searches == []
+
+
+def test_a_filter_is_checked_against_the_schema_of_the_index_named() -> None:
+    # Each index has its own schema; `where` must fit the one the statement reads
+    engine = Engine(
+        validity=AlwaysValid(),
+        indexes={
+            "chunks": chunks_index(scripted(dense=[A])),
+            "other": SearchableIndex(
+                index=ScriptedIndex({}, schema=Other),
+                scans={"dense": vector_scan(Other.dense)},
+            ),
+        },
+        rerankers={},
+    )
+    prepared = engine.prepare(search("other").retrieve(DENSE).take())
+
+    with pytest.raises(SchemaMismatchError, match="not in schema Other"):
+        prepared.execute("q", limit=5, where=PUBLIC)
 
 
 def test_a_retrieve_searching_one_vector_under_two_names_is_refused() -> None:
     # The shallower list would be the start of the deeper one, counted twice by fusion
     index = scripted()
-    engine = Engine(
-        validity=AlwaysValid(),
-        sources={
-            "dense": vector_source(index),
-            "dense_again": vector_source(index),
-        },
-        rerankers={},
-    )
+    engine = engine_on(index, {"dense": vector_scan(), "dense_again": vector_scan()})
     statement = (
-        search().retrieve(DENSE, source("dense_again", depth=50)).merge(Rrf()).take()
+        search("chunks")
+        .retrieve(DENSE, scan("dense_again", depth=50))
+        .merge(Rrf())
+        .take()
     )
 
     with pytest.raises(StatementError, match="search vector 'dense'"):
@@ -356,7 +447,7 @@ def test_a_refused_statement_calls_no_model_and_reads_no_index() -> None:
     engine = build_engine(index, embedder=embedder, rerankers={"bge": reranker})
 
     with pytest.raises(StatementError):
-        engine.prepare(search().retrieve(DENSE).rerank("other").take())
+        engine.prepare(search("chunks").retrieve(DENSE).rerank("other").take())
 
     assert embedder.calls == []
     assert reranker.texts == []
@@ -372,9 +463,9 @@ def test_a_prepared_statement_cannot_be_built_but_by_prepare() -> None:
 
 
 def test_a_prepared_statement_cannot_be_changed() -> None:
-    prepared = build_engine(scripted()).prepare(search().retrieve(DENSE).take())
+    prepared = build_engine(scripted()).prepare(search("chunks").retrieve(DENSE).take())
     unchecked = Statement(
-        stages=(Retrieve(sources=(source("sparse", depth=10),)), Take())
+        index="chunks", stages=(Retrieve(scans=(scan("sparse", depth=10),)), Take())
     )
 
     # Refused by mypy too: `statement` is a read-only property
@@ -384,20 +475,20 @@ def test_a_prepared_statement_cannot_be_changed() -> None:
 
 def test_a_prepared_statement_cannot_be_copied_with_another_statement() -> None:
     # `dataclasses.replace` would build a copy that skipped the checks
-    prepared = build_engine(scripted()).prepare(search().retrieve(DENSE).take())
+    prepared = build_engine(scripted()).prepare(search("chunks").retrieve(DENSE).take())
 
     with pytest.raises(TypeError):
-        dataclasses.replace(prepared, statement=search().retrieve(TITLE).take())  # type: ignore[type-var]
+        dataclasses.replace(prepared, statement=search("chunks").retrieve(TITLE).take())  # type: ignore[type-var]
 
 
 def test_one_prepared_statement_runs_for_every_question_limit_and_filter() -> None:
     embedder, index = SpyEmbedder(), scripted(dense=[A, B, C])
     prepared = build_engine(index, embedder=embedder).prepare(
-        search().retrieve(DENSE).take()
+        search("chunks").retrieve(DENSE).take()
     )
 
-    first = prepared.execute(question="first", limit=1, where=PUBLIC)
-    second = prepared.execute(question="second", limit=3, where=Everything())
+    first = prepared.execute("first", limit=1, where=PUBLIC)
+    second = prepared.execute("second", limit=3, where=Everything())
 
     assert ids(first) == [A.id]
     assert ids(second) == [A.id, B.id, C.id]
@@ -451,7 +542,7 @@ def test_wrong_inputs_are_refused_before_any_model_or_index_is_used(
 ) -> None:
     embedder, index = SpyEmbedder(), scripted(dense=[A])
     prepared = build_engine(index, embedder=embedder).prepare(
-        search().retrieve(DENSE).take()
+        search("chunks").retrieve(DENSE).take()
     )
     given: dict[str, Any] = {"question": "q", "limit": 5, "where": PUBLIC, **inputs}
 
@@ -466,7 +557,7 @@ def test_the_question_is_stripped_before_it_is_embedded() -> None:
     embedder = SpyEmbedder()
 
     run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(), embedder=embedder),
         question=" q\n",
     )
@@ -474,7 +565,7 @@ def test_the_question_is_stripped_before_it_is_embedded() -> None:
     assert embedder.calls == [("queries", ["q"])]
 
 
-# The filter: inside every source's search
+# The filter: inside every scan's search
 
 
 def test_a_hidden_chunk_never_appears_even_when_it_matches_best() -> None:
@@ -493,7 +584,7 @@ def test_a_hidden_chunk_never_appears_even_when_it_matches_best() -> None:
     )
 
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(index),
         question="thời hạn nộp hồ sơ",
     )
@@ -501,22 +592,22 @@ def test_a_hidden_chunk_never_appears_even_when_it_matches_best() -> None:
     assert ids(passages) == [visible.id]
 
 
-def test_every_source_searches_with_the_filter() -> None:
+def test_every_scan_searches_with_the_filter() -> None:
     index = scripted(dense=[A], title=[B])
 
     run(
-        search().retrieve(DENSE, TITLE).merge(Rrf()).take(),
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf()).take(),
         engine=build_engine(index),
     )
 
     assert [where for _, where, _ in index.searches] == [PUBLIC, PUBLIC]
 
 
-def test_everything_as_the_filter_reaches_every_source_as_it_is() -> None:
+def test_everything_as_the_filter_reaches_every_scan_as_it_is() -> None:
     index = scripted(dense=[A], title=[B])
 
     run(
-        search().retrieve(DENSE, TITLE).merge(Rrf()).take(),
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf()).take(),
         engine=build_engine(index),
         where=Everything(),
     )
@@ -527,12 +618,12 @@ def test_everything_as_the_filter_reaches_every_source_as_it_is() -> None:
 # Retrieve
 
 
-def test_each_source_searches_its_own_vector_to_its_depth() -> None:
+def test_each_scan_searches_its_own_vector_to_its_depth() -> None:
     index = scripted()
 
     run(
-        search()
-        .retrieve(source("dense", depth=50), source("title", depth=20))
+        search("chunks")
+        .retrieve(scan("dense", depth=50), scan("title", depth=20))
         .merge(Rrf())
         .take(),
         engine=build_engine(index),
@@ -548,7 +639,7 @@ def test_the_question_is_embedded_as_a_query_not_as_a_passage() -> None:
     embedder = SpyEmbedder()
 
     run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(), embedder=embedder),
     )
 
@@ -562,36 +653,35 @@ def test_an_embedder_giving_no_row_for_the_question_is_refused() -> None:
 
     with pytest.raises(ValueError, match="returned 0 rows for one question"):
         run(
-            search().retrieve(DENSE).take(),
+            search("chunks").retrieve(DENSE).take(),
             engine=build_engine(scripted(), embedder=Silent(size=SIZE)),
         )
 
 
-def test_one_source_gives_its_hits_in_order_each_found_by_it() -> None:
+def test_one_scan_gives_its_hits_in_order_each_found_by_it() -> None:
     passages = run(
-        search().retrieve(DENSE).take(), engine=build_engine(scripted(dense=[A, B, C]))
+        search("chunks").retrieve(DENSE).take(),
+        engine=build_engine(scripted(dense=[A, B, C])),
     )
 
     assert ids(passages) == [A.id, B.id, C.id]
     assert [passage.trail for passage in passages] == [
-        (Found(source="dense", rank=1, score=0.9),),
-        (Found(source="dense", rank=2, score=0.8),),
-        (Found(source="dense", rank=3, score=0.7),),
+        (Found(scan="dense", rank=1, score=0.9),),
+        (Found(scan="dense", rank=2, score=0.8),),
+        (Found(scan="dense", rank=3, score=0.7),),
     ]
 
 
-def test_the_trail_names_each_source_as_the_engine_registered_it() -> None:
+def test_the_trail_names_each_scan_as_the_engine_registered_it() -> None:
     # The name, not the vector: two engines may register one vector differently
     index = scripted(dense=[A])
-    engine = Engine(
-        validity=AlwaysValid(), sources={"semantic": vector_source(index)}, rerankers={}
-    )
+    engine = engine_on(index, {"semantic": vector_scan()})
 
     [passage] = run(
-        search().retrieve(source("semantic", depth=10)).take(), engine=engine
+        search("chunks").retrieve(scan("semantic", depth=10)).take(), engine=engine
     )
 
-    assert passage.trail == (Found(source="semantic", rank=1, score=0.9),)
+    assert passage.trail == (Found(scan="semantic", rank=1, score=0.9),)
 
 
 # Validity: where candidates enter, and again before take
@@ -599,16 +689,16 @@ def test_the_trail_names_each_source_as_the_engine_registered_it() -> None:
 
 def test_a_chunk_validity_drops_at_retrieve_never_appears() -> None:
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(dense=[A, B, C]), validity=SpyValidity(B)),
     )
 
     assert ids(passages) == [A.id, C.id]
 
 
-def test_found_ranks_are_the_sources_own_whatever_validity_drops() -> None:
+def test_found_ranks_are_the_scans_own_whatever_validity_drops() -> None:
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(dense=[A, B, C]), validity=SpyValidity(B)),
     )
 
@@ -621,7 +711,7 @@ def test_a_stale_chunk_is_never_reranked() -> None:
         scripted(dense=[A, B]), validity=SpyValidity(B), rerankers={"spy": reranker}
     )
 
-    run(search().retrieve(DENSE).rerank("spy").take(), engine=engine)
+    run(search("chunks").retrieve(DENSE).rerank("spy").take(), engine=engine)
 
     assert reranker.texts == [[A.embedded_text]]
 
@@ -629,7 +719,7 @@ def test_a_stale_chunk_is_never_reranked() -> None:
 def test_a_chunk_turning_invalid_during_the_search_never_appears() -> None:
     # Valid when retrieved, deleted before the final gate
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(
             scripted(dense=[A, B]), validity=SpyValidity(A, from_call=2)
         ),
@@ -638,7 +728,7 @@ def test_a_chunk_turning_invalid_during_the_search_never_appears() -> None:
     assert ids(passages) == [B.id]
 
 
-def test_validity_is_asked_once_per_gate_however_many_sources() -> None:
+def test_validity_is_asked_once_per_gate_however_many_scans() -> None:
     validity = SpyValidity()
     engine = build_engine(
         scripted(dense=[A, B], title=[C]),
@@ -647,17 +737,18 @@ def test_validity_is_asked_once_per_gate_however_many_sources() -> None:
     )
 
     run(
-        search().retrieve(DENSE, TITLE).merge(Rrf()).rerank("spy").take(), engine=engine
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf()).rerank("spy").take(),
+        engine=engine,
     )
 
     assert len(validity.calls) == 2
 
 
-def test_a_chunk_several_sources_found_is_asked_about_once() -> None:
+def test_a_chunk_several_scans_found_is_asked_about_once() -> None:
     validity = SpyValidity()
     engine = build_engine(scripted(dense=[A, B], title=[B, A]), validity=validity)
 
-    run(search().retrieve(DENSE, TITLE).merge(Rrf()).take(), engine=engine)
+    run(search("chunks").retrieve(DENSE, TITLE).merge(Rrf()).take(), engine=engine)
 
     assert sorted(validity.calls[0]) == sorted([A.id, B.id])
 
@@ -666,7 +757,7 @@ def test_validity_isnt_asked_when_nothing_was_found() -> None:
     validity = SpyValidity()
 
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(), validity=validity),
     )
 
@@ -679,7 +770,7 @@ def test_validity_isnt_asked_when_nothing_was_found() -> None:
 
 def test_merging_ranks_by_rrf_over_the_lists_that_have_each_chunk() -> None:
     passages = run(
-        search().retrieve(DENSE, TITLE).merge(Rrf(k=60)).take(),
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf(k=60)).take(),
         engine=build_engine(scripted(dense=[A, B], title=[C, A])),
     )
 
@@ -689,15 +780,15 @@ def test_merging_ranks_by_rrf_over_the_lists_that_have_each_chunk() -> None:
     )
 
 
-def test_a_merged_trail_holds_each_source_that_found_it_then_the_fusion() -> None:
+def test_a_merged_trail_holds_each_scan_that_found_it_then_the_fusion() -> None:
     [first, *_] = run(
-        search().retrieve(DENSE, TITLE).merge(Rrf(k=60)).take(),
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf(k=60)).take(),
         engine=build_engine(scripted(dense=[A, B], title=[C, A])),
     )
 
     assert first.trail == (
-        Found(source="dense", rank=1, score=0.9),
-        Found(source="title", rank=2, score=0.8),
+        Found(scan="dense", rank=1, score=0.9),
+        Found(scan="title", rank=2, score=0.8),
         # Summed as the engine does, in list order, so the floats match exactly
         Fused(rank=1, score=1 / 61 + 1 / 62),
     )
@@ -705,7 +796,7 @@ def test_a_merged_trail_holds_each_source_that_found_it_then_the_fusion() -> Non
 
 def test_fusion_ties_keep_the_order_of_first_appearance() -> None:
     passages = run(
-        search().retrieve(DENSE, TITLE).merge(Rrf()).take(),
+        search("chunks").retrieve(DENSE, TITLE).merge(Rrf()).take(),
         engine=build_engine(scripted(dense=[A], title=[B])),
     )
 
@@ -719,7 +810,7 @@ def test_a_rerank_scores_every_candidate_by_its_embedded_text() -> None:
     reranker = SpyReranker()
     engine = build_engine(scripted(dense=[A, B, C]), rerankers={"spy": reranker})
 
-    run(search().retrieve(DENSE).rerank("spy").take(), engine=engine, limit=1)
+    run(search("chunks").retrieve(DENSE).rerank("spy").take(), engine=engine, limit=1)
 
     assert reranker.texts == [[A.embedded_text, B.embedded_text, C.embedded_text]]
 
@@ -728,7 +819,7 @@ def test_a_rerank_orders_by_its_scores_and_adds_them_to_the_trail() -> None:
     reranker = SpyReranker({C.embedded_text: 0.95, A.embedded_text: 0.5})
     engine = build_engine(scripted(dense=[A, B, C]), rerankers={"spy": reranker})
 
-    passages = run(search().retrieve(DENSE).rerank("spy").take(), engine=engine)
+    passages = run(search("chunks").retrieve(DENSE).rerank("spy").take(), engine=engine)
 
     assert ids(passages) == [C.id, A.id, B.id]
     assert [passage.trail[-1] for passage in passages] == [
@@ -745,7 +836,10 @@ def test_each_rerank_uses_the_reranker_its_name_was_registered_for() -> None:
         scripted(dense=[A, B]), rerankers={"first": first, "second": second}
     )
 
-    run(search().retrieve(DENSE).rerank("first").rerank("second").take(), engine=engine)
+    run(
+        search("chunks").retrieve(DENSE).rerank("first").rerank("second").take(),
+        engine=engine,
+    )
 
     # The second reads the first's order
     assert first.texts == [[A.embedded_text, B.embedded_text]]
@@ -755,7 +849,7 @@ def test_each_rerank_uses_the_reranker_its_name_was_registered_for() -> None:
 def test_rerank_ties_keep_their_earlier_order() -> None:
     engine = build_engine(scripted(dense=[A, B, C]), rerankers={"spy": SpyReranker()})
 
-    passages = run(search().retrieve(DENSE).rerank("spy").take(), engine=engine)
+    passages = run(search("chunks").retrieve(DENSE).rerank("spy").take(), engine=engine)
 
     assert ids(passages) == [A.id, B.id, C.id]
 
@@ -765,7 +859,7 @@ def test_a_reranker_giving_a_score_that_isnt_finite_is_refused() -> None:
     engine = build_engine(scripted(dense=[A]), rerankers={"spy": reranker})
 
     with pytest.raises(ValueError, match="finite"):
-        run(search().retrieve(DENSE).rerank("spy").take(), engine=engine)
+        run(search("chunks").retrieve(DENSE).rerank("spy").take(), engine=engine)
 
 
 # Take
@@ -773,7 +867,7 @@ def test_a_reranker_giving_a_score_that_isnt_finite_is_refused() -> None:
 
 def test_take_keeps_the_best_limit() -> None:
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(scripted(dense=[A, B, C, D])),
         limit=2,
     )
@@ -783,7 +877,7 @@ def test_take_keeps_the_best_limit() -> None:
 
 def test_take_fills_its_limit_past_a_chunk_the_final_gate_drops() -> None:
     passages = run(
-        search().retrieve(DENSE).take(),
+        search("chunks").retrieve(DENSE).take(),
         engine=build_engine(
             scripted(dense=[A, B, C]), validity=SpyValidity(A, from_call=2)
         ),
@@ -793,7 +887,7 @@ def test_take_fills_its_limit_past_a_chunk_the_final_gate_drops() -> None:
     assert ids(passages) == [B.id, C.id]
 
 
-# Sparse sources: the same frame, a sparse binding
+# Sparse scans: the same frame, a sparse binding
 
 
 class Hybrid(Schema):
@@ -854,26 +948,21 @@ def hybrid_engine(*, counter: WordCounter | None = None) -> tuple[Engine, list[C
     ]
     index = InMemoryIndex(schema=Hybrid)
     index.put(embed_chunks(chunks, bindings=[dense, terms]))
-    engine = Engine(
-        validity=AlwaysValid(),
-        sources={
-            "dense": VectorSource(index=index, binding=dense),
-            "terms": VectorSource(index=index, binding=terms),
-        },
-        rerankers={},
+    engine = engine_on(
+        index, {"dense": VectorScan(binding=dense), "terms": VectorScan(binding=terms)}
     )
     return engine, chunks
 
 
-TERMS = source("terms", depth=10)
+TERMS = scan("terms", depth=10)
 
 
-def test_a_sparse_source_embeds_the_question_as_a_query_through_its_binding() -> None:
+def test_a_sparse_scan_embeds_the_question_as_a_query_through_its_binding() -> None:
     counter = WordCounter()
     engine, _ = hybrid_engine(counter=counter)
 
     run(
-        search().retrieve(TERMS).take(),
+        search("chunks").retrieve(TERMS).take(),
         engine=engine,
         question="late payment",
         where=Hybrid.group.eq("public"),
@@ -882,11 +971,11 @@ def test_a_sparse_source_embeds_the_question_as_a_query_through_its_binding() ->
     assert counter.query_batches == [["late payment"]]
 
 
-def test_a_sparse_source_finds_only_the_chunks_sharing_the_questions_terms() -> None:
+def test_a_sparse_scan_finds_only_the_chunks_sharing_the_questions_terms() -> None:
     engine, [leave, _, _] = hybrid_engine()
 
     passages = run(
-        search().retrieve(TERMS).take(),
+        search("chunks").retrieve(TERMS).take(),
         engine=engine,
         question="How many leave days do I get?",
         where=Hybrid.group.eq("public"),
@@ -897,17 +986,20 @@ def test_a_sparse_source_finds_only_the_chunks_sharing_the_questions_terms() -> 
 
 def test_a_hybrid_statement_fuses_dense_and_sparse_hits_by_rank() -> None:
     engine, [leave, late, scope] = hybrid_engine()
-    statement = search().retrieve(DENSE, TERMS).merge(Rrf()).take()
+    statement = search("chunks").retrieve(DENSE, TERMS).merge(Rrf()).take()
 
     question = "twelve fee"
     where = Hybrid.group.eq("public")
 
     dense_only = run(
-        search().retrieve(DENSE).take(), engine=engine, question=question, where=where
+        search("chunks").retrieve(DENSE).take(),
+        engine=engine,
+        question=question,
+        where=where,
     )
     fused = run(statement, engine=engine, question=question, where=where)
 
-    # Dense reads "twelve" and ranks `leave` first; only the sparse source finds `late`
+    # Dense reads "twelve" and ranks `leave` first; only the sparse scan finds `late`
     # (fee counts as interest), and a chunk in both lists outranks one in a single list
     assert ids(dense_only)[0] == leave.id
     assert set(ids(fused)) == {leave.id, late.id, scope.id}
@@ -928,7 +1020,7 @@ def test_a_sparse_embedder_giving_other_than_one_mapping_for_the_question_is_ref
         ValueError, match=f"vector 'terms' returned {rows} rows for one question"
     ):
         run(
-            search().retrieve(TERMS).take(),
+            search("chunks").retrieve(TERMS).take(),
             engine=engine,
             where=Hybrid.group.eq("public"),
         )

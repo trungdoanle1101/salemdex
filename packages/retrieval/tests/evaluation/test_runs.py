@@ -8,8 +8,8 @@ from salemdex_retrieval.embedders.fake import FakeDenseEmbedder
 from salemdex_retrieval.embedders.protocol import DenseBinding
 from salemdex_retrieval.engine.engine import Engine, PreparedStatement
 from salemdex_retrieval.engine.results import Found, Fused, Reranked
-from salemdex_retrieval.engine.sources import VectorSource
-from salemdex_retrieval.engine.stages import Rrf, source
+from salemdex_retrieval.engine.sources import SearchableIndex, VectorScan
+from salemdex_retrieval.engine.stages import Rrf, scan
 from salemdex_retrieval.engine.statements import Statement, search
 from salemdex_retrieval.engine.validity import AlwaysValid
 from salemdex_retrieval.evaluation.questions import KeyPoint, Question, Quote
@@ -72,13 +72,18 @@ def embed_note(document: str, body: str, title: str) -> EmbeddedChunk:
 def prepare(statement: Statement, *, index: InMemoryIndex) -> PreparedStatement:
     engine = Engine(
         validity=AlwaysValid(),
-        sources={
-            "body": VectorSource(
-                index=index, binding=DenseBinding(vector=Notes.body, embedder=EMBEDDER)
-            ),
-            "title": VectorSource(
-                index=index, binding=DenseBinding(vector=Notes.title, embedder=EMBEDDER)
-            ),
+        indexes={
+            "chunks": SearchableIndex(
+                index=index,
+                scans={
+                    "body": VectorScan(
+                        binding=DenseBinding(vector=Notes.body, embedder=EMBEDDER)
+                    ),
+                    "title": VectorScan(
+                        binding=DenseBinding(vector=Notes.title, embedder=EMBEDDER)
+                    ),
+                },
+            )
         },
         rerankers={"cross_encoder": FakeReranker()},
     )
@@ -102,15 +107,15 @@ def run(statement: Statement, *questions: Question) -> tuple[Run, PreparedStatem
     return returned, prepared
 
 
-BODY_ONLY = search().retrieve(source("body", depth=2)).take()
+BODY_ONLY = search("chunks").retrieve(scan("body", depth=2)).take()
 BODY_AND_TITLE = (
-    search()
-    .retrieve(source("body", depth=2), source("title", depth=2))
+    search("chunks")
+    .retrieve(scan("body", depth=2), scan("title", depth=2))
     .merge(Rrf())
     .take()
 )
 BODY_THEN_RERANK = (
-    search().retrieve(source("body", depth=4)).rerank("cross_encoder").take()
+    search("chunks").retrieve(scan("body", depth=4)).rerank("cross_encoder").take()
 )
 
 
@@ -155,7 +160,7 @@ def test_a_run_keeps_the_order_and_trails_the_statement_returned(
 ) -> None:
     result, prepared = run(statement, question("q-01"))
     # A limit far above any depth: what the statement returns when nothing is cut
-    passages = prepared.execute(question="rain sun", limit=1000, where=Everything())
+    passages = prepared.execute("rain sun", limit=1000, where=Everything())
 
     assert result.chunks_by_question["q-01"] == tuple(
         ReturnedChunk(chunk_id=passage.chunk.id, trail=passage.trail)
