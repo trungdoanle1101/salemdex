@@ -12,6 +12,7 @@ from salemdex_retrieval.embedders.protocol import (
     SparseBinding,
     SparseEmbedder,
     VectorBinding,
+    bind,
     embed_chunks,
 )
 from salemdex_retrieval.embedders.words import split_words
@@ -23,6 +24,7 @@ __all__ = [
     "SparseBinding",
     "SparseEmbedder",
     "VectorBinding",
+    "bind",
     "embed_chunks",
     "measure_average_length",
     "split_words",

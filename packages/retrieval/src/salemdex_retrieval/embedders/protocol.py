@@ -7,13 +7,14 @@ it, and the framework checks every row through that vector (`Dense.value`,
 `Sparse.value`).
 
 Two kinds exist: dense embedders (`DenseEmbedder`, `DenseBinding`) and sparse ones
-(`SparseEmbedder`, `SparseBinding`). Others become further protocols and bindings when
-a source needs them, each binding added to `VectorBinding`.
+(`SparseEmbedder`, `SparseBinding`). `bind` builds either, choosing by the vector's
+kind. Others become further protocols and bindings when a scan needs them, each binding
+added to `VectorBinding` and to `bind`.
 """
 
 from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass
-from typing import Protocol, assert_never
+from typing import Protocol, assert_never, cast, overload
 
 from salemdex_retrieval.chunks import Chunk, EmbeddedChunk
 from salemdex_retrieval.vectors import Dense, Sparse, Vector, VectorValue
@@ -141,6 +142,50 @@ class SparseBinding:
     embedder: SparseEmbedder
 
 
+@overload
+def bind(vector: Dense, *, embedder: DenseEmbedder) -> DenseBinding: ...
+@overload
+def bind(vector: Sparse, *, embedder: SparseEmbedder) -> SparseBinding: ...
+def bind(vector: Vector, *, embedder: DenseEmbedder | SparseEmbedder) -> VectorBinding:
+    """Return the binding pairing `vector` with `embedder`, its kind chosen by the vector.
+
+    The vector already says which binding it needs, so the caller needn't choose the
+    class. mypy checks the pairing at the call site: a `Dense` vector takes only a
+    `DenseEmbedder`, a `Sparse` one only a `SparseEmbedder`, and the binding returned
+    has the exact type. The embedder isn't checked at run time: a protocol can't be,
+    short of calling the model, and a wrong one fails on its first rows (`Dense.value`,
+    `Sparse.value`). Whether the vector belongs to an index is checked where the index
+    is known (`SearchableIndex`, `check_fits`).
+
+    Args:
+        vector: The schema vector to fill and search.
+        embedder: The model for it, for passages and questions alike.
+
+    Returns:
+        A `DenseBinding` for a `Dense` vector, a `SparseBinding` for a `Sparse` one.
+
+    Raises:
+        TypeError: `vector` isn't a vector of a kind that can be bound (e.g. a field).
+
+    Example:
+        dense = bind(KbChunks.dense, embedder=tei)
+        terms = bind(KbChunks.terms, embedder=bm25)
+        embed_chunks(chunks, bindings=[dense, terms])
+        SearchableIndex(index=chunk_index, scans={"dense": VectorScan(binding=dense)})
+    """
+    # The overloads pair each vector kind with its embedder kind, so the casts only
+    # restate what callers were already held to
+    match vector:
+        case Dense():
+            return DenseBinding(vector=vector, embedder=cast(DenseEmbedder, embedder))
+        case Sparse():
+            return SparseBinding(vector=vector, embedder=cast(SparseEmbedder, embedder))
+        case _:
+            raise TypeError(
+                f"bind takes a Dense or Sparse vector, got {type(vector).__name__}"
+            )
+
+
 def embed_chunks(
     chunks: Sequence[Chunk], *, bindings: Sequence[VectorBinding]
 ) -> list[EmbeddedChunk]:
@@ -166,7 +211,7 @@ def embed_chunks(
 
     Example:
         embedded = embed_chunks(
-            chunks, bindings=[DenseBinding(vector=KbChunks.dense, embedder=tei)]
+            chunks, bindings=[bind(KbChunks.dense, embedder=tei)]
         )
         index.put(embedded)
     """

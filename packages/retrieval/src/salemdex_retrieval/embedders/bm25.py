@@ -6,7 +6,7 @@ the index. The embedder gives the first part; the index gives the rarity, as IDF
 bind it to a `Sparse(modifier="idf")` vector:
 
     bm25 = BM25Embedder(average_length=measure_average_length(chunk_texts))
-    SparseBinding(vector=KbChunks.sparse, embedder=bm25)
+    bind(KbChunks.sparse, embedder=bm25)
 
 It needs no model, network or extra, and gives the same weights for the same text in
 every process, so tests can use it as it is. Changing its settings or tokenizer changes

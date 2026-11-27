@@ -43,7 +43,7 @@ from kb_server.storage.repositories.jobs import JobRepository
 from kb_server.storage.repositories.users import UserRepository
 from salemdex_retrieval import Engine as SalemdexEngine
 from salemdex_retrieval import SearchableIndex, VectorScan
-from salemdex_retrieval.embedders import DenseBinding, DenseEmbedder
+from salemdex_retrieval.embedders import DenseEmbedder, bind
 from salemdex_retrieval.engine import PreparedStatement
 from salemdex_retrieval.errors import ModelLoadError, SchemaMismatchError
 from salemdex_retrieval.index import Index
@@ -211,10 +211,7 @@ def open_job_tools(services: Services) -> Generator[JobTools, None, None]:
         yield JobTools(
             profile_chooser=profile_chooser,
             index_tools=IndexTools(
-                binding=DenseBinding(
-                    vector=KbChunks.dense,
-                    embedder=embedder,
-                ),
+                binding=bind(KbChunks.dense, embedder=embedder),
                 embedder_identity=embedder_identity,
                 index=index,
                 index_label=f"qdrant:{settings.qdrant_collection}",
@@ -260,9 +257,7 @@ def open_search_tools(
                     index=_open_index(settings, client=qdrant_client),
                     scans={
                         DENSE: VectorScan(
-                            binding=DenseBinding(
-                                vector=KbChunks.dense, embedder=embedder
-                            )
+                            binding=bind(KbChunks.dense, embedder=embedder)
                         )
                     },
                 )

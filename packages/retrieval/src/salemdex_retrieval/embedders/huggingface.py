@@ -33,7 +33,7 @@ class HuggingFaceDenseEmbedder:
 
     Example:
         embedder = HuggingFaceDenseEmbedder("BAAI/bge-m3", device="auto", batch_size=16)
-        binding = DenseBinding(vector=KbChunks.dense, embedder=embedder)
+        binding = bind(KbChunks.dense, embedder=embedder)
     """
 
     def __init__(
@@ -117,7 +117,7 @@ class HuggingFaceSparseEmbedder:
         embedder = HuggingFaceSparseEmbedder(
             "naver/splade-v3", device="auto", batch_size=16
         )
-        binding = SparseBinding(vector=KbChunks.lexical, embedder=embedder)
+        binding = bind(KbChunks.lexical, embedder=embedder)
     """
 
     def __init__(

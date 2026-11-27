@@ -958,7 +958,7 @@ class TeiDenseEmbedder:
 
 # writing: a binding pairs a schema vector with the embedder that fills it
 embedded = embed_chunks(
-    chunks, bindings=[DenseBinding(vector=KbChunks.dense, embedder=TeiDenseEmbedder(…))]
+    chunks, bindings=[bind(KbChunks.dense, embedder=TeiDenseEmbedder(…))]
 )
 index.put(embedded)
 
@@ -981,7 +981,9 @@ index.put(embedded)
   `len(texts)`, and an adapter splitting a batch may go over it twice. A numpy array isn't a
   `Sequence` for mypy, so a local adapter returns `.tolist()`.
 - **The framework pairs each embedder with its vector through a binding:**
-  `DenseBinding(vector=…, embedder=…)`. `embed_chunks(chunks, *, bindings)` fills one vector
+  `bind(KbChunks.dense, embedder=…)` returns a `DenseBinding` (a `SparseBinding` for a
+  `Sparse` vector), its overloads letting mypy refuse a vector paired with the wrong
+  kind of embedder. `embed_chunks(chunks, *, bindings)` fills one vector
   per binding, and the retrieve stage uses the same binding for searches. The numbers are
   wrapped with `Dense.value` / `Dense.query`. Why:
   - the checks on the numbers (size, finite) run where they enter, whoever wrote the adapter;
@@ -1082,10 +1084,10 @@ index.put(embedded)
 
 ```python
 bm25 = BM25Embedder(average_length=measure_average_length(chunk_texts))
-SparseBinding(vector=KbChunks.terms, embedder=bm25)           # terms = Sparse(modifier="idf")
+bind(KbChunks.terms, embedder=bm25)                           # terms = Sparse(modifier="idf")
 
 splade = HuggingFaceSparseEmbedder("naver/splade-v3", device="auto", batch_size=16)
-SparseBinding(vector=KbChunks.lexical, embedder=splade)       # lexical = Sparse(modifier="none")
+bind(KbChunks.lexical, embedder=splade)                       # lexical = Sparse(modifier="none")
 ```
 
 **`BM25Embedder`** (`embedders/bm25.py`, core, no extra):
